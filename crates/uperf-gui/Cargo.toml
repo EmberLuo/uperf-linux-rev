@@ -1,0 +1,17 @@
+[package]
+name = "uperf-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-channel = "2.5.0"
+futures-util.workspace = true
+gtk = { package = "gtk4", version = "0.10.2", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.8.1", features = ["v1_4"] }
+tokio.workspace = true
+uperf-api = { path = "../uperf-api" }
+
+[lints]
+workspace = true

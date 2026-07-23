@@ -1,0 +1,53 @@
+#!/usr/bin/make -f
+
+export CARGO_NET_OFFLINE = true
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --workspace --release --locked
+
+override_dh_auto_test:
+	cargo test --workspace --all-targets --locked
+
+override_dh_auto_install:
+	install -Dm0755 target/release/uperf-linux debian/uperf-linux/usr/bin/uperf-linux
+	install -Dm0755 target/release/uperfctl debian/uperf-linux/usr/bin/uperfctl
+	install -Dm0755 target/release/uperf-probe debian/uperf-linux/usr/bin/uperf-probe
+	install -Dm0755 target/release/uperf-gui \
+		debian/uperf-linux-gui/usr/bin/uperf-gui
+	install -Dm0644 packaging/systemd/uperf-linux.service \
+		debian/uperf-linux/usr/lib/systemd/system/uperf-linux.service
+	install -Dm0644 packaging/dbus/org.uperflinux.Daemon1.conf \
+		debian/uperf-linux/usr/share/dbus-1/system.d/org.uperflinux.Daemon1.conf
+	install -Dm0644 packaging/polkit/org.uperflinux.policy \
+		debian/uperf-linux/usr/share/polkit-1/actions/org.uperflinux.policy
+	install -Dm0644 config/devices/sm8550.json \
+		debian/uperf-linux/usr/share/uperf-linux/devices/sm8550.json
+	install -Dm0644 config/devices/sm8550.json \
+		debian/uperf-linux/etc/uperf-linux/device.json
+	install -Dm0644 config/policy.json \
+		debian/uperf-linux/usr/share/uperf-linux/defaults/policy.json
+	install -Dm0644 config/policy.json \
+		debian/uperf-linux/etc/uperf-linux/policy.json
+	install -Dm0644 config/apps.json \
+		debian/uperf-linux/usr/share/uperf-linux/defaults/apps.json
+	install -Dm0644 config/schema/device-v2.schema.json \
+		debian/uperf-linux/usr/share/uperf-linux/schema/device-v2.schema.json
+	install -Dm0644 config/schema/policy-v2.schema.json \
+		debian/uperf-linux/usr/share/uperf-linux/schema/policy-v2.schema.json
+	install -Dm0644 config/schema/apps-v2.schema.json \
+		debian/uperf-linux/usr/share/uperf-linux/schema/apps-v2.schema.json
+	install -Dm0644 packaging/gui/org.uperflinux.Gui.desktop \
+		debian/uperf-linux-gui/usr/share/applications/org.uperflinux.Gui.desktop
+	install -Dm0644 packaging/gui/org.uperflinux.Gui.metainfo.xml \
+		debian/uperf-linux-gui/usr/share/metainfo/org.uperflinux.Gui.metainfo.xml
+	install -Dm0644 packaging/gui/org.uperflinux.Gui.svg \
+		debian/uperf-linux-gui/usr/share/icons/hicolor/scalable/apps/org.uperflinux.Gui.svg
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_missing:
+	dh_missing --fail-missing

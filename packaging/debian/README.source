@@ -1,0 +1,16 @@
+uperf-linux-rev source packaging
+=================================
+
+The upstream repository keeps Debian metadata in packaging/debian. A release
+source tree must copy that directory to top-level debian before running Debian
+tools.
+
+Cargo.lock and Rust 1.96 are part of the source contract. debian/rules sets
+CARGO_NET_OFFLINE=true; populate the Cargo cache with `cargo fetch --locked`
+before a local build. A distribution upload should use reviewed vendored
+sources or packaged Rust crates instead of granting network access to the
+build.
+
+The JSON files below config/schema are generated release artifacts from the
+uperf-core schemars models. Configuration-type changes must regenerate all
+three files and include the schema diff in review.

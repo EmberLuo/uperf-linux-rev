@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+fail_if_journal_remains()
+{
+    # The daemon removes this file only after verified restoration. Never
+    # delete it from package scripts: removing the binary while it remains
+    # would make the current boot's hardware state unrecoverable.
+    if [ -e /run/uperf-linux/recovery.json ]; then
+        echo "uperf-linux: recovery journal remains at /run/uperf-linux/recovery.json." >&2
+        echo "Resolve recovery with the installed daemon before retrying the package operation." >&2
+        exit 1
+    fi
+}
+
+case "$1" in
+remove|deconfigure|upgrade)
+    if systemctl is-active --quiet uperf-linux.service; then
+        if ! systemctl stop uperf-linux.service; then
+            echo "uperf-linux: refusing package operation because the daemon did not stop cleanly." >&2
+            exit 1
+        fi
+    fi
+
+    fail_if_journal_remains
+    ;;
+esac
+
+#DEBHELPER#
+
+# Recheck after debhelper snippets in case they stopped a unit that was still
+# activating when the first is-active query ran.
+case "$1" in
+remove|deconfigure|upgrade)
+    fail_if_journal_remains
+    ;;
+esac

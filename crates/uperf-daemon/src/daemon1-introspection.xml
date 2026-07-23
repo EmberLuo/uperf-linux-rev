@@ -1,0 +1,62 @@
+<interface name="org.uperflinux.Daemon1">
+  <method name="GetStatus">
+    <arg type="((uu)ss(sbbsa(ssss))sss(b(utu)ssss)(sibb)a(sbttttbttbbb)ttt)" direction="out"/>
+  </method>
+  <method name="GetCapabilities">
+    <arg type="((uu)asa(sss)a(sssauttatb)uu)" direction="out"/>
+  </method>
+  <method name="SetMode">
+    <arg name="mode" type="s" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="SetActiveWorkload">
+    <arg name="request" type="(uss)" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ClearActiveWorkload">
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="SetFrequencyOverrides">
+    <arg name="overrides" type="a(sttts)" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ClearFrequencyOverrides">
+    <arg name="target_ids" type="as" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ReloadConfig">
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ListAppRules">
+    <arg type="a(sbuasassi)" direction="out"/>
+  </method>
+  <method name="SetAppRule">
+    <arg name="rule" type="(sbuasassi)" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="RemoveAppRule">
+    <arg name="rule_id" type="s" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <signal name="StateChanged">
+    <arg name="generation" type="t"/>
+  </signal>
+  <signal name="HealthChanged">
+    <arg name="health" type="(sbbsa(ssss))"/>
+  </signal>
+  <signal name="TelemetryUpdated">
+    <arg name="telemetry" type="(tta(uq)(sibb)a(sbttttbttbbb))"/>
+  </signal>
+  <signal name="CapabilitiesChanged">
+  </signal>
+  <property name="ApiVersion" type="(uu)" access="read"/>
+  <property name="ConfigGeneration" type="t" access="read"/>
+  <property name="DaemonVersion" type="s" access="read"/>
+  <property name="Degraded" type="b" access="read"/>
+  <property name="DominantScene" type="s" access="read"/>
+  <property name="EffectiveProfile" type="s" access="read"/>
+  <property name="Health" type="(sbbsa(ssss))" access="read">
+    <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="invalidates"/>
+  </property>
+  <property name="Mode" type="s" access="read"/>
+</interface>

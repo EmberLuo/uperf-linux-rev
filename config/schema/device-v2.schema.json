@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceConfig",
+  "type": "object",
+  "properties": {
+    "cpu_policies": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/CpuPolicyConfig"
+      },
+      "maxItems": 256
+    },
+    "devfreq_targets": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/DevfreqTargetConfig"
+      },
+      "maxItems": 256
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "device_match": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeviceMatch"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "thermal_zones": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ThermalZoneConfig"
+      },
+      "maxItems": 256
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "device_id"
+  ],
+  "$defs": {
+    "CpuPolicyConfig": {
+      "type": "object",
+      "properties": {
+        "admin_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "critical_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "efficient_cap_hz": {
+          "$ref": "#/$defs/Hertz"
+        },
+        "floor_hz": {
+          "$ref": "#/$defs/Hertz"
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "reference_hz": {
+          "$ref": "#/$defs/Hertz"
+        },
+        "related_cpus": {
+          "description": "Stable selector.  The Linux adapter resolves it against each policy's\ncurrent `related_cpus`; policy directory numbering is not persisted.",
+          "$ref": "#/$defs/CpuSet"
+        },
+        "sensor_failure_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sysfs_path": {
+          "description": "Optional administrator override for unusual kernels.  Normal profiles\nleave this unset and rely on `related_cpus`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "related_cpus",
+        "floor_hz",
+        "reference_hz",
+        "efficient_cap_hz"
+      ]
+    },
+    "CpuSet": {
+      "description": "A dynamically sized set of logical CPU IDs.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0
+      },
+      "uniqueItems": true
+    },
+    "DevfreqTargetConfig": {
+      "type": "object",
+      "properties": {
+        "admin_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compatible": {
+          "description": "Optional device-tree compatible strings used to disambiguate similarly\nnamed devfreq devices.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "critical_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device_name": {
+          "description": "Stable devfreq directory/device name used during discovery.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "manual_only": {
+          "type": "boolean",
+          "default": true
+        },
+        "sensor_failure_cap_hz": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hertz"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sysfs_path": {
+          "description": "Optional administrator override for devices without a stable name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "device_name"
+      ]
+    },
+    "DeviceMatch": {
+      "type": "object",
+      "properties": {
+        "compatible": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "product_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Hertz": {
+      "description": "Frequency in hertz.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "MilliCelsius": {
+      "description": "Temperature in thousandths of one degree Celsius.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "ThermalZoneConfig": {
+      "type": "object",
+      "properties": {
+        "critical": {
+          "$ref": "#/$defs/MilliCelsius"
+        },
+        "dwell_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "hysteresis": {
+          "$ref": "#/$defs/MilliCelsius"
+        },
+        "id": {
+          "type": "string"
+        },
+        "stale_after_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sysfs_path": {
+          "description": "Optional explicit override.  Normal profiles select by `zone_type`\nbecause `thermal_zoneN` numbering is not stable across boots.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "throttled": {
+          "$ref": "#/$defs/MilliCelsius"
+        },
+        "warning": {
+          "$ref": "#/$defs/MilliCelsius"
+        },
+        "zone_type": {
+          "description": "Stable value of the thermal zone's `type` file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "zone_type",
+        "warning",
+        "throttled",
+        "critical",
+        "hysteresis",
+        "dwell_ms",
+        "stale_after_ms"
+      ]
+    }
+  }
+}

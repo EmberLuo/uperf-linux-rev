@@ -1,0 +1,32 @@
+[package]
+name = "uperf-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uperf-linux"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uperf-actuator = { path = "../uperf-actuator" }
+uperf-api = { path = "../uperf-api" }
+uperf-core = { path = "../uperf-core" }
+uperf-linux = { path = "../uperf-linux" }
+uperf-platform = { path = "../uperf-platform" }
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uperf-testkit = { path = "../uperf-testkit" }
+
+[lints]
+workspace = true

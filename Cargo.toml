@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/uperf-core",
+    "crates/uperf-platform",
+    "crates/uperf-linux",
+    "crates/uperf-actuator",
+    "crates/uperf-api",
+    "crates/uperf-daemon",
+    "crates/uperfctl",
+    "crates/uperf-probe",
+    "crates/uperf-testkit",
+    "crates/uperf-gui",
+]
+default-members = [
+    "crates/uperf-daemon",
+    "crates/uperfctl",
+    "crates/uperf-probe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/EmberLuo/uperf-linux-rev"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+crc32fast = "1.5.0"
+evdev = "0.13.2"
+futures-util = "0.3.32"
+libc = "0.2.186"
+regex = "1.12.4"
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+zbus = { version = "5.16.0", features = ["tokio"] }
+zvariant = { version = "5.13.1", features = ["option-as-array"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

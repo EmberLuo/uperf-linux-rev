@@ -1,0 +1,3 @@
+Tests: installed-safety
+Depends: systemd, uperf-linux
+Restrictions: isolation-machine, needs-root

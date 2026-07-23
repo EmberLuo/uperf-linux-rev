@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Uperf Linux
+Comment=Inspect and control the uperf-linux performance scheduler
+Exec=uperf-gui
+Icon=org.uperflinux.Gui
+Terminal=false
+Categories=Settings;
+Keywords=performance;power;frequency;thermal;scheduler;
+StartupNotify=true
+StartupWMClass=org.uperflinux.Gui

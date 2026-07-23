@@ -1,0 +1,127 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            appstream \
+            desktop-file-utils \
+            jq \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libxml2-utils \
+            shellcheck
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check formatting
+        run: cargo +1.96.0 fmt --all --check
+
+      - name: Lint
+        run: cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo +1.96.0 test --workspace --all-targets --locked
+
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo +1.96.0 doc --workspace --no-deps --locked
+
+      - name: Build release binary
+        run: cargo +1.96.0 build --workspace --release --locked
+
+      - name: Stage core and GUI package payloads
+        run: |
+          make --file packaging/debian/rules override_dh_auto_install
+          test -x debian/uperf-linux/usr/bin/uperf-linux
+          test -x debian/uperf-linux/usr/bin/uperfctl
+          test -x debian/uperf-linux/usr/bin/uperf-probe
+          test -x debian/uperf-linux-gui/usr/bin/uperf-gui
+          test -f debian/uperf-linux/etc/uperf-linux/device.json
+          test -f debian/uperf-linux/usr/share/uperf-linux/schema/device-v2.schema.json
+          test -f debian/uperf-linux-gui/usr/share/applications/org.uperflinux.Gui.desktop
+
+      - name: Validate bundled configuration
+        run: |
+          install -d target/config-check
+          install -m 0644 config/devices/sm8550.json target/config-check/device.json
+          install -m 0644 config/policy.json target/config-check/policy.json
+          install -m 0644 config/apps.json target/config-check/apps.json
+          cargo +1.96.0 run --locked --package uperfctl -- \
+            config validate target/config-check
+
+      - name: Validate packaging assets
+        run: |
+          shellcheck \
+            packaging/debian/uperf-linux.postinst \
+            packaging/debian/uperf-linux.prerm \
+            packaging/debian/tests/installed-safety
+          xmllint --nonet --noout \
+            packaging/dbus/org.uperflinux.Daemon1.conf \
+            packaging/polkit/org.uperflinux.policy \
+            packaging/gui/org.uperflinux.Gui.metainfo.xml \
+            packaging/gui/org.uperflinux.Gui.svg
+          desktop-file-validate packaging/gui/org.uperflinux.Gui.desktop
+          appstreamcli validate --no-net packaging/gui/org.uperflinux.Gui.metainfo.xml
+          systemd-analyze verify packaging/systemd/uperf-linux.service
+          dpkg-parsechangelog --file packaging/debian/changelog >/dev/null
+          jq empty config/schema/*.json
+          make --dry-run --file packaging/debian/rules override_dh_auto_install >/dev/null
+
+  aarch64-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+
+      - name: Install Rust toolchain and ARM64 target
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup +1.96.0 target add aarch64-unknown-linux-gnu
+
+      - name: Cross-build release core packages
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo +1.96.0 build --locked --release \
+            --target aarch64-unknown-linux-gnu \
+            --package uperf-daemon \
+            --package uperfctl \
+            --package uperf-probe
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check advisories, licenses and dependency sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

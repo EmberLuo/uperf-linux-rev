@@ -1,0 +1,492 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolicyConfig",
+  "type": "object",
+  "properties": {
+    "default_profile": {
+      "$ref": "#/$defs/ProfileId"
+    },
+    "input": {
+      "$ref": "#/$defs/InputConfig",
+      "default": {
+        "edge_width": 0.03,
+        "enabled": true,
+        "gesture_duration_ms": 100,
+        "swipe_distance": 0.03,
+        "switch_duration_ms": 400,
+        "trigger_duration_ms": 30,
+        "wake_duration_ms": 500
+      }
+    },
+    "load": {
+      "$ref": "#/$defs/LoadConfig",
+      "default": {
+        "ema_time_constant_ms": 500,
+        "enabled": true,
+        "heavy_dwell_ms": 1000,
+        "heavy_enter": 0.6,
+        "heavy_exit": 0.2,
+        "sample_interval_ms": 250
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProfileConfig"
+      },
+      "maxItems": 8
+    },
+    "scheduler": {
+      "$ref": "#/$defs/SchedulerConfig",
+      "default": {
+        "cgroup_classes": [],
+        "enabled": false,
+        "process_rules": [],
+        "task_profiles": []
+      }
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "thermal": {
+      "$ref": "#/$defs/ThermalPolicyConfig",
+      "default": {
+        "sample_interval_ms": 250
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "default_profile",
+    "profiles"
+  ],
+  "$defs": {
+    "CgroupClassConfig": {
+      "type": "object",
+      "properties": {
+        "allowed_cpus": {
+          "$ref": "#/$defs/CpuSet"
+        },
+        "cpu_weight": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "allowed_cpus",
+        "cpu_weight"
+      ]
+    },
+    "CpuSet": {
+      "description": "A dynamically sized set of logical CPU IDs.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0
+      },
+      "uniqueItems": true
+    },
+    "InputConfig": {
+      "type": "object",
+      "properties": {
+        "edge_width": {
+          "description": "Normalized distance from a display edge in `[0, 0.5]`.",
+          "type": "number",
+          "format": "double"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "gesture_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "swipe_distance": {
+          "description": "Normalized movement threshold in `[0, 1]`.",
+          "type": "number",
+          "format": "double"
+        },
+        "switch_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "trigger_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wake_duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "trigger_duration_ms",
+        "gesture_duration_ms",
+        "switch_duration_ms",
+        "wake_duration_ms",
+        "swipe_distance",
+        "edge_width"
+      ]
+    },
+    "LoadConfig": {
+      "type": "object",
+      "properties": {
+        "ema_time_constant_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "heavy_dwell_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "heavy_enter": {
+          "type": "number",
+          "format": "double"
+        },
+        "heavy_exit": {
+          "type": "number",
+          "format": "double"
+        },
+        "sample_interval_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample_interval_ms",
+        "ema_time_constant_ms",
+        "heavy_enter",
+        "heavy_exit",
+        "heavy_dwell_ms"
+      ]
+    },
+    "ProcessRuleConfig": {
+      "type": "object",
+      "properties": {
+        "cgroup_class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matcher": {
+          "$ref": "#/$defs/WorkloadMatcher"
+        },
+        "name": {
+          "type": "string"
+        },
+        "task_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threads": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ThreadRuleConfig"
+          },
+          "maxItems": 256
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "matcher"
+      ]
+    },
+    "ProfileConfig": {
+      "type": "object",
+      "properties": {
+        "burst": {
+          "type": "number",
+          "format": "double"
+        },
+        "id": {
+          "$ref": "#/$defs/ProfileId"
+        },
+        "limit_efficiency": {
+          "type": "boolean"
+        },
+        "margin": {
+          "type": "number",
+          "format": "double"
+        },
+        "scenes": {
+          "type": "object",
+          "properties": {
+            "boost": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "gesture": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "idle": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "switch": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "touch": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "trigger": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "wake": {
+              "$ref": "#/$defs/ScenePatch"
+            }
+          },
+          "additionalProperties": false,
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "margin",
+        "burst",
+        "limit_efficiency"
+      ]
+    },
+    "ProfileId": {
+      "type": "string",
+      "enum": [
+        "powersave",
+        "balance",
+        "performance"
+      ]
+    },
+    "ScenePatch": {
+      "type": "object",
+      "properties": {
+        "burst": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "limit_efficiency": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "margin": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SchedulerConfig": {
+      "type": "object",
+      "properties": {
+        "cgroup_classes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CgroupClassConfig"
+          },
+          "maxItems": 256
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "process_rules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ProcessRuleConfig"
+          },
+          "maxItems": 1024
+        },
+        "task_profiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskProfileConfig"
+          },
+          "maxItems": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "SchedulingClass": {
+      "type": "string",
+      "enum": [
+        "other",
+        "batch",
+        "idle"
+      ]
+    },
+    "TaskPlan": {
+      "type": "object",
+      "properties": {
+        "affinity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuSet"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nice": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int8",
+          "maximum": 127,
+          "minimum": -128
+        },
+        "scheduling_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchedulingClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uclamp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UclampLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TaskProfileConfig": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "plan": {
+          "$ref": "#/$defs/TaskPlan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "plan"
+      ]
+    },
+    "ThermalPolicyConfig": {
+      "type": "object",
+      "properties": {
+        "sample_interval_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample_interval_ms"
+      ]
+    },
+    "ThreadRuleConfig": {
+      "type": "object",
+      "properties": {
+        "comm_regex": {
+          "type": "string"
+        },
+        "task_profile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "comm_regex",
+        "task_profile"
+      ]
+    },
+    "UclampLimits": {
+      "type": "object",
+      "properties": {
+        "max": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "min": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "min",
+        "max"
+      ]
+    },
+    "WorkloadMatcher": {
+      "type": "object",
+      "properties": {
+        "comm_regex": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "desktop_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executable": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

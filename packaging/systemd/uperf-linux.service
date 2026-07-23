@@ -1,0 +1,59 @@
+[Unit]
+Description=Uperf Linux userspace performance scheduler
+Documentation=https://github.com/EmberLuo/uperf-linux-rev
+After=dbus.service systemd-logind.service
+Wants=systemd-logind.service
+ConditionArchitecture=arm64
+
+[Service]
+Type=dbus
+BusName=org.uperflinux.Daemon1
+User=root
+Group=root
+ExecStart=/usr/bin/uperf-linux --config-dir /etc/uperf-linux --state-dir /var/lib/uperf-linux --runtime-dir /run/uperf-linux
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=30s
+SendSIGKILL=no
+UMask=0077
+
+RuntimeDirectory=uperf-linux
+RuntimeDirectoryMode=0700
+# The journal is evidence required for recovery. Preserve it after a failed
+# stop; only the actuator may remove recovery.json after verified restoration.
+RuntimeDirectoryPreserve=yes
+StateDirectory=uperf-linux
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+ReadOnlyPaths=/etc/uperf-linux
+ReadWritePaths=/run/uperf-linux /var/lib/uperf-linux
+
+CapabilityBoundingSet=CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_NICE
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uperf-linux
+
+[Install]
+WantedBy=multi-user.target

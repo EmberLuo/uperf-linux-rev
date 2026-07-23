@@ -1,0 +1,21 @@
+[package]
+name = "uperf-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+evdev.workspace = true
+libc.workspace = true
+rustix = { version = "1.1.4", features = ["process", "thread"] }
+serde.workspace = true
+uperf-core = { path = "../uperf-core" }
+uperf-platform = { path = "../uperf-platform" }
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

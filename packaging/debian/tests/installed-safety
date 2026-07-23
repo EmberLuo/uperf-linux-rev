@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+if systemctl is-enabled --quiet uperf-linux.service; then
+    echo "uperf-linux.service was enabled by package installation" >&2
+    exit 1
+fi
+
+if systemctl is-active --quiet uperf-linux.service; then
+    echo "uperf-linux.service was started by package installation" >&2
+    exit 1
+fi
+
+workdir="$(mktemp -d)"
+journal=/run/uperf-linux/recovery.json
+created_journal=no
+cleanup()
+{
+    rm -rf "$workdir"
+    if [ "$created_journal" = yes ]; then
+        rm -f "$journal"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+install -m 0644 /etc/uperf-linux/device.json "$workdir/device.json"
+install -m 0644 /etc/uperf-linux/policy.json "$workdir/policy.json"
+install -m 0644 /usr/share/uperf-linux/defaults/apps.json "$workdir/apps.json"
+
+uperfctl config validate "$workdir"
+uperf-probe --compact >/dev/null
+
+if [ -e "$journal" ]; then
+    echo "unexpected pre-existing recovery journal in isolated test machine" >&2
+    exit 1
+fi
+install -d -m 0700 /run/uperf-linux
+printf '{}\n' >"$journal"
+created_journal=yes
+
+if /var/lib/dpkg/info/uperf-linux.prerm remove; then
+    echo "package prerm did not block removal with pending recovery evidence" >&2
+    exit 1
+fi
+
+rm -f "$journal"
+created_journal=no

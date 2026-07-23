@@ -1,0 +1,105 @@
+//! D-Bus peer identity and `PolicyKit` authorization.
+
+use std::collections::HashMap;
+
+use uperf_api::ServiceError;
+use zbus::{
+    Connection, Proxy,
+    fdo::DBusProxy,
+    message::Header,
+    names::BusName,
+    zvariant::{Str, Value},
+};
+
+pub const CONTROL_ACTION: &str = "org.uperflinux.control";
+pub const ADMIN_ACTION: &str = "org.uperflinux.admin";
+
+/// Production authorization uses `PolicyKit`; session-bus development can
+/// explicitly trust the local peer while still enforcing workload ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorizationMode {
+    PolicyKit,
+    DevelopmentSession,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Authorizer {
+    mode: AuthorizationMode,
+}
+
+impl Authorizer {
+    #[must_use]
+    pub const fn new(mode: AuthorizationMode) -> Self {
+        Self { mode }
+    }
+
+    /// Resolve the Unix user ID associated with the calling D-Bus peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authorization error when the message has no sender or when
+    /// the bus cannot resolve that sender to a Unix user.
+    pub async fn caller_uid(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+    ) -> Result<u32, ServiceError> {
+        let sender = header
+            .sender()
+            .ok_or_else(|| ServiceError::NotAuthorized("D-Bus sender is missing".to_owned()))?;
+        let proxy = DBusProxy::new(connection)
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        proxy
+            .get_connection_unix_user(BusName::from(sender.clone()))
+            .await
+            .map_err(|error| ServiceError::NotAuthorized(error.to_string()))
+    }
+
+    /// Require the caller to hold a `PolicyKit` action.
+    ///
+    /// Root and explicitly configured development-session peers are accepted
+    /// without contacting `PolicyKit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller identity cannot be resolved, the
+    /// authorization service is unavailable, or the requested action is
+    /// denied.
+    pub async fn require_action(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+        action: &str,
+    ) -> Result<u32, ServiceError> {
+        let uid = self.caller_uid(connection, header).await?;
+        if uid == 0 || self.mode == AuthorizationMode::DevelopmentSession {
+            return Ok(uid);
+        }
+        let sender = header
+            .sender()
+            .ok_or_else(|| ServiceError::NotAuthorized("D-Bus sender is missing".to_owned()))?;
+        let proxy = Proxy::new(
+            connection,
+            "org.freedesktop.PolicyKit1",
+            "/org/freedesktop/PolicyKit1/Authority",
+            "org.freedesktop.PolicyKit1.Authority",
+        )
+        .await
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let subject_details = HashMap::from([("name", Value::from(Str::from(sender.as_str())))]);
+        let subject = ("system-bus-name", subject_details);
+        let details = HashMap::<&str, &str>::new();
+        let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = proxy
+            .call("CheckAuthorization", &(subject, action, details, 1_u32, ""))
+            .await
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        if authorized {
+            Ok(uid)
+        } else {
+            Err(ServiceError::NotAuthorized(format!(
+                "PolicyKit denied {action}"
+            )))
+        }
+    }
+}

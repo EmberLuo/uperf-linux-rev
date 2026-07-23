@@ -1,0 +1,46 @@
+Source: uperf-linux-rev
+Section: admin
+Priority: optional
+Maintainer: uperf-linux contributors <noreply@example.invalid>
+Build-Depends:
+ cargo (>= 1.96),
+ debhelper-compat (= 13),
+ libadwaita-1-dev (>= 1.4),
+ libgtk-4-dev (>= 4.10),
+ pkg-config,
+ rustc (>= 1.96)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Testsuite: autopkgtest
+Homepage: https://github.com/EmberLuo/uperf-linux-rev
+Vcs-Browser: https://github.com/EmberLuo/uperf-linux-rev
+Vcs-Git: https://github.com/EmberLuo/uperf-linux-rev.git
+
+Package: uperf-linux
+Architecture: arm64
+Depends:
+ dbus,
+ polkitd | policykit-1,
+ systemd,
+ util-linux,
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: capability-driven userspace performance scheduler
+ A Rust daemon and command-line tools for coordinating Linux ARM64 CPU,
+ GPU and workload performance policy.
+ .
+ The service is deliberately left disabled and stopped after installation.
+ The administrator must review and validate the device configuration before
+ enabling it.
+
+Package: uperf-linux-gui
+Section: utils
+Architecture: arm64
+Depends:
+ uperf-linux (= ${binary:Version}),
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: graphical control panel for uperf-linux
+ A GTK4 and libadwaita client for the versioned uperf-linux D-Bus API.
+ Targets, operating points, modes and telemetry are populated from daemon
+ capabilities rather than from device-specific constants.

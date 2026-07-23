@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppsConfig",
+  "type": "object",
+  "properties": {
+    "rules": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AppRule"
+      },
+      "maxItems": 4096
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version"
+  ],
+  "$defs": {
+    "AppRule": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "id": {
+          "type": "string"
+        },
+        "matcher": {
+          "$ref": "#/$defs/WorkloadMatcher"
+        },
+        "priority": {
+          "description": "Higher values are evaluated first. Equal priorities retain JSON order.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "profile": {
+          "$ref": "#/$defs/ProfileId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "matcher",
+        "profile"
+      ]
+    },
+    "ProfileId": {
+      "type": "string",
+      "enum": [
+        "powersave",
+        "balance",
+        "performance"
+      ]
+    },
+    "WorkloadMatcher": {
+      "type": "object",
+      "properties": {
+        "comm_regex": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "desktop_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executable": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,171 @@
+{
+  "schema_version": 2,
+  "default_profile": "balance",
+  "profiles": [
+    {
+      "id": "powersave",
+      "margin": 0.05,
+      "burst": 0.0,
+      "limit_efficiency": true,
+      "scenes": {
+        "touch": {
+          "margin": 0.1,
+          "burst": 0.02
+        },
+        "trigger": {
+          "margin": 0.12,
+          "burst": 0.04
+        },
+        "gesture": {
+          "margin": 0.15,
+          "burst": 0.06
+        },
+        "wake": {
+          "margin": 0.15,
+          "burst": 0.08
+        }
+      }
+    },
+    {
+      "id": "balance",
+      "margin": 0.15,
+      "burst": 0.02,
+      "limit_efficiency": true,
+      "scenes": {
+        "touch": {
+          "margin": 0.2,
+          "burst": 0.08
+        },
+        "trigger": {
+          "margin": 0.22,
+          "burst": 0.12
+        },
+        "gesture": {
+          "margin": 0.25,
+          "burst": 0.16
+        },
+        "switch": {
+          "margin": 0.25,
+          "burst": 0.15,
+          "limit_efficiency": false
+        },
+        "boost": {
+          "margin": 0.3,
+          "burst": 0.2,
+          "limit_efficiency": false
+        },
+        "wake": {
+          "margin": 0.3,
+          "burst": 0.2,
+          "limit_efficiency": false
+        }
+      }
+    },
+    {
+      "id": "performance",
+      "margin": 0.25,
+      "burst": 0.08,
+      "limit_efficiency": false,
+      "scenes": {
+        "touch": {
+          "margin": 0.3,
+          "burst": 0.15
+        },
+        "trigger": {
+          "margin": 0.32,
+          "burst": 0.2
+        },
+        "gesture": {
+          "margin": 0.35,
+          "burst": 0.25
+        },
+        "switch": {
+          "margin": 0.35,
+          "burst": 0.25
+        },
+        "boost": {
+          "margin": 0.4,
+          "burst": 0.3
+        },
+        "wake": {
+          "margin": 0.4,
+          "burst": 0.3
+        }
+      }
+    }
+  ],
+  "load": {
+    "enabled": true,
+    "sample_interval_ms": 250,
+    "ema_time_constant_ms": 500,
+    "heavy_enter": 0.6,
+    "heavy_exit": 0.2,
+    "heavy_dwell_ms": 1000
+  },
+  "thermal": {
+    "sample_interval_ms": 250
+  },
+  "input": {
+    "enabled": true,
+    "trigger_duration_ms": 30,
+    "gesture_duration_ms": 100,
+    "switch_duration_ms": 400,
+    "wake_duration_ms": 500,
+    "swipe_distance": 0.03,
+    "edge_width": 0.03
+  },
+  "scheduler": {
+    "enabled": true,
+    "task_profiles": [
+      {
+        "id": "background",
+        "plan": {
+          "affinity": [0, 1, 2],
+          "nice": 10,
+          "scheduling_class": "batch",
+          "uclamp": {
+            "min": 0,
+            "max": 384
+          }
+        }
+      },
+      {
+        "id": "balanced",
+        "plan": {
+          "affinity": [0, 1, 2, 3, 4, 5, 6],
+          "nice": 0,
+          "scheduling_class": "other",
+          "uclamp": {
+            "min": 128,
+            "max": 768
+          }
+        }
+      },
+      {
+        "id": "latency",
+        "plan": {
+          "affinity": [3, 4, 5, 6, 7],
+          "nice": -5,
+          "scheduling_class": "other",
+          "uclamp": {
+            "min": 512,
+            "max": 1024
+          }
+        }
+      }
+    ],
+    "process_rules": [],
+    "cgroup_classes": [
+      {
+        "id": "foreground",
+        "allowed_cpus": [0, 1, 2, 3, 4, 5, 6, 7],
+        "cpu_weight": 500
+      },
+      {
+        "id": "background",
+        "allowed_cpus": [0, 1, 2, 3, 4, 5, 6],
+        "cpu_weight": 100
+      }
+    ]
+  }
+}

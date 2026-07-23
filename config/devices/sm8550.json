@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "device_id": "qcom-sm8550",
+  "device_match": {
+    "compatible": "qcom,sm8550"
+  },
+  "cpu_policies": [
+    {
+      "id": "cpu.efficiency",
+      "related_cpus": [0, 1, 2],
+      "floor_hz": 307200000,
+      "reference_hz": 1344000000,
+      "efficient_cap_hz": 1785600000,
+      "admin_cap_hz": 2016000000,
+      "critical_cap_hz": 307200000,
+      "sensor_failure_cap_hz": 307200000
+    },
+    {
+      "id": "cpu.performance",
+      "related_cpus": [3, 4, 5, 6],
+      "floor_hz": 499200000,
+      "reference_hz": 1920000000,
+      "efficient_cap_hz": 2457600000,
+      "admin_cap_hz": 2803200000,
+      "critical_cap_hz": 499200000,
+      "sensor_failure_cap_hz": 499200000
+    },
+    {
+      "id": "cpu.prime",
+      "related_cpus": [7],
+      "floor_hz": 595200000,
+      "reference_hz": 2227200000,
+      "efficient_cap_hz": 2726400000,
+      "admin_cap_hz": 2956800000,
+      "critical_cap_hz": 595200000,
+      "sensor_failure_cap_hz": 595200000
+    }
+  ],
+  "devfreq_targets": [
+    {
+      "id": "gpu",
+      "device_name": "3d00000.gpu",
+      "manual_only": true,
+      "admin_cap_hz": 680000000,
+      "critical_cap_hz": 220000000,
+      "sensor_failure_cap_hz": 220000000
+    }
+  ],
+  "thermal_zones": [
+    {
+      "id": "cpu-soc-0",
+      "zone_type": "cpuss0-thermal",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-soc-1",
+      "zone_type": "cpuss1-thermal",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-soc-2",
+      "zone_type": "cpuss2-thermal",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-soc-3",
+      "zone_type": "cpuss3-thermal",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "gpu-soc",
+      "zone_type": "gpuss-0-thermal",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    }
+  ]
+}

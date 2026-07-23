@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.uperflinux.Gui</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Uperf Linux</name>
+  <summary>Control the uperf-linux userspace performance scheduler</summary>
+  <developer id="org.uperflinux">
+    <name>uperf-linux contributors</name>
+  </developer>
+  <description>
+    <p>
+      Uperf Linux displays daemon health, thermal state, active workloads,
+      discovered frequency targets, and supported modes. Its controls are
+      generated from the versioned D-Bus capability report.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.uperflinux.Gui.desktop</launchable>
+  <provides>
+    <binary>uperf-gui</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-07-23" type="development"/>
+  </releases>
+  <url type="homepage">https://github.com/EmberLuo/uperf-linux-rev</url>
+  <content_rating type="oars-1.1"/>
+</component>

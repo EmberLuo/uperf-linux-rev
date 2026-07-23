@@ -1,0 +1,7 @@
+uperf-linux-rev (0.1.0) unstable; urgency=medium
+
+  * Initial capability-driven Rust implementation.
+  * Ship the SM8550 device profile, version 2 schemas, system service,
+    D-Bus policy, PolicyKit actions, CLI, probe, and optional GTK client.
+
+ -- uperf-linux contributors <noreply@example.invalid>  Thu, 23 Jul 2026 00:00:00 +0800
