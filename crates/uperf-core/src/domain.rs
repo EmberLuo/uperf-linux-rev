@@ -5,7 +5,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     iter::FromIterator,
-    str::FromStr,
 };
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -42,18 +41,6 @@ impl Hertz {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
-    }
-}
-
-impl From<u64> for Hertz {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<Hertz> for u64 {
-    fn from(value: Hertz) -> Self {
-        value.0
     }
 }
 
@@ -179,18 +166,6 @@ macro_rules! numeric_id {
             }
         }
 
-        impl From<u32> for $name {
-            fn from(value: u32) -> Self {
-                Self(value)
-            }
-        }
-
-        impl From<$name> for u32 {
-            fn from(value: $name) -> Self {
-                value.0
-            }
-        }
-
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 self.0.fmt(formatter)
@@ -247,11 +222,6 @@ impl TargetId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
 }
 
 impl TryFrom<String> for TargetId {
@@ -265,20 +235,6 @@ impl TryFrom<String> for TargetId {
 impl From<TargetId> for String {
     fn from(value: TargetId) -> Self {
         value.0
-    }
-}
-
-impl FromStr for TargetId {
-    type Err = InvalidTargetId;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::new(value)
-    }
-}
-
-impl AsRef<str> for TargetId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
     }
 }
 
@@ -332,23 +288,9 @@ impl CpuSet {
         self.0.insert(cpu)
     }
 
-    pub fn remove(&mut self, cpu: &CpuId) -> bool {
-        self.0.remove(cpu)
-    }
-
-    #[must_use]
-    pub fn contains(&self, cpu: &CpuId) -> bool {
-        self.0.contains(cpu)
-    }
-
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 
     #[must_use]
@@ -480,13 +422,6 @@ impl FrequencyLimits {
     pub const fn is_valid(self) -> bool {
         self.min.0 <= self.max.0
     }
-
-    #[must_use]
-    pub fn clamp_to(self, bounds: Self) -> Self {
-        let max = self.max.min(bounds.max).max(bounds.min);
-        let min = self.min.max(bounds.min).min(max);
-        Self { min, max }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -555,13 +490,6 @@ pub struct DeviceCapabilities {
     pub input_devices: Vec<InputDeviceCapability>,
 }
 
-impl DeviceCapabilities {
-    #[must_use]
-    pub fn has_matched_profile(&self) -> bool {
-        self.matched_profile.is_some()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedFrequency {
@@ -580,8 +508,6 @@ pub struct ObservedState {
     pub frequencies: BTreeMap<TargetId, ObservedFrequency>,
     #[serde(default)]
     pub thermal: BTreeMap<String, ThermalReading>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_workload: Option<ProcessIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -619,21 +545,6 @@ pub struct TaskPlan {
     pub uclamp: Option<UclampLimits>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlanSource {
-    Automatic,
-    ManualOverride,
-    ThermalDegraded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TargetFrequencyPlan {
-    pub limits: FrequencyLimits,
-    pub source: PlanSource,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DesiredPlan {
@@ -641,17 +552,9 @@ pub struct DesiredPlan {
     pub effective_profile: crate::policy::ProfileId,
     pub dominant_scene: crate::policy::Scene,
     #[serde(default)]
-    pub frequencies: BTreeMap<TargetId, TargetFrequencyPlan>,
+    pub frequencies: BTreeMap<TargetId, FrequencyLimits>,
     #[serde(default)]
     pub tasks: BTreeMap<ProcessIdentity, TaskPlan>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AppliedTargetState {
-    pub limits: FrequencyLimits,
-    pub generation: u64,
-    pub verified_at: MonotonicMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -659,13 +562,9 @@ pub struct AppliedTargetState {
 pub struct AppliedState {
     pub generation: u64,
     #[serde(default)]
-    pub frequencies: BTreeMap<TargetId, AppliedTargetState>,
+    pub frequencies: BTreeMap<TargetId, FrequencyLimits>,
     #[serde(default)]
     pub tasks: BTreeMap<ProcessIdentity, TaskPlan>,
-    #[serde(default)]
-    pub degraded: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub degraded_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -707,25 +606,12 @@ mod tests {
     #[test]
     fn cpu_set_is_dynamic_sorted_and_unique() {
         let set = CpuSet::from_ids([CpuId(128), CpuId(7), CpuId(7)]);
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.iter().count(), 2);
         assert_eq!(
             set.iter().copied().collect::<Vec<_>>(),
             [CpuId(7), CpuId(128)]
         );
         assert_eq!(serde_json::to_string(&set).expect("serialize"), "[7,128]");
-    }
-
-    #[test]
-    fn frequency_limits_clamp_without_inverting() {
-        let request = FrequencyLimits::new(Hertz(2_000), Hertz(3_000)).expect("valid");
-        let bounds = FrequencyLimits::new(Hertz(500), Hertz(1_500)).expect("valid");
-        assert_eq!(
-            request.clamp_to(bounds),
-            FrequencyLimits {
-                min: Hertz(1_500),
-                max: Hertz(1_500)
-            }
-        );
     }
 
     #[test]

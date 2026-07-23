@@ -69,12 +69,6 @@ impl RootedSysfs {
         Ok(adapter)
     }
 
-    /// Physical root used by this adapter.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Map a logical `/sys/...` path into this adapter's physical root.
     ///
     /// The returned path is canonical and must already exist.

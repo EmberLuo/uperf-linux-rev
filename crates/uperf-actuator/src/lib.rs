@@ -326,11 +326,6 @@ impl TargetRegistry {
     pub fn get(&self, id: &TargetId) -> Option<&FrequencyTarget> {
         self.targets.get(id)
     }
-
-    /// Iterate over all registered targets.
-    pub fn iter(&self) -> impl Iterator<Item = &FrequencyTarget> {
-        self.targets.values()
-    }
 }
 
 /// One desired range in an atomic batch.
@@ -978,21 +973,6 @@ impl FrequencyActuator {
         self.systemd.is_some()
     }
 
-    /// Attach typed process and systemd mutation backends.
-    ///
-    /// This convenience method preserves the original combined builder while
-    /// allowing either independently optional capability to be installed.
-    #[must_use]
-    pub fn with_task_backends(
-        self,
-        proc_reader: Arc<dyn ProcReader>,
-        process_controller: Arc<dyn ProcessController>,
-        systemd: Arc<dyn SystemdClient>,
-    ) -> Self {
-        self.with_process_backend(proc_reader, process_controller)
-            .with_systemd_backend(systemd)
-    }
-
     /// Current safety mode.
     ///
     /// # Errors
@@ -1000,15 +980,6 @@ impl FrequencyActuator {
     /// Returns an error if the internal state lock is poisoned.
     pub fn mode(&self) -> Result<ActuatorMode, ActuatorError> {
         Ok(self.lock_state()?.mode.clone())
-    }
-
-    /// Report whether startup recovery has not completed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the internal state lock is poisoned.
-    pub fn has_pending_journal(&self) -> Result<bool, ActuatorError> {
-        self.startup_recovery_required()
     }
 
     /// Report whether a journal loaded at startup still requires recovery.
@@ -1965,20 +1936,7 @@ impl FrequencyActuator {
             state.journal.entries.remove(&entry.target);
         }
         state.journal.generation = state.journal.generation.saturating_add(1);
-        if state.journal.is_empty() {
-            if let Err(error) = self.store.remove_durable() {
-                return self.degrade_locked(
-                    &mut state,
-                    format!("cannot remove completed restore journal: {error}"),
-                );
-            }
-        } else if let Err(error) = persist_journal(self.store.as_ref(), &state.journal) {
-            return self.degrade_locked(
-                &mut state,
-                format!("cannot persist partial restore: {error}"),
-            );
-        }
-        Ok(())
+        self.persist_or_remove_locked(&mut state, "frequency restore")
     }
 
     /// Restore selected process identities when their current state is still
@@ -2416,12 +2374,12 @@ fn apply_pair(
         return Ok(before);
     }
     let result = write_ordered(io, target, before, desired)
-        .and_then(|()| read_limits(io, target).map_err(PlatformOrActuator::Actuator))
+        .and_then(|()| read_limits(io, target))
         .and_then(|actual| {
             if actual == desired {
                 Ok(actual)
             } else {
-                Err(PlatformOrActuator::Actuator(ActuatorError::Transaction {
+                Err(ActuatorError::Transaction {
                     target: target.id.to_string(),
                     reason: format!(
                         "readback {}..{} differs from requested {}..{}",
@@ -2430,17 +2388,17 @@ fn apply_pair(
                         desired.min.get(),
                         desired.max.get()
                     ),
-                }))
+                })
             }
         });
     match result {
         Ok(actual) => Ok(actual),
         Err(error) => {
             let current = read_limits(io, target).unwrap_or(before);
-            let rollback = write_ordered(io, target, current, before)
-                .and_then(|()| read_limits(io, target).map_err(PlatformOrActuator::Actuator));
+            let rollback =
+                write_ordered(io, target, current, before).and_then(|()| read_limits(io, target));
             match rollback {
-                Ok(actual) if actual == before => Err(error.into_actuator()),
+                Ok(actual) if actual == before => Err(error),
                 Ok(actual) => Err(ActuatorError::Rollback(format!(
                     "{} read back {}..{} instead of {}..{}",
                     target.id,
@@ -2451,25 +2409,9 @@ fn apply_pair(
                 ))),
                 Err(rollback_error) => Err(ActuatorError::Rollback(format!(
                     "{}: {}; original failure: {}",
-                    target.id,
-                    rollback_error.into_actuator(),
-                    error.into_actuator()
+                    target.id, rollback_error, error
                 ))),
             }
-        }
-    }
-}
-
-enum PlatformOrActuator {
-    Platform(PlatformError),
-    Actuator(ActuatorError),
-}
-
-impl PlatformOrActuator {
-    fn into_actuator(self) -> ActuatorError {
-        match self {
-            Self::Platform(error) => ActuatorError::Platform(error),
-            Self::Actuator(error) => error,
         }
     }
 }
@@ -2479,16 +2421,13 @@ fn write_ordered(
     target: &FrequencyTarget,
     current: FrequencyLimits,
     desired: FrequencyLimits,
-) -> Result<(), PlatformOrActuator> {
+) -> Result<(), ActuatorError> {
     let minimum = desired
         .min
         .get()
         .checked_div(target.hertz_per_unit)
         .ok_or_else(|| {
-            PlatformOrActuator::Actuator(ActuatorError::InvalidTarget(format!(
-                "{} has an invalid kernel unit",
-                target.id
-            )))
+            ActuatorError::InvalidTarget(format!("{} has an invalid kernel unit", target.id))
         })?
         .to_string();
     let maximum = desired
@@ -2496,29 +2435,22 @@ fn write_ordered(
         .get()
         .checked_div(target.hertz_per_unit)
         .ok_or_else(|| {
-            PlatformOrActuator::Actuator(ActuatorError::InvalidTarget(format!(
-                "{} has an invalid kernel unit",
-                target.id
-            )))
+            ActuatorError::InvalidTarget(format!("{} has an invalid kernel unit", target.id))
         })?
         .to_string();
     if desired.max < current.min {
         if desired.min != current.min {
-            io.write_string(&target.min_path, &minimum)
-                .map_err(PlatformOrActuator::Platform)?;
+            io.write_string(&target.min_path, &minimum)?;
         }
         if desired.max != current.max {
-            io.write_string(&target.max_path, &maximum)
-                .map_err(PlatformOrActuator::Platform)?;
+            io.write_string(&target.max_path, &maximum)?;
         }
     } else {
         if desired.max != current.max {
-            io.write_string(&target.max_path, &maximum)
-                .map_err(PlatformOrActuator::Platform)?;
+            io.write_string(&target.max_path, &maximum)?;
         }
         if desired.min != current.min {
-            io.write_string(&target.min_path, &minimum)
-                .map_err(PlatformOrActuator::Platform)?;
+            io.write_string(&target.min_path, &minimum)?;
         }
     }
     Ok(())
@@ -3125,7 +3057,7 @@ mod tests {
         UserId,
     };
     use uperf_platform::{
-        PlatformError, PlatformResult, ProcessController, ProcessSchedulingState, SchedulingPolicy,
+        PlatformError, PlatformResult, ProcessController, ProcessSchedulingState, SchedulingClass,
         StateStore, SysfsIo, SystemdClient, SystemdUnitInstanceIdentity, SystemdUnitInstanceKey,
         SystemdUnitProperties,
     };
@@ -3607,7 +3539,7 @@ mod tests {
         ProcessSchedulingState {
             affinity: CpuSet::from_ids([CpuId::new(0), CpuId::new(2)]),
             nice,
-            policy: SchedulingPolicy::Other,
+            policy: SchedulingClass::Other,
             uclamp_min: Some(128),
             uclamp_max: Some(896),
         }
@@ -4163,7 +4095,11 @@ mod tests {
                 .expect("read applied task"),
             desired
         );
-        assert!(!actuator.has_pending_journal().expect("startup recovery"));
+        assert!(
+            !actuator
+                .startup_recovery_required()
+                .expect("startup recovery")
+        );
         assert!(actuator.has_owned_resources().expect("owned resources"));
         assert!(store.load().expect("load task journal").is_some());
 
@@ -4174,7 +4110,11 @@ mod tests {
                 .expect("read restored task"),
             original
         );
-        assert!(!actuator.has_pending_journal().expect("pending journal"));
+        assert!(
+            !actuator
+                .startup_recovery_required()
+                .expect("pending journal")
+        );
         assert!(!actuator.has_owned_resources().expect("owned resources"));
         assert!(store.load().expect("load cleared journal").is_none());
     }
@@ -4256,7 +4196,7 @@ mod tests {
 
         let mut administrator = first_desired;
         administrator.nice = 7;
-        administrator.policy = SchedulingPolicy::Batch;
+        administrator.policy = SchedulingClass::Batch;
         controller.set_admin(identity.pid, administrator.clone());
 
         let mut next_desired = administrator.clone();
@@ -4271,7 +4211,7 @@ mod tests {
         let applied = &outcome.applied[&identity];
         assert_eq!(applied.affinity, CpuSet::from_ids([CpuId::new(2)]));
         assert_eq!(applied.nice, 7);
-        assert_eq!(applied.policy, SchedulingPolicy::Batch);
+        assert_eq!(applied.policy, SchedulingClass::Batch);
 
         actuator
             .restore_tasks(&[identity])
@@ -4281,7 +4221,7 @@ mod tests {
             .expect("restored task");
         assert_eq!(restored.affinity, original.affinity);
         assert_eq!(restored.nice, 7);
-        assert_eq!(restored.policy, SchedulingPolicy::Batch);
+        assert_eq!(restored.policy, SchedulingClass::Batch);
         assert!(store.load().expect("cleared journal").is_none());
     }
 
@@ -4409,7 +4349,7 @@ mod tests {
         controller.insert(second.pid, second_original.clone());
         controller.fail_on(2);
         let mut administrator = first_desired.clone();
-        administrator.policy = SchedulingPolicy::Batch;
+        administrator.policy = SchedulingClass::Batch;
         controller.set_admin_on_failure(first.pid, administrator);
         let actuator = control_actuator(
             store,
@@ -4436,7 +4376,7 @@ mod tests {
             .read_scheduling(first.pid)
             .expect("first rollback");
         assert_eq!(first_after_rollback.nice, first_original.nice);
-        assert_eq!(first_after_rollback.policy, SchedulingPolicy::Batch);
+        assert_eq!(first_after_rollback.policy, SchedulingClass::Batch);
         assert_eq!(
             controller
                 .read_scheduling(second.pid)
@@ -4693,7 +4633,11 @@ mod tests {
             Some(controller.clone()),
             Some(systemd.clone()),
         );
-        assert!(restarted.has_pending_journal().expect("pending journal"));
+        assert!(
+            restarted
+                .startup_recovery_required()
+                .expect("pending journal")
+        );
         assert!(matches!(
             restarted.apply_tasks(&[TaskRequest {
                 identity,
@@ -4713,7 +4657,11 @@ mod tests {
             systemd.read_unit_properties(unit).expect("recovered unit"),
             original_unit
         );
-        assert!(!restarted.has_pending_journal().expect("pending journal"));
+        assert!(
+            !restarted
+                .startup_recovery_required()
+                .expect("pending journal")
+        );
         assert!(store.load().expect("cleared recovery journal").is_none());
     }
 
@@ -4797,7 +4745,11 @@ mod tests {
             restarted.mode().expect("mode"),
             ActuatorMode::ReadWrite
         ));
-        assert!(!restarted.has_pending_journal().expect("pending journal"));
+        assert!(
+            !restarted
+                .startup_recovery_required()
+                .expect("pending journal")
+        );
         assert!(store.load().expect("cleared recovery journal").is_none());
     }
 

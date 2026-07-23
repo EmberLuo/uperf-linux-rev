@@ -14,11 +14,11 @@ use uperf_actuator::{
     ActuatorError, FrequencyActuator, FrequencyRequest, TaskRequest, UnitRequest,
 };
 use uperf_core::{
-    AppliedState, AppliedTargetState, DesiredPlan, Hertz, MonotonicMillis, PolicyEngine,
-    ProcessIdentity, ProcessInfo, SchedulingClass, TargetId, TaskPlan,
+    AppliedState, DesiredPlan, Hertz, PolicyEngine, ProcessIdentity, ProcessInfo, TargetId,
+    TaskPlan,
 };
 use uperf_platform::{
-    PlatformError, ProcessSchedulingState, RuntimePlatform, SchedulingPolicy, SystemdUnitProperties,
+    PlatformError, ProcessSchedulingState, RuntimePlatform, SystemdUnitProperties,
 };
 
 /// One immutable state snapshot submitted to the serialized blocking worker.
@@ -161,7 +161,6 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
         match job.frequency_safety.with_upper_caps(|upper_caps| {
             reconcile_frequencies(
                 job.actuator.as_ref(),
-                job.environment.monotonic_millis(),
                 &outcome.desired,
                 upper_caps,
                 &mut outcome.applied,
@@ -192,16 +191,11 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
 
 fn reconcile_frequencies(
     actuator: &FrequencyActuator,
-    now: MonotonicMillis,
     desired: &DesiredPlan,
     upper_caps: &BTreeMap<TargetId, Hertz>,
     applied: &mut AppliedState,
 ) -> Result<(), String> {
-    let mut effective = desired
-        .frequencies
-        .iter()
-        .map(|(id, plan)| (id.clone(), plan.limits))
-        .collect::<BTreeMap<_, _>>();
+    let mut effective = desired.frequencies.clone();
     for (id, cap) in upper_caps {
         if let Some(limits) = effective.get_mut(id) {
             *limits = apply_upper_cap(*limits, *cap);
@@ -232,14 +226,7 @@ fn reconcile_frequencies(
             .read_limits(id)
             .map_err(|error| format!("read frequency target {id}: {error}"))?;
         if current == *limits {
-            applied.frequencies.insert(
-                id.clone(),
-                AppliedTargetState {
-                    limits: current,
-                    generation: desired.generation,
-                    verified_at: now,
-                },
-            );
+            applied.frequencies.insert(id.clone(), current);
         } else {
             requests.push(FrequencyRequest {
                 target: id.clone(),
@@ -251,14 +238,7 @@ fn reconcile_frequencies(
         .apply_batch(&requests)
         .map_err(|error| format!("apply frequency batch: {error}"))?;
     for (id, limits) in result.applied {
-        applied.frequencies.insert(
-            id,
-            AppliedTargetState {
-                limits,
-                generation: desired.generation,
-                verified_at: now,
-            },
-        );
+        applied.frequencies.insert(id, limits);
     }
     Ok(())
 }
@@ -566,14 +546,9 @@ fn task_plan_matches(actual: &ProcessSchedulingState, desired: &TaskPlan) -> boo
         .as_ref()
         .is_none_or(|affinity| actual.affinity == *affinity)
         && desired.nice.is_none_or(|nice| actual.nice == nice)
-        && desired.scheduling_class.is_none_or(|class| {
-            actual.policy
-                == match class {
-                    SchedulingClass::Other => SchedulingPolicy::Other,
-                    SchedulingClass::Batch => SchedulingPolicy::Batch,
-                    SchedulingClass::Idle => SchedulingPolicy::Idle,
-                }
-        })
+        && desired
+            .scheduling_class
+            .is_none_or(|class| actual.policy == class)
         && desired.uclamp.is_none_or(|limits| {
             actual.uclamp_min == Some(limits.min) && actual.uclamp_max == Some(limits.max)
         })
@@ -590,11 +565,7 @@ fn apply_task_plan(
         current.nice = nice;
     }
     if let Some(class) = desired.scheduling_class {
-        current.policy = match class {
-            SchedulingClass::Other => SchedulingPolicy::Other,
-            SchedulingClass::Batch => SchedulingPolicy::Batch,
-            SchedulingClass::Idle => SchedulingPolicy::Idle,
-        };
+        current.policy = class;
     }
     if let Some(limits) = desired.uclamp {
         current.uclamp_min = Some(limits.min);
@@ -611,11 +582,7 @@ fn scheduling_state_as_plan(state: &ProcessSchedulingState) -> TaskPlan {
     TaskPlan {
         affinity: Some(state.affinity.clone()),
         nice: Some(state.nice),
-        scheduling_class: Some(match state.policy {
-            SchedulingPolicy::Other => SchedulingClass::Other,
-            SchedulingPolicy::Batch => SchedulingClass::Batch,
-            SchedulingPolicy::Idle => SchedulingClass::Idle,
-        }),
+        scheduling_class: Some(state.policy),
         uclamp,
     }
 }

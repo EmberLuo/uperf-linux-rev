@@ -64,21 +64,6 @@ impl ValidationErrors {
     pub fn issues(&self) -> &[ValidationIssue] {
         &self.issues
     }
-
-    #[must_use]
-    pub fn into_issues(self) -> Vec<ValidationIssue> {
-        self.issues
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.issues.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.issues.is_empty()
-    }
 }
 
 impl fmt::Display for ValidationErrors {
@@ -832,23 +817,25 @@ impl Validate for AppsConfig {
     }
 }
 
-/// An already separated set of runtime configuration files.
+/// Runtime configuration documents with cross-file references.
 ///
 /// This is not another on-disk format; it exists to validate references spanning
-/// the three independently reloadable JSON documents.
+/// the device and policy documents. App rules are validated independently.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigBundle {
     pub device: DeviceConfig,
     pub policy: PolicyConfig,
-    pub apps: AppsConfig,
 }
 
-impl Validate for ConfigBundle {
-    fn validate(&self) -> Result<(), ValidationErrors> {
+impl ConfigBundle {
+    /// Validate only references and invariants spanning separately validated
+    /// configuration documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns all cross-document issues.
+    pub fn validate_cross_references(&self) -> Result<(), ValidationErrors> {
         let mut issues = Vec::new();
-        append_prefixed_issues("device", self.device.validate(), &mut issues);
-        append_prefixed_issues("policy", self.policy.validate(), &mut issues);
-        append_prefixed_issues("apps", self.apps.validate(), &mut issues);
 
         if self.device.thermal_zones.is_empty() {
             issues.push(ValidationIssue::new(
@@ -1262,20 +1249,6 @@ fn finish_validation(issues: Vec<ValidationIssue>) -> Result<(), ValidationError
     }
 }
 
-fn append_prefixed_issues(
-    prefix: &str,
-    result: Result<(), ValidationErrors>,
-    issues: &mut Vec<ValidationIssue>,
-) {
-    if let Err(errors) = result {
-        issues.extend(
-            errors.into_issues().into_iter().map(|issue| {
-                ValidationIssue::new(format!("{prefix}.{}", issue.path), issue.message)
-            }),
-        );
-    }
-}
-
 const fn default_true() -> bool {
     true
 }
@@ -1518,15 +1491,10 @@ mod tests {
                 ..TaskPlan::default()
             },
         });
-        let bundle = ConfigBundle {
-            device,
-            policy,
-            apps: AppsConfig {
-                schema_version: CONFIG_SCHEMA_VERSION,
-                rules: Vec::new(),
-            },
-        };
-        let error = bundle.validate().expect_err("cross-file errors");
+        let bundle = ConfigBundle { device, policy };
+        let error = bundle
+            .validate_cross_references()
+            .expect_err("cross-file errors");
         assert!(
             error
                 .issues()

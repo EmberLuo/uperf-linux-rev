@@ -11,10 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AppliedState, AppsConfig, CpuId, CpuSet, DesiredPlan, FrequencyLimits, Hertz, MilliCelsius,
-    MonotonicMillis, ObservedState, PlanSource, PolicyConfig, ProcessIdentity, ProcessInfo,
-    ProfileConfig, TargetFrequencyPlan, TargetId, TaskPlan, ThermalReading, ThermalZoneConfig,
-    Validate, ValidationErrors, WorkloadMatcher,
+    AppsConfig, CpuId, CpuSet, DesiredPlan, FrequencyLimits, Hertz, MilliCelsius, MonotonicMillis,
+    ObservedState, PolicyConfig, ProcessIdentity, ProcessInfo, ProfileConfig, TargetId, TaskPlan,
+    ThermalReading, ThermalZoneConfig, Validate, ValidationErrors, WorkloadMatcher,
 };
 
 #[derive(
@@ -459,16 +458,6 @@ impl Default for HeavyLoadDetector {
 }
 
 impl HeavyLoadDetector {
-    #[must_use]
-    pub fn state(&self) -> HeavyLoadState {
-        self.state
-    }
-
-    #[must_use]
-    pub fn ema(&self) -> Option<f64> {
-        self.ema
-    }
-
     /// Add one load sample and update the hysteretic heavy-load state.
     ///
     /// # Errors
@@ -550,33 +539,6 @@ impl From<&ThermalZoneConfig> for ThermalThresholds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ThermalCaps {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warning: Option<Hertz>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub throttled: Option<Hertz>,
-    pub critical: Hertz,
-    pub sensor_failure: Hertz,
-}
-
-impl ThermalCaps {
-    #[must_use]
-    pub const fn for_state(self, state: ThermalState) -> Option<Hertz> {
-        match state {
-            ThermalState::Normal => None,
-            ThermalState::Warning => self.warning,
-            ThermalState::Throttled => match self.throttled {
-                Some(cap) => Some(cap),
-                None => self.warning,
-            },
-            ThermalState::Critical => Some(self.critical),
-            ThermalState::Degraded => Some(self.sensor_failure),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ThermalGuard {
     thresholds: ThermalThresholds,
@@ -592,11 +554,6 @@ impl ThermalGuard {
             state: ThermalState::Normal,
             pending: None,
         }
-    }
-
-    #[must_use]
-    pub const fn state(&self) -> ThermalState {
-        self.state
     }
 
     pub fn update(&mut self, now: MonotonicMillis, reading: &ThermalReading) -> ThermalState {
@@ -913,31 +870,19 @@ impl PolicyEngine {
                     thermal_cap,
                 },
             )?;
-            let (request, source) = input
-                .manual_overrides
-                .get(id)
-                .map_or((automatic, PlanSource::Automatic), |manual| {
-                    (*manual, PlanSource::ManualOverride)
-                });
-            let limits = constrain_frequency_limits(
-                request,
-                target.frequency.hardware_limits,
-                input.administrator_caps.get(id).copied(),
-                thermal_cap,
-                &target.frequency.available_frequencies,
-                target.frequency.hertz_per_unit,
-            )?;
-            frequencies.insert(
-                id.clone(),
-                TargetFrequencyPlan {
-                    limits,
-                    source: if input.thermal_degraded {
-                        PlanSource::ThermalDegraded
-                    } else {
-                        source
-                    },
-                },
-            );
+            let limits = if let Some(manual) = input.manual_overrides.get(id) {
+                constrain_frequency_limits(
+                    *manual,
+                    target.frequency.hardware_limits,
+                    input.administrator_caps.get(id).copied(),
+                    thermal_cap,
+                    &target.frequency.available_frequencies,
+                    target.frequency.hertz_per_unit,
+                )?
+            } else {
+                automatic
+            };
+            frequencies.insert(id.clone(), limits);
         }
 
         for (id, target) in input.manual_target_policies {
@@ -970,19 +915,7 @@ impl PolicyEngine {
                 &target.available_frequencies,
                 target.hertz_per_unit,
             )?;
-            frequencies.insert(
-                id.clone(),
-                TargetFrequencyPlan {
-                    limits,
-                    source: if input.thermal_degraded {
-                        PlanSource::ThermalDegraded
-                    } else if manual.is_some() {
-                        PlanSource::ManualOverride
-                    } else {
-                        PlanSource::Automatic
-                    },
-                },
-            );
+            frequencies.insert(id.clone(), limits);
         }
 
         Ok(DesiredPlan {
@@ -1060,19 +993,6 @@ impl PolicyEngine {
         }
         Ok(decision)
     }
-
-    /// True when no verified target state differs from the desired plan.
-    #[must_use]
-    pub fn is_reconciled(desired: &DesiredPlan, applied: &AppliedState) -> bool {
-        desired.frequencies.len() == applied.frequencies.len()
-            && desired.frequencies.iter().all(|(id, target)| {
-                applied
-                    .frequencies
-                    .get(id)
-                    .is_some_and(|actual| actual.limits == target.limits)
-            })
-            && desired.tasks == applied.tasks
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1149,10 +1069,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        AppRule, AppliedTargetState, CONFIG_SCHEMA_VERSION, CpuId, InputConfig, LoadConfig,
-        ObservedFrequency, ProcessId, ProcessIdentity, ProcessRuleConfig, ScenePatch,
-        SchedulerConfig, SchedulingClass, SensorHealth, TaskPlan, TaskProfileConfig,
-        ThermalPolicyConfig, ThreadRuleConfig, UserId, WorkloadMatcher,
+        AppRule, CONFIG_SCHEMA_VERSION, CpuId, InputConfig, LoadConfig, ObservedFrequency,
+        ProcessId, ProcessIdentity, ProcessRuleConfig, ScenePatch, SchedulerConfig,
+        SchedulingClass, SensorHealth, TaskPlan, TaskProfileConfig, ThermalPolicyConfig,
+        ThreadRuleConfig, UserId, WorkloadMatcher,
     };
 
     fn target(value: &str) -> TargetId {
@@ -1605,7 +1525,6 @@ mod tests {
                 },
             )]),
             thermal: BTreeMap::new(),
-            active_workload: None,
         };
         let mut hints = HintSet::new();
         hints.activate(Hint::with_ttl(Scene::Boost, MonotonicMillis(0), 100));
@@ -1639,17 +1558,16 @@ mod tests {
             .expect("evaluate");
         assert_eq!(plan.dominant_scene, Scene::Boost);
         assert_eq!(
-            plan.frequencies[&id].limits,
+            plan.frequencies[&id],
             FrequencyLimits {
                 min: Hertz(1_500),
                 max: Hertz(1_500)
             }
         );
-        assert_eq!(plan.frequencies[&id].source, PlanSource::ManualOverride);
     }
 
     #[test]
-    fn degraded_thermal_suppresses_boost_and_marks_source() {
+    fn degraded_thermal_suppresses_boost() {
         let engine = PolicyEngine::new(policy_config()).expect("engine");
         let id = target("cpu.0");
         let observed = ObservedState {
@@ -1657,7 +1575,6 @@ mod tests {
             cpu_loads: BTreeMap::from([(CpuId(0), 0.1)]),
             frequencies: BTreeMap::new(),
             thermal: BTreeMap::new(),
-            active_workload: None,
         };
         let mut hints = HintSet::new();
         hints.activate(Hint::persistent(Scene::Touch, MonotonicMillis(0)));
@@ -1685,7 +1602,6 @@ mod tests {
             })
             .expect("evaluate");
         assert_eq!(plan.dominant_scene, Scene::Touch);
-        assert_eq!(plan.frequencies[&id].source, PlanSource::ThermalDegraded);
     }
 
     #[test]
@@ -1706,7 +1622,6 @@ mod tests {
                 },
             )]),
             thermal: BTreeMap::new(),
-            active_workload: None,
         };
         let manual_targets = BTreeMap::from([(id.clone(), frequency_policy())]);
         let plan = engine
@@ -1725,13 +1640,12 @@ mod tests {
             })
             .expect("evaluate");
         assert_eq!(
-            plan.frequencies[&id].limits,
+            plan.frequencies[&id],
             FrequencyLimits {
                 min: Hertz(1_000),
                 max: Hertz(1_500),
             }
         );
-        assert_eq!(plan.frequencies[&id].source, PlanSource::Automatic);
     }
 
     #[test]
@@ -1743,7 +1657,6 @@ mod tests {
             cpu_loads: BTreeMap::new(),
             frequencies: BTreeMap::new(),
             thermal: BTreeMap::new(),
-            active_workload: None,
         };
         let targets = BTreeMap::from([(
             id.clone(),
@@ -1768,44 +1681,5 @@ mod tests {
             })
             .expect_err("missing cap");
         assert_eq!(error, PolicyError::MissingThermalCap(id));
-    }
-
-    #[test]
-    fn reconciliation_compares_verified_values_not_generation() {
-        let id = target("cpu.0");
-        let desired = DesiredPlan {
-            generation: 5,
-            effective_profile: ProfileId::Balance,
-            dominant_scene: Scene::Idle,
-            frequencies: BTreeMap::from([(
-                id.clone(),
-                TargetFrequencyPlan {
-                    limits: FrequencyLimits {
-                        min: Hertz(500),
-                        max: Hertz(1_000),
-                    },
-                    source: PlanSource::Automatic,
-                },
-            )]),
-            tasks: BTreeMap::new(),
-        };
-        let applied = AppliedState {
-            generation: 4,
-            frequencies: BTreeMap::from([(
-                id,
-                AppliedTargetState {
-                    limits: FrequencyLimits {
-                        min: Hertz(500),
-                        max: Hertz(1_000),
-                    },
-                    generation: 4,
-                    verified_at: MonotonicMillis(1),
-                },
-            )]),
-            tasks: BTreeMap::new(),
-            degraded: false,
-            degraded_reason: None,
-        };
-        assert!(PolicyEngine::is_reconciled(&desired, &applied));
     }
 }

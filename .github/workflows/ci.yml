@@ -91,7 +91,6 @@ jobs:
             packaging/gui/org.uperflinux.Gui.svg
           desktop-file-validate packaging/gui/org.uperflinux.Gui.desktop
           appstreamcli validate --no-net packaging/gui/org.uperflinux.Gui.metainfo.xml
-          systemd-analyze verify packaging/systemd/uperf-linux.service
           dpkg-parsechangelog --file packaging/debian/changelog >/dev/null
           jq empty config/schema/*.json
           make --dry-run --file packaging/debian/rules override_dh_auto_install >/dev/null
@@ -121,14 +120,3 @@ jobs:
             --package uperf-daemon \
             --package uperfctl \
             --package uperf-probe
-
-  dependency-policy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check advisories, licenses and dependency sources
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses bans sources

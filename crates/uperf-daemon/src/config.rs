@@ -13,7 +13,7 @@ use uperf_api::{ApiVersion, Capabilities, ModeInfo, TargetCapability, feature};
 use uperf_core::{
     AppRuleEngine, AppsConfig, CONFIG_SCHEMA_VERSION, ConfigBundle, CpuSet, CpuTargetPolicy,
     DeviceConfig, FrequencyLimits, FrequencyPolicy, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig,
-    PolicyEngine, TargetId, ThermalZoneConfig, Validate,
+    PolicyEngine, TargetId, ThermalZoneConfig,
 };
 use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -26,15 +26,6 @@ pub struct ConfigurationPaths {
 }
 
 impl ConfigurationPaths {
-    #[must_use]
-    pub fn system() -> Self {
-        Self {
-            device: PathBuf::from("/etc/uperf-linux/device.json"),
-            policy: PathBuf::from("/etc/uperf-linux/policy.json"),
-            apps: PathBuf::from("/var/lib/uperf-linux/apps.json"),
-        }
-    }
-
     #[must_use]
     pub fn below(config_directory: impl AsRef<Path>, state_directory: impl AsRef<Path>) -> Self {
         Self {
@@ -146,9 +137,8 @@ impl ResolvedConfiguration {
         ConfigBundle {
             device: device.clone(),
             policy: policy.clone(),
-            apps: apps.clone(),
         }
-        .validate()
+        .validate_cross_references()
         .context("validate references across device, policy, and application rules")?;
         let policy_engine = PolicyEngine::new(policy.clone())?;
         let app_rule_engine = AppRuleEngine::new(&apps)?;
@@ -658,7 +648,7 @@ mod tests {
     use uperf_core::{
         AppsConfig, ConfigBundle, CpuId, CpuPolicyCapability, CpuSet, DevfreqCapability,
         DeviceCapabilities, DeviceConfig, FrequencyLimits, Hertz, MAX_CONFIG_FILE_BYTES,
-        PolicyConfig, TargetId, ThermalZoneCapability, Validate,
+        PolicyConfig, TargetId, ThermalZoneCapability,
     };
     use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -679,15 +669,11 @@ mod tests {
             .expect("device configuration");
         let policy = PolicyConfig::from_json(include_str!("../../../config/policy.json"))
             .expect("policy configuration");
-        let apps = AppsConfig::from_json(include_str!("../../../config/apps.json"))
+        let _apps = AppsConfig::from_json(include_str!("../../../config/apps.json"))
             .expect("apps configuration");
-        ConfigBundle {
-            device,
-            policy,
-            apps,
-        }
-        .validate()
-        .expect("cross-file configuration");
+        ConfigBundle { device, policy }
+            .validate_cross_references()
+            .expect("cross-file configuration");
     }
 
     #[test]

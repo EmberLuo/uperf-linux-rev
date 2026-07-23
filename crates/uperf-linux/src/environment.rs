@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uperf_core::{CpuSet, DeviceCapabilities, ProcessId, ProcessInfo};
 use uperf_platform::{
     Clock, CpuTimeSnapshot, OnlineCpuSource, PlatformError, PlatformResult, ProcReader, SysfsIo,
-    ThermalSample, ThermalSource, TopologySource,
+    ThermalSample,
 };
 
 use crate::{
@@ -103,12 +103,6 @@ impl LinuxEnvironment {
     #[must_use]
     pub fn sysfs(&self) -> &RootedSysfs {
         &self.sysfs
-    }
-
-    /// Monotonic clock shared by procfs, thermal and daemon hint timestamps.
-    #[must_use]
-    pub fn clock(&self) -> &LinuxClock {
-        &self.clock
     }
 
     /// Read the current CPU-online mask without relying on the startup
@@ -206,7 +200,7 @@ impl LinuxEnvironment {
     pub fn probe(&self) -> PlatformResult<ProbeReport> {
         let discovery = self.discover()?;
         let cpu_times = self.cpu_times()?;
-        let thermal = self.read_thermal()?;
+        let thermal = read_thermal_samples(&self.roots.sys, &self.sysfs, &self.clock)?;
         let system = read_system_info(&self.roots)?;
         Ok(ProbeReport {
             schema_version: 1,
@@ -225,19 +219,9 @@ impl Clock for LinuxEnvironment {
     }
 }
 
-impl TopologySource for LinuxEnvironment {
-    fn discover_capabilities(&self) -> PlatformResult<DeviceCapabilities> {
-        Ok(self.discover()?.capabilities)
-    }
-}
-
 impl ProcReader for LinuxEnvironment {
     fn cpu_times(&self) -> PlatformResult<CpuTimeSnapshot> {
         self.procfs.cpu_times()
-    }
-
-    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
-        self.procfs.list_processes()
     }
 
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
@@ -252,12 +236,6 @@ impl ProcReader for LinuxEnvironment {
 impl OnlineCpuSource for LinuxEnvironment {
     fn online_cpus(&self) -> PlatformResult<CpuSet> {
         LinuxEnvironment::online_cpus(self)
-    }
-}
-
-impl ThermalSource for LinuxEnvironment {
-    fn read_thermal(&self) -> PlatformResult<Vec<ThermalSample>> {
-        read_thermal_samples(&self.roots.sys, &self.sysfs, &self.clock)
     }
 }
 

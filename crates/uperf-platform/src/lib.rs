@@ -12,9 +12,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uperf_core::{
-    CpuId, CpuSet, DeviceCapabilities, MonotonicMillis, ProcessId, ProcessInfo, ThermalReading,
-};
+pub use uperf_core::SchedulingClass;
+use uperf_core::{CpuId, CpuSet, MonotonicMillis, ProcessId, ProcessInfo, ThermalReading};
 
 /// Result type shared by all operating-system ports.
 pub type PlatformResult<T> = Result<T, PlatformError>;
@@ -124,25 +123,6 @@ pub struct CpuTimes {
 }
 
 impl CpuTimes {
-    /// Total accounted time, saturating on corrupt or extreme input.
-    #[must_use]
-    pub fn total(self) -> u64 {
-        self.user
-            .saturating_add(self.nice)
-            .saturating_add(self.system)
-            .saturating_add(self.idle)
-            .saturating_add(self.io_wait)
-            .saturating_add(self.irq)
-            .saturating_add(self.soft_irq)
-            .saturating_add(self.steal)
-    }
-
-    /// Time treated as idle by the load observer.
-    #[must_use]
-    pub fn idle_total(self) -> u64 {
-        self.idle.saturating_add(self.io_wait)
-    }
-
     /// Compute busy utilization between two monotonic counter samples.
     ///
     /// Counter regression and a zero-width interval return `None`; callers
@@ -191,14 +171,6 @@ pub trait ProcReader: Send + Sync {
     /// Returns a platform error when procfs is unreadable or malformed.
     fn cpu_times(&self) -> PlatformResult<CpuTimeSnapshot>;
 
-    /// Return currently visible PIDs.  Processes may disappear before a
-    /// subsequent `process_identity` call.
-    ///
-    /// # Errors
-    ///
-    /// Returns a platform error when the process directory cannot be listed.
-    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>>;
-
     /// Return the thread IDs currently belonging to a process.
     ///
     /// The returned IDs are snapshots only. Callers must resolve and verify a
@@ -237,16 +209,6 @@ pub trait RuntimePlatform: Clock + ProcReader + OnlineCpuSource {}
 
 impl<T> RuntimePlatform for T where T: Clock + ProcReader + OnlineCpuSource {}
 
-/// Discover immutable and slowly-changing device capabilities.
-pub trait TopologySource: Send + Sync {
-    /// Discover CPU policies, devfreq targets and thermal-zone identities.
-    ///
-    /// # Errors
-    ///
-    /// Returns a platform error when a required discovery root is unreadable.
-    fn discover_capabilities(&self) -> PlatformResult<DeviceCapabilities>;
-}
-
 /// A temperature observation tied to a discovered thermal-zone identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -256,16 +218,6 @@ pub struct ThermalSample {
     /// Exact logical sysfs directory from which this sample was read.
     pub path: PathBuf,
     pub reading: ThermalReading,
-}
-
-/// Observe configured or discovered thermal zones.
-pub trait ThermalSource: Send + Sync {
-    /// Read all currently known thermal zones independently.
-    ///
-    /// # Errors
-    ///
-    /// Returns a platform error when thermal-zone enumeration fails.
-    fn read_thermal(&self) -> PlatformResult<Vec<ThermalSample>>;
 }
 
 /// Opaque identity assigned to one open physical input-device instance.
@@ -282,12 +234,6 @@ impl InputDeviceId {
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    /// Return the opaque numeric value.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -333,36 +279,15 @@ pub enum InputEvent {
     Resync { device: Option<InputDeviceId> },
 }
 
-/// Stream-like source for input events.
-pub trait InputSource: Send {
-    /// Return the next complete event, blocking according to the adapter's
-    /// documented scheduling model.
-    ///
-    /// # Errors
-    ///
-    /// Returns a platform error when the input source disconnects or emits an
-    /// unrecoverable malformed event.
-    fn next_event(&mut self) -> PlatformResult<InputEvent>;
-}
-
 /// Scheduler state whose original value must be journaled before mutation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSchedulingState {
     pub affinity: CpuSet,
     pub nice: i8,
-    pub policy: SchedulingPolicy,
+    pub policy: SchedulingClass,
     pub uclamp_min: Option<u16>,
     pub uclamp_max: Option<u16>,
-}
-
-/// Non-real-time scheduling classes supported by v1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SchedulingPolicy {
-    Other,
-    Batch,
-    Idle,
 }
 
 /// Typed process/thread scheduling mutations.

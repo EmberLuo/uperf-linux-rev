@@ -52,12 +52,6 @@ impl LinuxProc {
             .map_err(|error| PlatformError::io("canonicalize procfs root", requested, error))?;
         Ok(Self { root, clock })
     }
-
-    /// Physical procfs root.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
 }
 
 impl ProcReader for LinuxProc {
@@ -66,10 +60,6 @@ impl ProcReader for LinuxProc {
         let contents =
             fs::read_to_string(&path).map_err(|error| PlatformError::io("read", &path, error))?;
         parse_cpu_times(&path, &contents, self.clock.monotonic_millis())
-    }
-
-    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
-        list_numeric_directories(&self.root, "list procfs")
     }
 
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
@@ -337,7 +327,19 @@ intr 0
             snapshot.cpus.keys().copied().collect::<Vec<_>>(),
             [CpuId(0), CpuId(7)]
         );
-        assert_eq!(snapshot.aggregate.total(), 558);
+        assert_eq!(
+            snapshot.aggregate,
+            CpuTimes {
+                user: 100,
+                nice: 2,
+                system: 30,
+                idle: 400,
+                io_wait: 5,
+                irq: 6,
+                soft_irq: 7,
+                steal: 8,
+            }
+        );
     }
 
     #[test]

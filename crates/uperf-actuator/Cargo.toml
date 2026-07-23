@@ -9,15 +9,12 @@ license.workspace = true
 crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 uperf-core = { path = "../uperf-core" }
 uperf-platform = { path = "../uperf-platform" }
 
 [dev-dependencies]
-tempfile.workspace = true
 uperf-testkit = { path = "../uperf-testkit" }
 
 [lints]
 workspace = true
-

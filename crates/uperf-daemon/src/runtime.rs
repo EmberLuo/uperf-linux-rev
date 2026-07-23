@@ -841,7 +841,6 @@ impl RuntimeActor {
                 cpu_loads: BTreeMap::new(),
                 frequencies: BTreeMap::new(),
                 thermal: BTreeMap::new(),
-                active_workload: None,
             },
             desired: None,
             applied: AppliedState::default(),
@@ -993,18 +992,11 @@ impl RuntimeActor {
             effective_profile,
             dominant_scene,
             thermal_state: self.thermal_state,
-            desired_frequencies: self.desired.as_ref().map_or_else(BTreeMap::new, |plan| {
-                plan.frequencies
-                    .iter()
-                    .map(|(id, target)| (id.clone(), target.limits))
-                    .collect()
-            }),
-            applied_frequencies: self
-                .applied
-                .frequencies
-                .iter()
-                .map(|(id, target)| (id.clone(), target.limits))
-                .collect(),
+            desired_frequencies: self
+                .desired
+                .as_ref()
+                .map_or_else(BTreeMap::new, |plan| plan.frequencies.clone()),
+            applied_frequencies: self.applied.frequencies.clone(),
             desired_tasks: self
                 .desired
                 .as_ref()
@@ -2052,10 +2044,8 @@ impl RuntimeActor {
                 "workload was already active",
             ));
         }
-        let observed_identity = observed.identity;
         self.active_workload = Some(observed);
         self.requested_workload_profile = requested_profile;
-        self.observed.active_workload = Some(observed_identity);
         self.health_issues.remove("workload.exited");
         self.scheduler_dirty = true;
         let now = self.environment.monotonic_millis();
@@ -2130,7 +2120,6 @@ impl RuntimeActor {
         let pid = active_identity.pid;
         self.active_workload = None;
         self.requested_workload_profile = None;
-        self.observed.active_workload = None;
         self.scheduler_dirty = true;
         self.generation = self.generation.saturating_add(1);
         self.evaluate_and_reconcile();
@@ -2314,7 +2303,6 @@ impl RuntimeActor {
     fn clear_exited_workload(&mut self) {
         self.active_workload = None;
         self.requested_workload_profile = None;
-        self.observed.active_workload = None;
         self.scheduler_dirty = true;
         self.generation = self.generation.saturating_add(1);
         self.health_issues.insert(
@@ -2774,12 +2762,12 @@ impl RuntimeActor {
             self.applied
                 .frequencies
                 .get(id)
-                .is_none_or(|applied| applied.limits != target.limits)
+                .is_none_or(|applied| applied != target)
                 || self
                     .observed
                     .frequencies
                     .get(id)
-                    .is_none_or(|observed| observed.limits != target.limits)
+                    .is_none_or(|observed| observed.limits != *target)
         }) || self
             .applied
             .frequencies
@@ -2822,7 +2810,7 @@ impl RuntimeActor {
                             self.observed.frequencies.insert(
                                 id.clone(),
                                 ObservedFrequency {
-                                    limits: applied.limits,
+                                    limits: *applied,
                                     // The actuator verifies the two limit
                                     // nodes, but it does not read the
                                     // instantaneous clock node.
@@ -3279,8 +3267,8 @@ impl RuntimeActor {
                     .desired
                     .as_ref()
                     .and_then(|plan| plan.frequencies.get(id))
-                    .map(|plan| plan.limits);
-                let applied = self.applied.frequencies.get(id).map(|state| state.limits);
+                    .copied();
+                let applied = self.applied.frequencies.get(id).copied();
                 let observed_values = observed.unwrap_or_default();
                 let desired_values = desired.unwrap_or_default();
                 let applied_values = applied.unwrap_or_default();
@@ -3979,10 +3967,6 @@ mod tests {
             self.inner.cpu_times()
         }
 
-        fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
-            self.inner.list_processes()
-        }
-
         fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
             self.inner.list_threads(process)
         }
@@ -4451,7 +4435,6 @@ mod tests {
         let active = test_process(42, 1_000);
         let expected = active.identity;
         actor.active_workload = Some(active.clone());
-        actor.observed.active_workload = Some(expected);
         actor.process_identity_in_flight = Some(ProcessIdentityInFlight {
             id: 2,
             is_control_request: true,
@@ -4464,7 +4447,6 @@ mod tests {
         });
 
         assert_eq!(actor.active_workload, Some(active));
-        assert_eq!(actor.observed.active_workload, Some(expected));
         assert_eq!(
             actor.process_identity_in_flight.map(|request| request.id),
             Some(2)

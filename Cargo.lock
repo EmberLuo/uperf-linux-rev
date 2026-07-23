@@ -1322,8 +1322,6 @@ dependencies = [
  "crc32fast",
  "serde",
  "serde_json",
- "sha2",
- "tempfile",
  "thiserror",
  "uperf-core",
  "uperf-platform",
@@ -1422,7 +1420,6 @@ dependencies = [
 name = "uperf-testkit"
 version = "0.1.0"
 dependencies = [
- "tempfile",
  "uperf-core",
  "uperf-platform",
 ]

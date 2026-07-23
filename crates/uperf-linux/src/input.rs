@@ -5,11 +5,10 @@
 //! `/dev/input`. [`EvdevInputSource`] adds conservative hotplug discovery and
 //! multiplexes supported type-B multitouch devices.
 //!
-//! `InputSource::next_event` is a blocking API. The daemon should run it on a
-//! dedicated operating-system thread and forward its normalized events into a
-//! bounded channel. Device descriptors themselves are opened nonblocking so a
-//! quiet touchscreen cannot prevent another device or hotplug from being
-//! observed.
+//! The daemon runs its cancellation-aware blocking API on a dedicated
+//! operating-system thread and forwards normalized events into a bounded
+//! channel. Device descriptors themselves are opened nonblocking so a quiet
+//! touchscreen cannot prevent another device or hotplug from being observed.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -28,9 +27,7 @@ use std::{
 
 use evdev::{AbsoluteAxisCode, EventSummary, SynchronizationCode, raw_stream::RawDevice};
 use uperf_core::InputConfig;
-use uperf_platform::{
-    InputDeviceId, InputEvent, InputSource, PlatformError, PlatformResult, TouchContactId,
-};
+use uperf_platform::{InputDeviceId, InputEvent, PlatformError, PlatformResult, TouchContactId};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_millis(500);
@@ -912,15 +909,6 @@ impl EvdevInputSource {
             self.next_scan = Instant::now() + self.scan_interval;
         }
         self.pending.len() != pending_before || had_disconnected
-    }
-}
-
-impl InputSource for EvdevInputSource {
-    fn next_event(&mut self) -> PlatformResult<InputEvent> {
-        self.next_event_until(&AtomicBool::new(false))?
-            .ok_or(PlatformError::Disappeared(
-                "input source was unexpectedly cancelled".to_owned(),
-            ))
     }
 }
 

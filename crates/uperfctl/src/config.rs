@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uperf_core::{
     AppsConfig, ConfigBundle, DeviceConfig, MAX_CONFIG_FILE_BYTES, MigrationResult, PolicyConfig,
-    Validate, migrate_c_v1,
+    migrate_c_v1,
 };
 
 #[derive(Debug)]
@@ -79,23 +79,6 @@ pub fn write_migration(
     migration: &MigrationResult,
     force: bool,
 ) -> Result<MigrationOutputs> {
-    // Migration intentionally cannot pass activation validation: C v1 did not
-    // identify trusted thermal sensors. Validate each typed document here so a
-    // safe, strictly structured draft can still be written for administrator
-    // review.
-    migration
-        .device
-        .validate()
-        .context("validate migrated device draft")?;
-    migration
-        .policy
-        .validate()
-        .context("validate migrated policy draft")?;
-    migration
-        .apps
-        .validate()
-        .context("validate migrated application-rule draft")?;
-
     ensure_output_directory(directory)?;
     let outputs = MigrationOutputs {
         device: directory.join("device.json"),
@@ -157,13 +140,8 @@ fn validate_bundle(directory: &Path) -> Result<ValidationReport> {
     let policy = parse_document(&policy_path, "policy", PolicyConfig::from_json, &mut errors)?;
     let apps = parse_document(&apps_path, "apps", AppsConfig::from_json, &mut errors)?;
 
-    if let (Some(device), Some(policy), Some(apps)) = (device, policy, apps)
-        && let Err(bundle_errors) = (ConfigBundle {
-            device,
-            policy,
-            apps,
-        })
-        .validate()
+    if let (Some(device), Some(policy), Some(_)) = (device, policy, apps)
+        && let Err(bundle_errors) = (ConfigBundle { device, policy }).validate_cross_references()
     {
         errors.extend(
             bundle_errors

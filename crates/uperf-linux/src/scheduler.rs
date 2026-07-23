@@ -22,7 +22,7 @@ use rustix::{
 };
 use uperf_core::{CpuId, CpuSet, ProcessId};
 use uperf_platform::{
-    PlatformError, PlatformResult, ProcessController, ProcessSchedulingState, SchedulingPolicy,
+    PlatformError, PlatformResult, ProcessController, ProcessSchedulingState, SchedulingClass,
 };
 
 const PROC_ROOT: &str = "/proc";
@@ -35,7 +35,7 @@ trait SchedulingApi: Send + Sync {
     fn read(&self, process: ProcessId) -> PlatformResult<ProcessSchedulingState>;
     fn set_affinity(&self, process: ProcessId, affinity: &CpuSet) -> PlatformResult<()>;
     fn set_nice(&self, process: ProcessId, nice: i8) -> PlatformResult<()>;
-    fn set_policy(&self, process: ProcessId, policy: SchedulingPolicy) -> PlatformResult<()>;
+    fn set_policy(&self, process: ProcessId, policy: SchedulingClass) -> PlatformResult<()>;
     fn set_uclamp(&self, process: ProcessId, minimum: u16, maximum: u16) -> PlatformResult<()>;
 }
 
@@ -368,16 +368,16 @@ impl SchedulingApi for RealSchedulingApi {
         })
     }
 
-    fn set_policy(&self, process: ProcessId, policy: SchedulingPolicy) -> PlatformResult<()> {
+    fn set_policy(&self, process: ProcessId, policy: SchedulingClass) -> PlatformResult<()> {
         let Some(tool) = &self.chrt else {
             return Err(PlatformError::Unsupported(
                 "trusted /usr/bin/chrt is unavailable",
             ));
         };
         let policy = match policy {
-            SchedulingPolicy::Other => "--other",
-            SchedulingPolicy::Batch => "--batch",
-            SchedulingPolicy::Idle => "--idle",
+            SchedulingClass::Other => "--other",
+            SchedulingClass::Batch => "--batch",
+            SchedulingClass::Idle => "--idle",
         };
         run_util_linux(
             tool,
@@ -485,7 +485,7 @@ fn wait_with_deadline(mut child: Child, tool: &Path, resource: &Path) -> Platfor
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParsedScheduler {
-    policy: SchedulingPolicy,
+    policy: SchedulingClass,
     uclamp_min: Option<u16>,
     uclamp_max: Option<u16>,
 }
@@ -509,9 +509,9 @@ fn parse_scheduler_file(path: &Path, contents: &str) -> PlatformResult<ParsedSch
                 })?;
                 let base = raw & !0x4000_0000;
                 policy = Some(match base {
-                    0 => SchedulingPolicy::Other,
-                    3 => SchedulingPolicy::Batch,
-                    5 => SchedulingPolicy::Idle,
+                    0 => SchedulingClass::Other,
+                    3 => SchedulingClass::Batch,
+                    5 => SchedulingClass::Idle,
                     1 | 2 | 6 | 7 => {
                         return Err(PlatformError::Unsupported(
                             "real-time, deadline, and sched_ext tasks are outside v1 control",
@@ -770,7 +770,7 @@ mod tests {
             "policy : 3\nuclamp.min : 128\nuclamp.max : 900\n",
         )
         .unwrap();
-        assert_eq!(parsed.policy, SchedulingPolicy::Batch);
+        assert_eq!(parsed.policy, SchedulingClass::Batch);
         assert_eq!(parsed.uclamp_min, Some(128));
         assert_eq!(parsed.uclamp_max, Some(900));
     }
@@ -798,10 +798,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let online = directory.path().join("online");
         fs::write(&online, "0-2\n").unwrap();
-        let original = state(&[0, 1], 0, SchedulingPolicy::Other, Some(0), Some(1024));
+        let original = state(&[0, 1], 0, SchedulingClass::Other, Some(0), Some(1024));
         let api = Arc::new(FakeSchedulingApi::new(original));
         let controller = LinuxProcessController::with_api(api.clone(), online);
-        let requested = state(&[0, 3], 0, SchedulingPolicy::Other, None, None);
+        let requested = state(&[0, 3], 0, SchedulingClass::Other, None, None);
 
         assert!(
             controller
@@ -816,10 +816,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let online = directory.path().join("online");
         fs::write(&online, "0-7\n").unwrap();
-        let original = state(&[0, 1], 0, SchedulingPolicy::Other, Some(0), Some(1024));
+        let original = state(&[0, 1], 0, SchedulingClass::Other, Some(0), Some(1024));
         let api = Arc::new(FakeSchedulingApi::new(original));
         let controller = LinuxProcessController::with_api(api.clone(), online);
-        let requested = state(&[4, 7], 5, SchedulingPolicy::Batch, Some(256), Some(768));
+        let requested = state(&[4, 7], 5, SchedulingClass::Batch, Some(256), Some(768));
 
         let applied = controller
             .write_scheduling(ProcessId(42), &requested)
@@ -836,11 +836,11 @@ mod tests {
         let directory = tempdir().unwrap();
         let online = directory.path().join("online");
         fs::write(&online, "0-7\n").unwrap();
-        let original = state(&[0, 1], 0, SchedulingPolicy::Other, Some(0), Some(1024));
+        let original = state(&[0, 1], 0, SchedulingClass::Other, Some(0), Some(1024));
         let api = Arc::new(FakeSchedulingApi::new(original.clone()));
         *api.fail_on.lock().unwrap() = Some("policy");
         let controller = LinuxProcessController::with_api(api.clone(), online);
-        let requested = state(&[4], 5, SchedulingPolicy::Batch, None, None);
+        let requested = state(&[4], 5, SchedulingClass::Batch, None, None);
 
         assert!(
             controller
@@ -860,7 +860,7 @@ mod tests {
             api: Arc::new(FakeSchedulingApi::new(state(
                 &[0],
                 0,
-                SchedulingPolicy::Other,
+                SchedulingClass::Other,
                 Some(0),
                 Some(1024),
             ))),
@@ -882,7 +882,7 @@ mod tests {
     fn state(
         cpus: &[u32],
         nice: i8,
-        policy: SchedulingPolicy,
+        policy: SchedulingClass,
         minimum: Option<u16>,
         maximum: Option<u16>,
     ) -> ProcessSchedulingState {
@@ -939,7 +939,7 @@ mod tests {
             Ok(())
         }
 
-        fn set_policy(&self, _process: ProcessId, policy: SchedulingPolicy) -> PlatformResult<()> {
+        fn set_policy(&self, _process: ProcessId, policy: SchedulingClass) -> PlatformResult<()> {
             self.record("policy")?;
             self.state.lock().unwrap().policy = policy;
             Ok(())
