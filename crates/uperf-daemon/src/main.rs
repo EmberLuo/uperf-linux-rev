@@ -67,7 +67,9 @@ impl Default for Options {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+// The control plane uses one executor thread. Periodic telemetry and durable
+// actuator operations run on their dedicated or blocking workers.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run(parse_options(env::args().skip(1))).await {
         eprintln!("uperf-linux: {error:#}");
@@ -177,7 +179,8 @@ async fn run(options: Result<Options>) -> Result<()> {
         actuator,
         started_at,
     });
-    let observers = spawn_linux_observers(environment, &ingress);
+    let observers = spawn_linux_observers(environment, &ingress)
+        .map_err(|error| anyhow!("start Linux observers: {error}"))?;
     let input_observer = spawn_input_observer(ingress.clone())
         .map_err(|error| anyhow!("start evdev observer: {error}"))?;
 
@@ -219,6 +222,10 @@ async fn run(options: Result<Options>) -> Result<()> {
     ));
     let logind_task = (!options.session_bus)
         .then(|| spawn_logind_observer(connection.clone(), ingress, service_shutdown_rx));
+    runtime
+        .activate()
+        .await
+        .context("activate runtime mutation control")?;
 
     let mut shutdown_error = wait_for_shutdown_or_reload(&runtime, &state_task, &signal_task)
         .await

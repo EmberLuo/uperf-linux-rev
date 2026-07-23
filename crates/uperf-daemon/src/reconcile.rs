@@ -102,6 +102,11 @@ impl FrequencySafetyFence {
             .map_err(|_| "frequency safety fence was poisoned".to_owned())?;
         Ok(operation(&envelope.upper_caps))
     }
+
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self, operation: impl FnOnce()) -> Result<(), String> {
+        self.with_upper_caps(|_| operation())
+    }
 }
 
 /// Execute one reconciliation snapshot.

@@ -74,10 +74,10 @@ Pad 6S Pro 12.4 running the repository's local SM8550 kernel:
 - a real session-bus `GetStatus` call completed against the release daemon,
   reported observed/desired values separately, and the daemon exited cleanly
   after SIGINT;
-- a 45.213 second release-mode, read-only sample consumed 0.183 seconds of
-  user CPU and 0.198 seconds of system CPU, or approximately 0.84% of one
-  core, including startup and shutdown;
-- all 189 workspace tests, strict Clippy, rustdoc warnings, and release builds
+- a 45 second release-mode, read-only interval consumed 0.30 CPU-seconds from
+  100 Hz `/proc` accounting, or approximately 0.67% of one core; its steady
+  state had five named threads and 18,484 KiB RSS;
+- all 206 workspace tests, strict Clippy, rustdoc warnings, and release builds
   passed with the locked offline dependency set.
 
 This is deliberately not a signed certification result. No real sysfs,

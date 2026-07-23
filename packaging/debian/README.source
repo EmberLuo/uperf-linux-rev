@@ -11,6 +11,13 @@ before a local build. A distribution upload should use reviewed vendored
 sources or packaged Rust crates instead of granting network access to the
 build.
 
+Release codegen intentionally leaves binaries unstripped and Debian builds
+retain line-table debug information. `dh_strip` owns final stripping and
+generation of matching automatic debug-symbol packages, and therefore also
+honours Debian's `DEB_BUILD_OPTIONS=nostrip` convention. Standalone release
+archives should likewise strip only staged copies and retain their matching
+debug artifacts instead of stripping Cargo's build output in place.
+
 The JSON files below config/schema are generated release artifacts from the
 uperf-core schemars models. Configuration-type changes must regenerate all
 three files and include the schema diff in review.

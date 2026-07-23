@@ -39,9 +39,19 @@ serde_json = "1.0.150"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
-zbus = { version = "5.16.0", features = ["tokio"] }
+tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "rt", "signal", "sync", "time"] }
+zbus = { version = "5.16.0", default-features = false, features = ["tokio"] }
 zvariant = { version = "5.13.1", features = ["option-as-array"] }
+
+# Size-oriented codegen for the shipped binaries. Keep unwind support so a
+# supervised task panic can still drive orderly recovery, and leave stripping
+# to the distribution packager so matching debug symbols can be produced.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "none"
+panic = "unwind"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

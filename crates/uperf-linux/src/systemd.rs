@@ -2,23 +2,26 @@
 //!
 //! systemd remains the only cgroup writer. This module never opens cgroupfs and
 //! never migrates a PID. `SystemdClient` is synchronous, so this implementation
-//! deliberately uses one reusable blocking zbus connection; async callers must
-//! invoke it from `spawn_blocking` rather than a Tokio core worker.
+//! owns one asynchronous zbus connection on a dedicated current-thread Tokio
+//! runtime. Synchronous callers use a bounded request queue; async callers must
+//! still invoke the facade from `spawn_blocking` rather than a Tokio core worker.
 
 use std::{
     fmt, io,
     path::{Path, PathBuf},
+    sync::mpsc::{self, SyncSender},
     time::Duration,
 };
 
+use tokio::sync::mpsc as tokio_mpsc;
 use uperf_core::{CpuId, CpuSet, ProcessId};
 use uperf_platform::{
     PlatformError, PlatformResult, SystemdClient, SystemdUnitInstanceIdentity,
     SystemdUnitInstanceKey, SystemdUnitProperties,
 };
 use zbus::{
-    Error as ZbusError,
-    blocking::{Connection, Proxy, connection::Builder as ConnectionBuilder},
+    Address, Connection, Error as ZbusError, Proxy,
+    connection::Builder as ConnectionBuilder,
     zvariant::{OwnedObjectPath, Value},
 };
 
@@ -33,15 +36,19 @@ const MIN_CPU_WEIGHT: u64 = 1;
 const MAX_CPU_WEIGHT: u64 = 10_000;
 const UNSET_CPU_WEIGHT: u64 = u64::MAX;
 const METHOD_TIMEOUT: Duration = Duration::from_millis(50);
+const OWNER_QUEUE_CAPACITY: usize = 16;
+const OWNER_STACK_SIZE: usize = 512 * 1024;
 
-/// Reusable blocking connection to systemd's system-bus manager.
+/// Synchronous facade for a connection owned by one dedicated D-Bus thread.
 ///
 /// The implementation sends only `CPUWeight` (`t`) and `AllowedCPUs` (`ay`)
 /// through `SetUnitProperties`. It does not expose an untyped property name or
-/// arbitrary variant surface.
+/// arbitrary variant surface. Every facade clone shares the same bounded queue,
+/// so a write, readback, and any required rollback remain one serialized owner
+/// request.
 #[derive(Clone)]
 pub struct SystemdDbusClient {
-    connection: Connection,
+    requests: tokio_mpsc::Sender<OwnerRequest>,
     online_path: PathBuf,
 }
 
@@ -64,47 +71,213 @@ impl SystemdDbusClient {
     pub fn connect_system() -> PlatformResult<Self> {
         let online_path = PathBuf::from(ONLINE_CPUS);
         read_online(&online_path)?;
-        let connection = ConnectionBuilder::system()
-            .and_then(|builder| builder.method_timeout(METHOD_TIMEOUT).build())
-            .map_err(|error| map_dbus_error("connect system bus", error))?;
-        Ok(Self {
-            connection,
-            online_path,
-        })
+        Self::start_owner(ConnectionSource::System, online_path)
     }
 
-    /// Construct from an already-open connection.
+    /// Connect to an explicit bus address.
     ///
     /// This is useful for integration tests on an isolated bus. The connection
-    /// is cloned cheaply and retained for every call.
+    /// is still constructed and exclusively owned by the dedicated owner
+    /// thread, so it cannot inherit another Tokio runtime.
     ///
     /// # Errors
     ///
-    /// Returns an error if the host online CPU list cannot be parsed.
-    pub fn from_connection(connection: &Connection) -> PlatformResult<Self> {
+    /// Returns an error if the bus cannot be reached or the host online CPU
+    /// list cannot be parsed.
+    pub fn from_address(address: Address) -> PlatformResult<Self> {
         let online_path = PathBuf::from(ONLINE_CPUS);
         read_online(&online_path)?;
+        Self::start_owner(ConnectionSource::Address(address), online_path)
+    }
+
+    fn start_owner(source: ConnectionSource, online_path: PathBuf) -> PlatformResult<Self> {
+        let (request_sender, request_receiver) = tokio_mpsc::channel(OWNER_QUEUE_CAPACITY);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let owner_online_path = online_path.clone();
+        std::thread::Builder::new()
+            .name("uperf-systemd".to_owned())
+            .stack_size(OWNER_STACK_SIZE)
+            .spawn(move || {
+                systemd_owner(source, owner_online_path, request_receiver, ready_sender);
+            })
+            .map_err(|error| {
+                PlatformError::io(
+                    "start systemd D-Bus owner",
+                    dbus_resource(SYSTEMD_SERVICE),
+                    error,
+                )
+            })?;
+
+        ready_receiver
+            .recv()
+            .map_err(|_| owner_unavailable("initialize systemd D-Bus owner"))??;
         Ok(Self {
-            connection: connection.clone(),
+            requests: request_sender,
             online_path,
         })
     }
 
-    fn manager(&self) -> PlatformResult<Proxy<'_>> {
+    fn request<T>(
+        &self,
+        operation: &'static str,
+        request: impl FnOnce(SyncSender<PlatformResult<T>>) -> OwnerRequest,
+    ) -> PlatformResult<T> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        match self.requests.try_send(request(reply_sender)) {
+            Ok(()) => {}
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                return Err(owner_queue_full(operation));
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                return Err(owner_unavailable(operation));
+            }
+        }
+        reply_receiver
+            .recv()
+            .map_err(|_| owner_unavailable(operation))?
+    }
+}
+
+enum ConnectionSource {
+    System,
+    Address(Address),
+}
+
+enum OwnerRequest {
+    UnitInstanceForProcess {
+        process: ProcessId,
+        reply: SyncSender<PlatformResult<Option<SystemdUnitInstanceIdentity>>>,
+    },
+    UnitInstanceIdentity {
+        unit: String,
+        reply: SyncSender<PlatformResult<SystemdUnitInstanceIdentity>>,
+    },
+    UnitProcesses {
+        unit: String,
+        reply: SyncSender<PlatformResult<Vec<ProcessId>>>,
+    },
+    ReadUnitProperties {
+        unit: String,
+        reply: SyncSender<PlatformResult<SystemdUnitProperties>>,
+    },
+    WriteUnitProperties {
+        unit: String,
+        desired: SystemdUnitProperties,
+        reply: SyncSender<PlatformResult<SystemdUnitProperties>>,
+    },
+}
+
+struct SystemdOwner {
+    connection: Connection,
+    online_path: PathBuf,
+}
+
+fn systemd_owner(
+    source: ConnectionSource,
+    online_path: PathBuf,
+    mut requests: tokio_mpsc::Receiver<OwnerRequest>,
+    ready: SyncSender<PlatformResult<()>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(PlatformError::io(
+                "build systemd D-Bus runtime",
+                dbus_resource(SYSTEMD_SERVICE),
+                error,
+            )));
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        let builder = match source {
+            ConnectionSource::System => ConnectionBuilder::system()
+                .map_err(|error| map_dbus_error("configure system bus", error)),
+            ConnectionSource::Address(address) => ConnectionBuilder::address(address)
+                .map_err(|error| map_dbus_error("configure D-Bus address", error)),
+        };
+        let builder = match builder {
+            Ok(builder) => builder,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
+        let connection = builder
+            .method_timeout(METHOD_TIMEOUT)
+            .build()
+            .await
+            .map_err(|error| map_dbus_error("connect D-Bus", error));
+        let connection = match connection {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
+        let owner = SystemdOwner {
+            connection,
+            online_path,
+        };
+        if ready.send(Ok(())).is_err() {
+            return;
+        }
+        while let Some(request) = requests.recv().await {
+            owner.handle(request).await;
+        }
+    });
+}
+
+impl SystemdOwner {
+    async fn handle(&self, request: OwnerRequest) {
+        match request {
+            OwnerRequest::UnitInstanceForProcess { process, reply } => {
+                let result = self.unit_instance_for_process(process).await;
+                let _ = reply.send(result);
+            }
+            OwnerRequest::UnitInstanceIdentity { unit, reply } => {
+                let result = self.unit_instance_identity(&unit).await;
+                let _ = reply.send(result);
+            }
+            OwnerRequest::UnitProcesses { unit, reply } => {
+                let result = self.unit_processes(&unit).await;
+                let _ = reply.send(result);
+            }
+            OwnerRequest::ReadUnitProperties { unit, reply } => {
+                let result = self.read_unit_properties(&unit).await;
+                let _ = reply.send(result);
+            }
+            OwnerRequest::WriteUnitProperties {
+                unit,
+                desired,
+                reply,
+            } => {
+                let result = self.write_unit_properties(&unit, &desired).await;
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    async fn manager(&self) -> PlatformResult<Proxy<'_>> {
         Proxy::new(
             &self.connection,
             SYSTEMD_SERVICE,
             SYSTEMD_PATH,
             MANAGER_INTERFACE,
         )
+        .await
         .map_err(|error| map_dbus_error("create systemd manager proxy", error))
     }
 
-    fn resolve_unit(&self, unit: &str) -> PlatformResult<ResolvedUnit> {
+    async fn resolve_unit(&self, unit: &str) -> PlatformResult<ResolvedUnit> {
         let type_interface = validate_unit_name(unit)?;
-        let manager = self.manager()?;
+        let manager = self.manager().await?;
         let path: OwnedObjectPath = manager
             .call("GetUnit", &unit)
+            .await
             .map_err(|error| map_dbus_error("resolve systemd unit", error))?;
         let identity = Proxy::new(
             &self.connection,
@@ -112,9 +285,11 @@ impl SystemdDbusClient {
             path.as_str(),
             UNIT_INTERFACE,
         )
+        .await
         .map_err(|error| map_dbus_error("create systemd unit proxy", error))?;
         let actual: String = identity
             .get_property("Id")
+            .await
             .map_err(|error| map_dbus_error("read systemd unit identity", error))?;
         if actual != unit {
             return Err(PlatformError::invalid(
@@ -129,7 +304,7 @@ impl SystemdDbusClient {
         })
     }
 
-    fn instance_identity(
+    async fn instance_identity(
         &self,
         unit: &str,
         path: &OwnedObjectPath,
@@ -140,24 +315,28 @@ impl SystemdDbusClient {
             path.as_str(),
             UNIT_INTERFACE,
         )
+        .await
         .map_err(|error| map_dbus_error("create systemd unit identity proxy", error))?;
-        read_instance_identity(unit, &proxy)
+        read_instance_identity(unit, &proxy).await
     }
 
-    fn read_raw(&self, unit: &str) -> PlatformResult<RawUnitProperties> {
-        let resolved = self.resolve_unit(unit)?;
+    async fn read_raw(&self, unit: &str) -> PlatformResult<RawUnitProperties> {
+        let resolved = self.resolve_unit(unit).await?;
         let proxy = Proxy::new(
             &self.connection,
             SYSTEMD_SERVICE,
             resolved.path.as_str(),
             resolved.type_interface,
         )
+        .await
         .map_err(|error| map_dbus_error("create typed systemd unit proxy", error))?;
         let cpu_weight = proxy
             .get_property::<u64>("CPUWeight")
+            .await
             .map_err(|error| map_dbus_error("read systemd CPUWeight", error))?;
         let allowed_cpus = proxy
             .get_property::<Vec<u8>>("AllowedCPUs")
+            .await
             .map_err(|error| map_dbus_error("read systemd AllowedCPUs", error))?;
         Ok(RawUnitProperties {
             cpu_weight,
@@ -165,19 +344,125 @@ impl SystemdDbusClient {
         })
     }
 
-    fn set_raw(&self, unit: &str, cpu_weight: u64, allowed_cpus: Vec<u8>) -> PlatformResult<()> {
+    async fn set_raw(
+        &self,
+        unit: &str,
+        cpu_weight: u64,
+        allowed_cpus: Vec<u8>,
+    ) -> PlatformResult<()> {
         let properties: Vec<(&str, Value<'static>)> = vec![
             ("CPUWeight", Value::from(cpu_weight)),
             ("AllowedCPUs", Value::from(allowed_cpus)),
         ];
-        let manager = self.manager()?;
+        let manager = self.manager().await?;
         manager
             .call::<_, _, ()>("SetUnitProperties", &(unit, true, properties))
+            .await
             .map_err(|error| map_dbus_error("set typed systemd unit properties", error))
     }
 
     fn validate_desired(&self, desired: &SystemdUnitProperties) -> PlatformResult<()> {
         validate_desired_properties(desired, &self.online_path)
+    }
+
+    async fn unit_instance_for_process(
+        &self,
+        process: ProcessId,
+    ) -> PlatformResult<Option<SystemdUnitInstanceIdentity>> {
+        validate_pid(process)?;
+        let manager = self.manager().await?;
+        let path: OwnedObjectPath = match manager.call("GetUnitByPID", &process.0).await {
+            Ok(path) => path,
+            Err(error) if is_no_unit_for_pid(&error) => return Ok(None),
+            Err(error) => return Err(map_dbus_error("resolve unit for PID", error)),
+        };
+        let identity = Proxy::new(
+            &self.connection,
+            SYSTEMD_SERVICE,
+            path.as_str(),
+            UNIT_INTERFACE,
+        )
+        .await
+        .map_err(|error| map_dbus_error("create systemd unit identity proxy", error))?;
+        let unit: String = identity
+            .get_property("Id")
+            .await
+            .map_err(|error| map_dbus_error("read systemd unit identity", error))?;
+        validate_unit_name(&unit)?;
+        Ok(Some(read_instance_identity(&unit, &identity).await?))
+    }
+
+    async fn unit_instance_identity(
+        &self,
+        unit: &str,
+    ) -> PlatformResult<SystemdUnitInstanceIdentity> {
+        let resolved = self.resolve_unit(unit).await?;
+        self.instance_identity(unit, &resolved.path).await
+    }
+
+    async fn unit_processes(&self, unit: &str) -> PlatformResult<Vec<ProcessId>> {
+        validate_unit_name(unit)?;
+        let manager = self.manager().await?;
+        let processes: Vec<(String, u32, String)> =
+            manager
+                .call("GetUnitProcesses", &unit)
+                .await
+                .map_err(|error| map_dbus_error("enumerate systemd unit processes", error))?;
+        let mut ids = processes
+            .into_iter()
+            .map(|(_, pid, _)| ProcessId(pid))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn read_unit_properties(&self, unit: &str) -> PlatformResult<SystemdUnitProperties> {
+        raw_to_domain(unit, &self.read_raw(unit).await?)
+    }
+
+    async fn write_unit_properties(
+        &self,
+        unit: &str,
+        desired: &SystemdUnitProperties,
+    ) -> PlatformResult<SystemdUnitProperties> {
+        validate_unit_name(unit)?;
+        self.validate_desired(desired)?;
+        let original_raw = self.read_raw(unit).await?;
+        let desired_raw = domain_to_raw(desired);
+        self.set_raw(
+            unit,
+            desired_raw.cpu_weight,
+            desired_raw.allowed_cpus.clone(),
+        )
+        .await?;
+
+        let readback = match self.read_unit_properties(unit).await {
+            Ok(readback) => readback,
+            Err(error) => {
+                let rollback = self
+                    .set_raw(
+                        unit,
+                        original_raw.cpu_weight,
+                        original_raw.allowed_cpus.clone(),
+                    )
+                    .await;
+                return Err(with_systemd_rollback(unit, error, rollback));
+            }
+        };
+        if !unit_matches_desired(&readback, desired) {
+            let failure = PlatformError::invalid(
+                dbus_resource(unit),
+                format!(
+                    "systemd readback differs from request: requested {desired:?}, got {readback:?}"
+                ),
+            );
+            let rollback = self
+                .set_raw(unit, original_raw.cpu_weight, original_raw.allowed_cpus)
+                .await;
+            return Err(with_systemd_rollback(unit, failure, rollback));
+        }
+        Ok(readback)
     }
 }
 
@@ -192,49 +477,36 @@ impl SystemdClient for SystemdDbusClient {
         &self,
         process: ProcessId,
     ) -> PlatformResult<Option<SystemdUnitInstanceIdentity>> {
-        validate_pid(process)?;
-        let manager = self.manager()?;
-        let path: OwnedObjectPath = match manager.call("GetUnitByPID", &process.0) {
-            Ok(path) => path,
-            Err(error) if is_no_unit_for_pid(&error) => return Ok(None),
-            Err(error) => return Err(map_dbus_error("resolve unit for PID", error)),
-        };
-        let identity = Proxy::new(
-            &self.connection,
-            SYSTEMD_SERVICE,
-            path.as_str(),
-            UNIT_INTERFACE,
-        )
-        .map_err(|error| map_dbus_error("create systemd unit identity proxy", error))?;
-        let unit: String = identity
-            .get_property("Id")
-            .map_err(|error| map_dbus_error("read systemd unit identity", error))?;
-        validate_unit_name(&unit)?;
-        Ok(Some(read_instance_identity(&unit, &identity)?))
+        self.request("resolve unit for PID", |reply| {
+            OwnerRequest::UnitInstanceForProcess { process, reply }
+        })
     }
 
     fn unit_instance_identity(&self, unit: &str) -> PlatformResult<SystemdUnitInstanceIdentity> {
-        let resolved = self.resolve_unit(unit)?;
-        self.instance_identity(unit, &resolved.path)
+        self.request("read systemd unit identity", |reply| {
+            OwnerRequest::UnitInstanceIdentity {
+                unit: unit.to_owned(),
+                reply,
+            }
+        })
     }
 
     fn unit_processes(&self, unit: &str) -> PlatformResult<Vec<ProcessId>> {
-        validate_unit_name(unit)?;
-        let manager = self.manager()?;
-        let processes: Vec<(String, u32, String)> = manager
-            .call("GetUnitProcesses", &unit)
-            .map_err(|error| map_dbus_error("enumerate systemd unit processes", error))?;
-        let mut ids = processes
-            .into_iter()
-            .map(|(_, pid, _)| ProcessId(pid))
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(ids)
+        self.request("enumerate systemd unit processes", |reply| {
+            OwnerRequest::UnitProcesses {
+                unit: unit.to_owned(),
+                reply,
+            }
+        })
     }
 
     fn read_unit_properties(&self, unit: &str) -> PlatformResult<SystemdUnitProperties> {
-        raw_to_domain(unit, &self.read_raw(unit)?)
+        self.request("read systemd unit properties", |reply| {
+            OwnerRequest::ReadUnitProperties {
+                unit: unit.to_owned(),
+                reply,
+            }
+        })
     }
 
     fn write_unit_properties(
@@ -242,38 +514,13 @@ impl SystemdClient for SystemdDbusClient {
         unit: &str,
         desired: &SystemdUnitProperties,
     ) -> PlatformResult<SystemdUnitProperties> {
-        validate_unit_name(unit)?;
-        self.validate_desired(desired)?;
-        let original_raw = self.read_raw(unit)?;
-        let desired_raw = domain_to_raw(desired);
-        self.set_raw(
-            unit,
-            desired_raw.cpu_weight,
-            desired_raw.allowed_cpus.clone(),
-        )?;
-
-        let readback = match self.read_unit_properties(unit) {
-            Ok(readback) => readback,
-            Err(error) => {
-                let rollback = self.set_raw(
-                    unit,
-                    original_raw.cpu_weight,
-                    original_raw.allowed_cpus.clone(),
-                );
-                return Err(with_systemd_rollback(unit, error, rollback));
+        self.request("write systemd unit properties", |reply| {
+            OwnerRequest::WriteUnitProperties {
+                unit: unit.to_owned(),
+                desired: desired.clone(),
+                reply,
             }
-        };
-        if !unit_matches_desired(&readback, desired) {
-            let failure = PlatformError::invalid(
-                dbus_resource(unit),
-                format!(
-                    "systemd readback differs from request: requested {desired:?}, got {readback:?}"
-                ),
-            );
-            let rollback = self.set_raw(unit, original_raw.cpu_weight, original_raw.allowed_cpus);
-            return Err(with_systemd_rollback(unit, failure, rollback));
-        }
-        Ok(readback)
+        })
     }
 }
 
@@ -289,11 +536,11 @@ struct ResolvedUnit {
     type_interface: &'static str,
 }
 
-fn read_instance_identity(
+async fn read_instance_identity(
     unit: &str,
     proxy: &Proxy<'_>,
 ) -> PlatformResult<SystemdUnitInstanceIdentity> {
-    let invocation_id = match proxy.get_property::<Vec<u8>>("InvocationID") {
+    let invocation_id = match proxy.get_property::<Vec<u8>>("InvocationID").await {
         Ok(value) => Some(value),
         Err(error) if is_unknown_property(&error) => None,
         Err(error) => {
@@ -307,6 +554,7 @@ fn read_instance_identity(
         Some(
             proxy
                 .get_property::<String>("ControlGroup")
+                .await
                 .map_err(|error| map_dbus_error("read systemd unit ControlGroup", error))?,
         )
     } else {
@@ -573,6 +821,28 @@ fn map_dbus_error(operation: &'static str, error: ZbusError) -> PlatformError {
     )
 }
 
+fn owner_unavailable(operation: &'static str) -> PlatformError {
+    PlatformError::io(
+        operation,
+        dbus_resource(SYSTEMD_SERVICE),
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "systemd D-Bus owner thread is unavailable",
+        ),
+    )
+}
+
+fn owner_queue_full(operation: &'static str) -> PlatformError {
+    PlatformError::io(
+        operation,
+        dbus_resource(SYSTEMD_SERVICE),
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "systemd D-Bus owner request queue is full",
+        ),
+    )
+}
+
 fn dbus_resource(name: &str) -> PathBuf {
     PathBuf::from("dbus").join(name)
 }
@@ -580,6 +850,71 @@ fn dbus_resource(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_facade_is_send_and_sync() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SystemdDbusClient>();
+    }
+
+    #[test]
+    fn owner_reports_connection_failure_during_startup() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let address = format!(
+            "unix:path={}",
+            directory.path().join("missing-system-bus").display()
+        )
+        .parse()
+        .expect("test bus address");
+
+        let error =
+            SystemdDbusClient::from_address(address).expect_err("missing bus socket must fail");
+        assert!(matches!(error, PlatformError::Io { .. }));
+    }
+
+    #[test]
+    fn disconnected_owner_fails_without_falling_back_to_another_runtime() {
+        let (requests, receiver) = tokio_mpsc::channel(1);
+        drop(receiver);
+        let client = SystemdDbusClient {
+            requests,
+            online_path: PathBuf::from(ONLINE_CPUS),
+        };
+
+        let error = client
+            .unit_processes("game.scope")
+            .expect_err("closed owner queue must fail");
+        assert!(matches!(
+            error,
+            PlatformError::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    #[test]
+    fn full_owner_queue_fails_without_blocking_send() {
+        let (requests, _receiver) = tokio_mpsc::channel(1);
+        let (reply, _reply_receiver) = mpsc::sync_channel(1);
+        assert!(
+            requests
+                .try_send(OwnerRequest::UnitProcesses {
+                    unit: "queued.scope".to_owned(),
+                    reply,
+                })
+                .is_ok()
+        );
+        let client = SystemdDbusClient {
+            requests,
+            online_path: PathBuf::from(ONLINE_CPUS),
+        };
+
+        let error = client
+            .unit_processes("game.scope")
+            .expect_err("full owner queue must fail");
+        assert!(matches!(
+            error,
+            PlatformError::Io { source, .. } if source.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
 
     #[test]
     fn cpu_mask_round_trip_supports_sparse_high_ids() {

@@ -1,6 +1,8 @@
 #!/usr/bin/make -f
 
 export CARGO_NET_OFFLINE = true
+export CARGO_PROFILE_RELEASE_DEBUG = 1
+export CARGO_PROFILE_RELEASE_STRIP = none
 
 %:
 	dh $@

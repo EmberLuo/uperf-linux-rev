@@ -51,6 +51,13 @@ jobs:
       - name: Build release binary
         run: cargo +1.96.0 build --workspace --release --locked
 
+      - name: Verify release artifacts remain package-debuggable
+        run: |
+          for binary in uperf-linux uperfctl uperf-probe uperf-gui; do
+            readelf --sections --wide "target/release/${binary}" |
+              grep --quiet '[.]symtab'
+          done
+
       - name: Stage core and GUI package payloads
         run: |
           make --file packaging/debian/rules override_dh_auto_install

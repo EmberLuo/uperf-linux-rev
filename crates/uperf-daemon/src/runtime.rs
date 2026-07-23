@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -47,8 +47,11 @@ const FREQUENCY_OBSERVER_INTERVAL: Duration = Duration::from_secs(1);
 const REDUCER_TICK: Duration = Duration::from_millis(100);
 const WORKLOAD_CHECK_INTERVAL_MS: u64 = 1_000;
 const FREQUENCY_STALE_AFTER_MS: u64 = 3_000;
+const PROCESS_IDENTITY_TIMEOUT: Duration = Duration::from_millis(500);
+const PROCESS_IDENTITY_THREAD_STACK_SIZE: usize = 256 * 1024;
 const APP_PERSISTENCE_IN_FLIGHT: &str = "an application-rule update is still being persisted";
 const RELOAD_IN_FLIGHT: &str = "configuration reload is still being prepared";
+const PROCESS_IDENTITY_IN_FLIGHT: &str = "a workload identity lookup is still in progress";
 
 /// Errors produced by the state owner before D-Bus translation.
 #[derive(Debug, Error)]
@@ -160,6 +163,9 @@ enum Command {
     RemoveAppRule {
         id: String,
         reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    },
+    Activate {
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     BeginShutdown {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
@@ -319,6 +325,15 @@ impl RuntimeHandle {
         self.request(|reply| Command::BeginShutdown { reply }).await
     }
 
+    /// Enable actuator reconciliation after every startup dependency is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shutdown has started or the state task has stopped.
+    pub async fn activate(&self) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::Activate { reply }).await
+    }
+
     /// Restore owned resources and stop the state task.
     ///
     /// # Errors
@@ -328,9 +343,11 @@ impl RuntimeHandle {
         loop {
             match self.request(|reply| Command::Stop { reply }).await {
                 Err(RuntimeError::Conflict(message))
-                    if message == APP_PERSISTENCE_IN_FLIGHT || message == RELOAD_IN_FLIGHT =>
+                    if message == APP_PERSISTENCE_IN_FLIGHT
+                        || message == RELOAD_IN_FLIGHT
+                        || message == PROCESS_IDENTITY_IN_FLIGHT =>
                 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 result => return result,
             }
@@ -353,7 +370,7 @@ impl RuntimeHandle {
 }
 
 type LoadObservation = Option<(u64, Result<CpuTimeSnapshot, String>)>;
-type ThermalObservation = Option<(u64, Result<Vec<ThermalSample>, String>)>;
+type ThermalObservation = Option<(u64, u64, Result<Vec<ThermalSample>, String>)>;
 type FrequencyObservation = Option<(u64, Result<FrequencyObservationBatch, String>)>;
 type LogindHealthObservation = Option<Result<(), String>>;
 type InputHealthObservation = Option<Result<(), String>>;
@@ -378,6 +395,65 @@ struct ReloadOutcome {
     result: Result<ResolvedConfiguration, RuntimeError>,
 }
 
+struct RestoreOutcome {
+    id: u64,
+    result: Result<(), String>,
+}
+
+struct FrequencySafetyOutcome {
+    id: u64,
+    result: Result<(), String>,
+}
+
+enum ProcessIdentityPurpose {
+    Set {
+        pid: ProcessId,
+        requested_profile: Option<ProfileId>,
+        caller_uid: u32,
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    },
+    Clear {
+        expected: ProcessIdentity,
+        caller_uid: u32,
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    },
+    Refresh {
+        expected: ProcessIdentity,
+    },
+}
+
+impl ProcessIdentityPurpose {
+    const fn is_control_request(&self) -> bool {
+        !matches!(self, Self::Refresh { .. })
+    }
+}
+
+struct ProcessIdentityOutcome {
+    id: u64,
+    purpose: ProcessIdentityPurpose,
+    result: Result<ProcessInfo, String>,
+}
+
+struct ProcessIdentityRead {
+    pid: ProcessId,
+    reply: oneshot::Sender<Result<ProcessInfo, String>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessIdentityInFlight {
+    id: u64,
+    is_control_request: bool,
+}
+
+struct RuntimeWorkerSenders {
+    reconcile: mpsc::Sender<ReconcileResult>,
+    restore: mpsc::Sender<RestoreOutcome>,
+    frequency_safety: mpsc::Sender<FrequencySafetyOutcome>,
+    process_identity: mpsc::Sender<ProcessIdentityOutcome>,
+    app_persistence: mpsc::Sender<AppPersistenceOutcome>,
+    reload: mpsc::Sender<ReloadOutcome>,
+}
+
 /// Congestion-resistant observer inputs.
 ///
 /// Load and thermal use watch channels, so a slow reducer keeps the latest
@@ -399,8 +475,14 @@ impl ObserverIngress {
         self.load.send_replace(Some((sequence, sample)));
     }
 
-    pub fn observe_thermal(&self, sequence: u64, sample: Result<Vec<ThermalSample>, String>) {
-        self.thermal.send_replace(Some((sequence, sample)));
+    pub fn observe_thermal(
+        &self,
+        sequence: u64,
+        observer_generation: u64,
+        sample: Result<Vec<ThermalSample>, String>,
+    ) {
+        self.thermal
+            .send_replace(Some((sequence, observer_generation, sample)));
     }
 
     fn observe_frequencies(
@@ -488,6 +570,7 @@ impl ObserverIngress {
 /// Reloadable observer cadences and input policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObserverSettings {
+    pub generation: u64,
     pub load_interval: Duration,
     pub thermal_interval: Duration,
     pub thermal_paths: Vec<PathBuf>,
@@ -495,8 +578,9 @@ pub struct ObserverSettings {
 }
 
 impl ObserverSettings {
-    fn from_configuration(configuration: &ResolvedConfiguration) -> Self {
+    fn from_configuration(configuration: &ResolvedConfiguration, generation: u64) -> Self {
         Self {
+            generation,
             load_interval: Duration::from_millis(configuration.policy.load.sample_interval_ms),
             thermal_interval: Duration::from_millis(
                 configuration.policy.thermal.sample_interval_ms,
@@ -540,6 +624,17 @@ pub fn spawn_runtime(
     ObserverIngress,
     JoinHandle<Result<(), RuntimeError>>,
 ) {
+    spawn_runtime_with_mutation_gate(parts, Arc::new(Mutex::new(())))
+}
+
+fn spawn_runtime_with_mutation_gate(
+    parts: RuntimeParts,
+    mutation_gate: Arc<Mutex<()>>,
+) -> (
+    RuntimeHandle,
+    ObserverIngress,
+    JoinHandle<Result<(), RuntimeError>>,
+) {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (load_tx, load_rx) = watch::channel(None);
     let (thermal_tx, thermal_rx) = watch::channel(None);
@@ -548,18 +643,29 @@ pub fn spawn_runtime(
     let (input_health_tx, input_health_rx) = watch::channel(None);
     let (runtime_event_tx, runtime_event_rx) = mpsc::channel(HINT_CAPACITY);
     let (reconcile_tx, reconcile_rx) = mpsc::channel::<ReconcileResult>(1);
+    let (restore_tx, restore_rx) = mpsc::channel::<RestoreOutcome>(1);
+    let (frequency_safety_tx, frequency_safety_rx) = mpsc::channel::<FrequencySafetyOutcome>(1);
+    let (process_identity_tx, process_identity_rx) = mpsc::channel::<ProcessIdentityOutcome>(2);
     let (app_persistence_tx, app_persistence_rx) = mpsc::channel(1);
     let (reload_tx, reload_rx) = mpsc::channel(1);
-    let (settings_tx, settings_rx) =
-        watch::channel(ObserverSettings::from_configuration(&parts.configuration));
+    let (settings_tx, settings_rx) = watch::channel(ObserverSettings::from_configuration(
+        &parts.configuration,
+        1,
+    ));
     let frequency_targets = Arc::new(parts.configuration.targets.clone());
     let (event_tx, _) = broadcast::channel(64);
     let actor = RuntimeActor::new(
         parts,
         settings_tx,
-        reconcile_tx,
-        app_persistence_tx,
-        reload_tx,
+        mutation_gate,
+        RuntimeWorkerSenders {
+            reconcile: reconcile_tx,
+            restore: restore_tx,
+            frequency_safety: frequency_safety_tx,
+            process_identity: process_identity_tx,
+            app_persistence: app_persistence_tx,
+            reload: reload_tx,
+        },
     );
     let initial = actor.published();
     let (published_tx, published_rx) = watch::channel(Arc::new(initial));
@@ -587,6 +693,9 @@ pub fn spawn_runtime(
         input_health_rx,
         runtime_event_rx,
         reconcile_rx,
+        restore_rx,
+        frequency_safety_rx,
+        process_identity_rx,
         app_persistence_rx,
         reload_rx,
         published_tx,
@@ -606,13 +715,13 @@ struct RuntimeActor {
     configuration_paths: ConfigurationPaths,
     observer_settings: watch::Sender<ObserverSettings>,
     actuator: Option<Arc<FrequencyActuator>>,
-    reconcile_tx: mpsc::Sender<ReconcileResult>,
+    worker_senders: RuntimeWorkerSenders,
     mutation_gate: Arc<Mutex<()>>,
     frequency_safety: Arc<FrequencySafetyFence>,
-    app_persistence_tx: mpsc::Sender<AppPersistenceOutcome>,
     app_persist_in_flight: bool,
-    reload_tx: mpsc::Sender<ReloadOutcome>,
     reload_in_flight: bool,
+    pending_reload: Option<ReloadOutcome>,
+    capabilities_changed_pending: bool,
     started_at: Instant,
     mode: ModeSelection,
     active_workload: Option<ProcessInfo>,
@@ -635,6 +744,7 @@ struct RuntimeActor {
     generation: u64,
     state_revision: u64,
     config_generation: u64,
+    observer_generation: u64,
     telemetry_sequence: u64,
     health_issues: BTreeMap<String, HealthIssue>,
     last_workload_check: MonotonicMillis,
@@ -643,6 +753,24 @@ struct RuntimeActor {
     applied_units: BTreeMap<String, SystemdUnitProperties>,
     reconcile_in_flight: bool,
     reconcile_pending: bool,
+    restore_in_flight: Option<u64>,
+    next_restore_id: u64,
+    restore_requested: bool,
+    sleep_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    wake_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    pending_resume: bool,
+    stop_waiters: Vec<oneshot::Sender<Result<(), RuntimeError>>>,
+    restored_while_suspended: bool,
+    restore_failure: Option<String>,
+    process_identity_reader: Option<std::sync::mpsc::SyncSender<ProcessIdentityRead>>,
+    process_identity_in_flight: Option<ProcessIdentityInFlight>,
+    next_process_identity_id: u64,
+    frequency_safety_update_in_flight: Option<u64>,
+    next_frequency_safety_update_id: u64,
+    requested_frequency_upper_caps: BTreeMap<TargetId, Hertz>,
+    pending_frequency_upper_caps: Option<BTreeMap<TargetId, Hertz>>,
+    frequency_safety_failure: Option<String>,
+    reconcile_worker_failure: Option<String>,
     inflight_frequency: bool,
     inflight_scheduler: bool,
     frequency_failures: u32,
@@ -652,6 +780,7 @@ struct RuntimeActor {
     actuator_read_only: bool,
     startup_recovery_pending: bool,
     suspended: bool,
+    mutations_activated: bool,
     accepting_control: bool,
     stop_requested: bool,
 }
@@ -677,9 +806,8 @@ impl RuntimeActor {
     fn new(
         parts: RuntimeParts,
         observer_settings: watch::Sender<ObserverSettings>,
-        reconcile_tx: mpsc::Sender<ReconcileResult>,
-        app_persistence_tx: mpsc::Sender<AppPersistenceOutcome>,
-        reload_tx: mpsc::Sender<ReloadOutcome>,
+        mutation_gate: Arc<Mutex<()>>,
+        worker_senders: RuntimeWorkerSenders,
     ) -> Self {
         let thermal_guards = parts
             .configuration
@@ -701,13 +829,13 @@ impl RuntimeActor {
             configuration_paths: parts.configuration_paths,
             observer_settings,
             actuator: parts.actuator,
-            reconcile_tx,
-            mutation_gate: Arc::new(Mutex::new(())),
+            worker_senders,
+            mutation_gate,
             frequency_safety: Arc::new(FrequencySafetyFence::default()),
-            app_persistence_tx,
             app_persist_in_flight: false,
-            reload_tx,
             reload_in_flight: false,
+            pending_reload: None,
+            capabilities_changed_pending: false,
             started_at: parts.started_at,
             mode: ModeSelection::Auto,
             active_workload: None,
@@ -738,6 +866,7 @@ impl RuntimeActor {
             generation: 0,
             state_revision: 0,
             config_generation: 1,
+            observer_generation: 1,
             telemetry_sequence: 0,
             health_issues: BTreeMap::new(),
             last_workload_check: MonotonicMillis::new(0),
@@ -746,6 +875,24 @@ impl RuntimeActor {
             applied_units: BTreeMap::new(),
             reconcile_in_flight: false,
             reconcile_pending: false,
+            restore_in_flight: None,
+            next_restore_id: 0,
+            restore_requested: false,
+            sleep_waiters: Vec::new(),
+            wake_waiters: Vec::new(),
+            pending_resume: false,
+            stop_waiters: Vec::new(),
+            restored_while_suspended: false,
+            restore_failure: None,
+            process_identity_reader: None,
+            process_identity_in_flight: None,
+            next_process_identity_id: 0,
+            frequency_safety_update_in_flight: None,
+            next_frequency_safety_update_id: 0,
+            requested_frequency_upper_caps: BTreeMap::new(),
+            pending_frequency_upper_caps: None,
+            frequency_safety_failure: None,
+            reconcile_worker_failure: None,
             inflight_frequency: false,
             inflight_scheduler: false,
             frequency_failures: 0,
@@ -755,6 +902,7 @@ impl RuntimeActor {
             actuator_read_only,
             startup_recovery_pending,
             suspended: false,
+            mutations_activated: false,
             accepting_control: true,
             stop_requested: false,
         };
@@ -903,6 +1051,13 @@ impl RuntimeActor {
                 );
             }
         }
+        // A restore worker join failure or poisoned mutation gate leaves its
+        // exact point of progress unknowable even when the actuator's own
+        // mutex still reports read-write. Only a restart/recovery may clear
+        // this fail-closed latch.
+        self.actuator_read_only |= self.restore_failure.is_some()
+            || self.frequency_safety_failure.is_some()
+            || self.reconcile_worker_failure.is_some();
     }
 
     #[allow(
@@ -920,6 +1075,9 @@ impl RuntimeActor {
         mut input_health: watch::Receiver<InputHealthObservation>,
         mut runtime_events: mpsc::Receiver<RuntimeInput>,
         mut reconcile_results: mpsc::Receiver<ReconcileResult>,
+        mut restore_results: mpsc::Receiver<RestoreOutcome>,
+        mut frequency_safety_results: mpsc::Receiver<FrequencySafetyOutcome>,
+        mut process_identity_results: mpsc::Receiver<ProcessIdentityOutcome>,
         mut app_persistence_results: mpsc::Receiver<AppPersistenceOutcome>,
         mut reload_results: mpsc::Receiver<ReloadOutcome>,
         published: watch::Sender<Arc<PublishedState>>,
@@ -952,7 +1110,9 @@ impl RuntimeActor {
                 }
                 changed = thermal.changed() => {
                     if changed.is_ok()
-                        && let Some((_, observation)) = thermal.borrow_and_update().clone()
+                        && let Some((_, observer_generation, observation)) =
+                            thermal.borrow_and_update().clone()
+                        && observer_generation == self.observer_generation
                     {
                         self.reduce_thermal(observation);
                     }
@@ -988,6 +1148,21 @@ impl RuntimeActor {
                         self.finish_reconcile(result);
                     }
                 }
+                result = restore_results.recv() => {
+                    if let Some(result) = result {
+                        self.finish_restore(result);
+                    }
+                }
+                result = frequency_safety_results.recv() => {
+                    if let Some(result) = result {
+                        self.finish_frequency_safety_update(result);
+                    }
+                }
+                result = process_identity_results.recv() => {
+                    if let Some(result) = result {
+                        self.finish_process_identity(result);
+                    }
+                }
                 result = app_persistence_results.recv() => {
                     if let Some(result) = result {
                         self.finish_app_persistence(result);
@@ -995,7 +1170,7 @@ impl RuntimeActor {
                 }
                 result = reload_results.recv() => {
                     if let Some(result) = result {
-                        capabilities_changed = self.finish_reload(result);
+                        self.receive_reload(result);
                     }
                 }
                 _ = ticker.tick() => {
@@ -1003,6 +1178,7 @@ impl RuntimeActor {
                 }
             }
 
+            capabilities_changed |= std::mem::take(&mut self.capabilities_changed_pending);
             capabilities_changed |= self.actuator_read_only != previous_actuator_read_only;
             previous_actuator_read_only = self.actuator_read_only;
             let new_state = self.state_signature();
@@ -1055,16 +1231,18 @@ impl RuntimeActor {
                 caller_uid,
                 reply,
             } => {
-                let result = self
-                    .require_accepting_control()
-                    .and_then(|()| self.command_set_workload(&request, caller_uid));
-                let _ = reply.send(result);
+                if let Err(error) = self.require_accepting_control() {
+                    let _ = reply.send(Err(error));
+                } else {
+                    self.start_set_workload(&request, caller_uid, reply);
+                }
             }
             Command::ClearActiveWorkload { caller_uid, reply } => {
-                let result = self
-                    .require_accepting_control()
-                    .and_then(|()| self.command_clear_workload(caller_uid));
-                let _ = reply.send(result);
+                if let Err(error) = self.require_accepting_control() {
+                    let _ = reply.send(Err(error));
+                } else {
+                    self.start_clear_workload(caller_uid, reply);
+                }
             }
             Command::SetFrequencyOverrides { overrides, reply } => {
                 let result = self
@@ -1099,26 +1277,37 @@ impl RuntimeActor {
                     self.start_remove_app_rule(&id, reply);
                 }
             }
+            Command::Activate { reply } => {
+                let result = self.require_accepting_control().map(|()| {
+                    self.mutations_activated = true;
+                    self.evaluate_and_reconcile();
+                });
+                let _ = reply.send(result);
+            }
             Command::BeginShutdown { reply } => {
                 self.accepting_control = false;
                 self.reconcile_pending = false;
                 let _ = reply.send(Ok(()));
             }
             Command::Stop { reply } => {
-                if self.app_persist_in_flight || self.reload_in_flight {
+                let process_control_in_flight = self
+                    .process_identity_in_flight
+                    .is_some_and(|request| request.is_control_request);
+                if self.app_persist_in_flight || self.reload_in_flight || process_control_in_flight
+                {
                     let _ = reply.send(Err(RuntimeError::Conflict(
                         if self.app_persist_in_flight {
                             APP_PERSISTENCE_IN_FLIGHT
-                        } else {
+                        } else if self.reload_in_flight {
                             RELOAD_IN_FLIGHT
+                        } else {
+                            PROCESS_IDENTITY_IN_FLIGHT
                         }
                         .to_owned(),
                     )));
                     return false;
                 }
-                let result = self.restore_on_shutdown();
-                self.stop_requested = true;
-                let _ = reply.send(result);
+                self.request_stop(reply);
             }
         }
         false
@@ -1377,23 +1566,7 @@ impl RuntimeActor {
                 .and_modify(|cap| *cap = (*cap).min(*thermal_cap))
                 .or_insert(*thermal_cap);
         }
-        match self.frequency_safety.replace_upper_caps(upper_caps) {
-            Ok(_) => {
-                self.health_issues.remove("safety.frequency_fence");
-            }
-            Err(message) => {
-                self.actuator_read_only = true;
-                self.health_issues.insert(
-                    "safety.frequency_fence".to_owned(),
-                    issue(
-                        "safety.frequency_fence",
-                        "critical",
-                        "thermal",
-                        format!("{message}; all further mutations are disabled"),
-                    ),
-                );
-            }
-        }
+        self.request_frequency_safety_update(upper_caps);
         let tightened = self.thermal_caps.iter().any(|(id, cap)| {
             previous
                 .get(id)
@@ -1404,6 +1577,64 @@ impl RuntimeActor {
             // earlier frequency failure must never postpone a stricter cap.
             self.clear_frequency_failure();
         }
+    }
+
+    fn request_frequency_safety_update(&mut self, upper_caps: BTreeMap<TargetId, Hertz>) {
+        if self.frequency_safety_failure.is_some()
+            || upper_caps == self.requested_frequency_upper_caps
+        {
+            return;
+        }
+        self.requested_frequency_upper_caps = upper_caps.clone();
+        if self.frequency_safety_update_in_flight.is_some() {
+            self.pending_frequency_upper_caps = Some(upper_caps);
+            return;
+        }
+        self.start_frequency_safety_update(upper_caps);
+    }
+
+    fn start_frequency_safety_update(&mut self, upper_caps: BTreeMap<TargetId, Hertz>) {
+        debug_assert!(self.frequency_safety_update_in_flight.is_none());
+        self.next_frequency_safety_update_id =
+            self.next_frequency_safety_update_id.saturating_add(1);
+        let id = self.next_frequency_safety_update_id;
+        self.frequency_safety_update_in_flight = Some(id);
+        let fence = self.frequency_safety.clone();
+        let sender = self.worker_senders.frequency_safety.clone();
+        tokio::spawn(async move {
+            let result = replace_frequency_safety_caps(fence, upper_caps).await;
+            let _ = sender.send(FrequencySafetyOutcome { id, result }).await;
+        });
+    }
+
+    fn finish_frequency_safety_update(&mut self, outcome: FrequencySafetyOutcome) {
+        let expected = self.frequency_safety_update_in_flight.take();
+        let result = if expected == Some(outcome.id) {
+            outcome.result
+        } else {
+            Err(format!(
+                "received frequency safety result {} while waiting for {:?}",
+                outcome.id, expected
+            ))
+        };
+        if let Err(message) = result {
+            let message = format!("{message}; all further mutations are disabled");
+            self.frequency_safety_failure = Some(message.clone());
+            self.pending_frequency_upper_caps = None;
+            self.actuator_read_only = true;
+            self.health_issues.insert(
+                "safety.frequency_fence".to_owned(),
+                issue("safety.frequency_fence", "critical", "actuator", message),
+            );
+            self.refresh_actuator_health();
+            return;
+        }
+        self.health_issues.remove("safety.frequency_fence");
+        if let Some(upper_caps) = self.pending_frequency_upper_caps.take() {
+            self.start_frequency_safety_update(upper_caps);
+            return;
+        }
+        self.evaluate_and_reconcile();
     }
 
     fn reduce_runtime_input(&mut self, event: RuntimeInput) {
@@ -1435,13 +1666,11 @@ impl RuntimeActor {
                 sleeping,
                 completion,
             } => {
-                let result = if sleeping {
-                    self.prepare_to_sleep()
+                if sleeping {
+                    self.request_sleep_restore(completion);
                 } else {
-                    self.resume_from_sleep();
-                    Ok(())
-                };
-                let _ = completion.send(result);
+                    self.request_resume(completion);
+                }
             }
         }
     }
@@ -1474,39 +1703,107 @@ impl RuntimeActor {
         }
     }
 
-    fn prepare_to_sleep(&mut self) -> Result<(), String> {
+    fn request_sleep_restore(&mut self, completion: oneshot::Sender<Result<(), String>>) {
+        if !self.stop_waiters.is_empty() {
+            let _ = completion.send(Err(
+                "daemon shutdown has started; the sleep transition was superseded".to_owned(),
+            ));
+            return;
+        }
+        if self.pending_resume {
+            self.pending_resume = false;
+            for waiter in self.wake_waiters.drain(..) {
+                let _ = waiter.send(Err(
+                    "a newer sleep transition superseded the pending resume".to_owned(),
+                ));
+            }
+        }
+        if let Some(message) = self.restore_failure.clone() {
+            if !self.suspended {
+                self.enter_suspended_state();
+            }
+            let _ = completion.send(Err(message));
+            return;
+        }
+        if self.suspended {
+            if self.restored_while_suspended {
+                let _ = completion.send(Ok(()));
+            } else {
+                self.sleep_waiters.push(completion);
+            }
+            return;
+        }
+
+        self.enter_suspended_state();
+        self.sleep_waiters.push(completion);
+        self.restore_requested = true;
+        self.drive_mutation_barriers();
+    }
+
+    fn request_resume(&mut self, completion: oneshot::Sender<Result<(), String>>) {
+        if !self.stop_waiters.is_empty() || !self.accepting_control {
+            let _ = completion.send(Err(
+                "daemon shutdown has started; resume is no longer accepted".to_owned(),
+            ));
+            return;
+        }
+        if !self.suspended {
+            let _ = completion.send(Ok(()));
+            return;
+        }
+        if self.restore_requested || self.restore_in_flight.is_some() {
+            self.pending_resume = true;
+            self.wake_waiters.push(completion);
+            return;
+        }
+        self.restored_while_suspended = false;
+        self.resume_from_sleep();
+        let _ = completion.send(Ok(()));
+    }
+
+    fn request_stop(&mut self, reply: oneshot::Sender<Result<(), RuntimeError>>) {
+        self.accepting_control = false;
+        if self
+            .process_identity_in_flight
+            .is_some_and(|request| !request.is_control_request)
+        {
+            // A periodic refresh is read-only and has no caller waiting for its
+            // result. Invalidate it so a stuck procfs read cannot delay exit.
+            self.process_identity_in_flight = None;
+        }
+        self.pending_resume = false;
+        for waiter in self.wake_waiters.drain(..) {
+            let _ = waiter.send(Err(
+                "daemon shutdown superseded the pending resume transition".to_owned(),
+            ));
+        }
+
+        if let Some(message) = &self.restore_failure {
+            self.stop_requested = true;
+            let _ = reply.send(Err(RuntimeError::Degraded(message.clone())));
+            return;
+        }
+        if self.suspended && self.restored_while_suspended {
+            self.stop_requested = true;
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        if !self.suspended {
+            self.enter_suspended_state();
+        }
+        self.stop_waiters.push(reply);
+        if self.restore_in_flight.is_none() {
+            self.restore_requested = true;
+        }
+        self.drive_mutation_barriers();
+    }
+
+    fn enter_suspended_state(&mut self) {
         self.suspended = true;
         self.hints = HintSet::new();
         self.active_touch_contacts.clear();
-        let Some(actuator) = self.actuator.clone() else {
-            return Ok(());
-        };
-        let mutation_gate = self.mutation_gate.clone();
-        let _gate = mutation_gate
-            .lock()
-            .map_err(|_| "runtime mutation gate was poisoned".to_owned())?;
-        match actuator.restore_all() {
-            Ok(()) => {
-                self.applied = AppliedState::default();
-                self.applied_units.clear();
-                self.observed.frequencies.clear();
-                Ok(())
-            }
-            Err(error) => {
-                let message = format!("failed to restore resources before sleep: {error}");
-                self.health_issues.insert(
-                    "actuator.sleep_restore".to_owned(),
-                    issue(
-                        "actuator.sleep_restore",
-                        "critical",
-                        "actuator",
-                        message.clone(),
-                    ),
-                );
-                self.refresh_actuator_health();
-                Err(message)
-            }
-        }
+        self.reconcile_pending = false;
+        self.restored_while_suspended = false;
     }
 
     fn resume_from_sleep(&mut self) {
@@ -1697,25 +1994,60 @@ impl RuntimeActor {
         ))
     }
 
-    fn command_set_workload(
+    fn start_set_workload(
         &mut self,
         request: &WorkloadRequest,
         caller_uid: u32,
-    ) -> Result<MutationReceipt, RuntimeError> {
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    ) {
         if request.pid == 0 {
-            return Err(RuntimeError::InvalidArgument(
+            let _ = reply.send(Err(RuntimeError::InvalidArgument(
                 "workload PID must be non-zero".to_owned(),
-            ));
+            )));
+            return;
         }
         if request.reason.len() > 256 {
-            return Err(RuntimeError::InvalidArgument(
+            let _ = reply.send(Err(RuntimeError::InvalidArgument(
                 "workload audit reason exceeds 256 bytes".to_owned(),
-            ));
+            )));
+            return;
         }
-        let observed = self
-            .environment
-            .process_identity(ProcessId::new(request.pid))
-            .map_err(|error| RuntimeError::NotFound(error.to_string()))?;
+        let requested_profile = if request.mode.is_empty() {
+            None
+        } else {
+            match parse_profile(&request.mode) {
+                Ok(profile) => Some(profile),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            }
+        };
+        if self.process_control_request_in_flight() {
+            let _ = reply.send(Err(RuntimeError::Conflict(
+                PROCESS_IDENTITY_IN_FLIGHT.to_owned(),
+            )));
+            return;
+        }
+        let pid = ProcessId::new(request.pid);
+        self.start_process_identity_read(
+            pid,
+            ProcessIdentityPurpose::Set {
+                pid,
+                requested_profile,
+                caller_uid,
+                reply,
+            },
+        );
+    }
+
+    fn complete_set_workload(
+        &mut self,
+        pid: ProcessId,
+        requested_profile: Option<ProfileId>,
+        caller_uid: u32,
+        observed: ProcessInfo,
+    ) -> Result<MutationReceipt, RuntimeError> {
         if caller_uid != 0
             && (!observed.owner_control_safe || observed.identity.uid.get() != caller_uid)
         {
@@ -1723,11 +2055,6 @@ impl RuntimeActor {
                 "non-root callers may only select a process whose real/effective/saved/fs UIDs all equal their UID".to_owned(),
             ));
         }
-        let requested_profile = if request.mode.is_empty() {
-            None
-        } else {
-            Some(parse_profile(&request.mode)?)
-        };
         let changed = self.active_workload.as_ref().map(|info| info.identity)
             != Some(observed.identity)
             || self.requested_workload_profile != requested_profile;
@@ -1742,6 +2069,7 @@ impl RuntimeActor {
         self.active_workload = Some(observed);
         self.requested_workload_profile = requested_profile;
         self.observed.active_workload = Some(observed_identity);
+        self.health_issues.remove("workload.exited");
         self.scheduler_dirty = true;
         let now = self.environment.monotonic_millis();
         self.hints.activate(Hint::with_ttl(
@@ -1753,25 +2081,54 @@ impl RuntimeActor {
         self.evaluate_and_reconcile();
         Ok(receipt(
             self.generation,
-            vec![format!("workload:{}", request.pid)],
+            vec![format!("workload:{}", pid.get())],
             "active workload selected",
         ))
     }
 
-    fn command_clear_workload(&mut self, caller_uid: u32) -> Result<MutationReceipt, RuntimeError> {
+    fn start_clear_workload(
+        &mut self,
+        caller_uid: u32,
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    ) {
         let Some(active_identity) = self.active_workload.as_ref().map(|active| active.identity)
         else {
-            return Ok(receipt(
+            let _ = reply.send(Ok(receipt(
                 self.generation,
                 Vec::new(),
                 "no workload was active",
+            )));
+            return;
+        };
+        if self.process_control_request_in_flight() {
+            let _ = reply.send(Err(RuntimeError::Conflict(
+                PROCESS_IDENTITY_IN_FLIGHT.to_owned(),
+            )));
+            return;
+        }
+        self.start_process_identity_read(
+            active_identity.pid,
+            ProcessIdentityPurpose::Clear {
+                expected: active_identity,
+                caller_uid,
+                reply,
+            },
+        );
+    }
+
+    fn complete_clear_workload(
+        &mut self,
+        expected: ProcessIdentity,
+        caller_uid: u32,
+        current: &ProcessInfo,
+    ) -> Result<MutationReceipt, RuntimeError> {
+        let Some(active_identity) = self.active_workload.as_ref().map(|active| active.identity)
+        else {
+            return Err(RuntimeError::Conflict(
+                "active workload changed while its identity was being verified".to_owned(),
             ));
         };
-        let current = self
-            .environment
-            .process_identity(active_identity.pid)
-            .map_err(|error| RuntimeError::Conflict(error.to_string()))?;
-        if current.identity != active_identity {
+        if active_identity != expected || current.identity != expected {
             return Err(RuntimeError::Conflict(
                 "active workload exited or its PID was reused".to_owned(),
             ));
@@ -1795,6 +2152,194 @@ impl RuntimeActor {
             vec![format!("workload:{}", pid.get())],
             "active workload cleared",
         ))
+    }
+
+    fn process_control_request_in_flight(&self) -> bool {
+        self.process_identity_in_flight
+            .is_some_and(|request| request.is_control_request)
+    }
+
+    fn start_process_identity_read(&mut self, pid: ProcessId, purpose: ProcessIdentityPurpose) {
+        debug_assert!(
+            !self.process_control_request_in_flight(),
+            "control identity requests are serialized"
+        );
+        self.next_process_identity_id = self.next_process_identity_id.saturating_add(1);
+        let id = self.next_process_identity_id;
+        self.process_identity_in_flight = Some(ProcessIdentityInFlight {
+            id,
+            is_control_request: purpose.is_control_request(),
+        });
+        let reader = match self.ensure_process_identity_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                self.finish_process_identity(ProcessIdentityOutcome {
+                    id,
+                    purpose,
+                    result: Err(error),
+                });
+                return;
+            }
+        };
+        let (read_reply, read_result) = oneshot::channel();
+        let request = ProcessIdentityRead {
+            pid,
+            reply: read_reply,
+        };
+        if let Err(error) = reader.try_send(request) {
+            let message = match error {
+                std::sync::mpsc::TrySendError::Full(_) => {
+                    "workload identity reader queue is full".to_owned()
+                }
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    "workload identity reader stopped".to_owned()
+                }
+            };
+            self.finish_process_identity(ProcessIdentityOutcome {
+                id,
+                purpose,
+                result: Err(message),
+            });
+            return;
+        }
+        let sender = self.worker_senders.process_identity.clone();
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(PROCESS_IDENTITY_TIMEOUT, read_result).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("workload identity reader dropped its result".to_owned()),
+                Err(_) => Err(format!(
+                    "workload identity lookup exceeded its {} ms deadline",
+                    PROCESS_IDENTITY_TIMEOUT.as_millis()
+                )),
+            };
+            let _ = sender
+                .send(ProcessIdentityOutcome {
+                    id,
+                    purpose,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn ensure_process_identity_reader(
+        &mut self,
+    ) -> Result<std::sync::mpsc::SyncSender<ProcessIdentityRead>, String> {
+        if let Some(reader) = &self.process_identity_reader {
+            return Ok(reader.clone());
+        }
+        let (requests, reader) = std::sync::mpsc::sync_channel::<ProcessIdentityRead>(1);
+        let environment = self.environment.clone();
+        let worker = thread::Builder::new()
+            .name("uperf-process".to_owned())
+            .stack_size(PROCESS_IDENTITY_THREAD_STACK_SIZE)
+            .spawn(move || {
+                while let Ok(request) = reader.recv() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        environment
+                            .process_identity(request.pid)
+                            .map_err(|error| error.to_string())
+                    }))
+                    .unwrap_or_else(|payload| {
+                        Err(format!(
+                            "workload identity reader panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        ))
+                    });
+                    let _ = request.reply.send(result);
+                }
+            })
+            .map_err(|error| format!("start workload identity reader thread: {error}"))?;
+        // The request channel owns normal worker lifetime. Deliberately
+        // detaching the handle means a kernel-stuck procfs read cannot make
+        // Tokio runtime destruction wait forever during process shutdown.
+        drop(worker);
+        self.process_identity_reader = Some(requests.clone());
+        Ok(requests)
+    }
+
+    fn finish_process_identity(&mut self, outcome: ProcessIdentityOutcome) {
+        if self.process_identity_in_flight.map(|request| request.id) != Some(outcome.id) {
+            // An explicit request may supersede a periodic refresh. Its stale
+            // result must never clear or rewrite the newly selected workload.
+            return;
+        }
+        self.process_identity_in_flight = None;
+        match outcome.purpose {
+            ProcessIdentityPurpose::Set {
+                pid,
+                requested_profile,
+                caller_uid,
+                reply,
+            } => {
+                let result = outcome
+                    .result
+                    .map_err(RuntimeError::NotFound)
+                    .and_then(|observed| {
+                        self.complete_set_workload(pid, requested_profile, caller_uid, observed)
+                    });
+                let _ = reply.send(result);
+            }
+            ProcessIdentityPurpose::Clear {
+                expected,
+                caller_uid,
+                reply,
+            } => {
+                let result = outcome
+                    .result
+                    .map_err(RuntimeError::Conflict)
+                    .and_then(|current| {
+                        self.complete_clear_workload(expected, caller_uid, &current)
+                    });
+                let _ = reply.send(result);
+            }
+            ProcessIdentityPurpose::Refresh { expected } => {
+                self.complete_workload_refresh(expected, outcome.result);
+            }
+        }
+    }
+
+    fn complete_workload_refresh(
+        &mut self,
+        expected: ProcessIdentity,
+        result: Result<ProcessInfo, String>,
+    ) {
+        let Some(active) = self.active_workload.clone() else {
+            return;
+        };
+        if active.identity != expected {
+            return;
+        }
+        if let Ok(current) = result
+            && current.identity == expected
+        {
+            if current != active {
+                self.active_workload = Some(current);
+                self.scheduler_dirty = true;
+                self.generation = self.generation.saturating_add(1);
+                self.evaluate_and_reconcile();
+            }
+            return;
+        }
+        self.clear_exited_workload();
+    }
+
+    fn clear_exited_workload(&mut self) {
+        self.active_workload = None;
+        self.requested_workload_profile = None;
+        self.observed.active_workload = None;
+        self.scheduler_dirty = true;
+        self.generation = self.generation.saturating_add(1);
+        self.health_issues.insert(
+            "workload.exited".to_owned(),
+            issue(
+                "workload.exited",
+                "info",
+                "workload",
+                "the active workload exited or its PID was reused",
+            ),
+        );
+        self.evaluate_and_reconcile();
     }
 
     fn command_set_overrides(
@@ -1910,7 +2455,7 @@ impl RuntimeActor {
         }
         let paths = self.configuration_paths.clone();
         let discovery = self.discovery.clone();
-        let sender = self.reload_tx.clone();
+        let sender = self.worker_senders.reload.clone();
         self.reload_in_flight = true;
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -1930,37 +2475,62 @@ impl RuntimeActor {
         });
     }
 
-    fn finish_reload(&mut self, outcome: ReloadOutcome) -> bool {
-        self.reload_in_flight = false;
-        let result = outcome
-            .result
-            .and_then(|candidate| self.apply_reload_candidate(candidate));
-        let changed = result.is_ok();
-        let _ = outcome.reply.send(result);
-        changed
-    }
-
-    fn apply_reload_candidate(
-        &mut self,
-        candidate: ResolvedConfiguration,
-    ) -> Result<ReloadReport, RuntimeError> {
-        if target_signature(&candidate) != target_signature(&self.configuration) {
-            return Err(RuntimeError::Validation(
+    fn receive_reload(&mut self, mut outcome: ReloadOutcome) {
+        if let Ok(candidate) = &outcome.result
+            && target_signature(candidate) != target_signature(&self.configuration)
+        {
+            outcome.result = Err(RuntimeError::Validation(
                 "device target mapping changed; safely restore and restart the daemon to adopt it"
                     .to_owned(),
             ));
         }
-        // A successful reload is a mutation barrier, not just an in-memory
-        // pointer swap. Waiting for the gate here guarantees that no task,
-        // cgroup or frequency transaction built from the previous generation
-        // can write after the new generation has been published.
-        let mutation_gate = self.mutation_gate.clone();
-        let barrier = mutation_gate
-            .lock()
-            .map_err(|_| RuntimeError::Internal("runtime mutation gate was poisoned".to_owned()))?;
+        if outcome.result.is_err() {
+            self.reload_in_flight = false;
+            let ReloadOutcome { reply, result } = outcome;
+            if let Err(error) = result {
+                let _ = reply.send(Err(error));
+            }
+        } else if !self.reconcile_in_flight
+            && self.restore_in_flight.is_none()
+            && !self.restore_requested
+        {
+            self.complete_reload(outcome);
+        } else {
+            debug_assert!(self.pending_reload.is_none());
+            self.pending_reload = Some(outcome);
+        }
+    }
+
+    fn complete_reload(&mut self, outcome: ReloadOutcome) {
+        debug_assert!(!self.reconcile_in_flight);
+        debug_assert!(self.restore_in_flight.is_none());
+        debug_assert!(!self.restore_requested);
+        self.reload_in_flight = false;
+        let result = outcome
+            .result
+            .map(|candidate| self.apply_reload_candidate(candidate));
+        let changed = result.is_ok();
+        let _ = outcome.reply.send(result);
+        self.capabilities_changed_pending |= changed;
+    }
+
+    fn apply_reload_candidate(&mut self, candidate: ResolvedConfiguration) -> ReloadReport {
+        debug_assert_eq!(
+            target_signature(&candidate),
+            target_signature(&self.configuration)
+        );
+        // The actor applies candidates only after every older reconciliation
+        // and restore result has been consumed. That channel happens-before
+        // relationship is the reload mutation barrier; the core runtime thread
+        // never waits on the blocking-worker mutex.
         let warnings = candidate.warnings.clone();
-        let observer_settings = ObserverSettings::from_configuration(&candidate);
+        let next_config_generation = self.config_generation.saturating_add(1);
+        let next_observer_generation = self.observer_generation.saturating_add(1);
+        let observer_settings =
+            ObserverSettings::from_configuration(&candidate, next_observer_generation);
         self.configuration = candidate;
+        self.config_generation = next_config_generation;
+        self.observer_generation = next_observer_generation;
         self.observer_settings.send_replace(observer_settings);
         self.scheduler_dirty = true;
         self.thermal_guards = self
@@ -1978,20 +2548,18 @@ impl RuntimeActor {
         self.thermal_state = ThermalState::Degraded;
         self.mark_all_thermal_unavailable(self.environment.monotonic_millis());
         self.update_thermal_caps();
-        self.config_generation = self.config_generation.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
         self.health_issues
             .retain(|code, _| !code.starts_with("discovery.warning."));
         self.seed_health();
-        drop(barrier);
         self.evaluate_and_reconcile();
-        Ok(ReloadReport {
+        ReloadReport {
             config_generation: self.config_generation,
             warnings,
             message:
                 "configuration generation swapped under the sensor-failure envelope; awaiting a fresh thermal sample"
                     .to_owned(),
-        })
+        }
     }
 
     fn start_set_app_rule(
@@ -2077,7 +2645,7 @@ impl RuntimeActor {
     ) {
         let persisted = candidate.clone();
         let paths = self.configuration_paths.clone();
-        let sender = self.app_persistence_tx.clone();
+        let sender = self.worker_senders.app_persistence.clone();
         self.app_persist_in_flight = true;
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || persist_apps(&paths, &persisted))
@@ -2159,7 +2727,16 @@ impl RuntimeActor {
         }
         self.desired = Some(desired.clone());
 
-        if !self.thermal_ready || self.suspended || !self.accepting_control {
+        if !self.thermal_ready
+            || self.suspended
+            || !self.mutations_activated
+            || !self.accepting_control
+            || self.restore_requested
+            || self.restore_in_flight.is_some()
+            || self.pending_reload.is_some()
+            || self.frequency_safety_update_in_flight.is_some()
+            || self.pending_frequency_upper_caps.is_some()
+        {
             return;
         }
         let Some(actuator) = self.actuator.clone() else {
@@ -2194,7 +2771,7 @@ impl RuntimeActor {
             mutation_gate: self.mutation_gate.clone(),
             frequency_safety: self.frequency_safety.clone(),
         };
-        let sender = self.reconcile_tx.clone();
+        let sender = self.worker_senders.reconcile.clone();
         self.reconcile_in_flight = true;
         self.reconcile_pending = false;
         self.inflight_frequency = reconcile_frequencies;
@@ -2315,6 +2892,15 @@ impl RuntimeActor {
                 }
             }
             Err(error) => {
+                let barrier_error = format!(
+                    "reconciler worker stopped with unknown mutation progress: {error}; all further mutations are disabled"
+                );
+                self.reconcile_worker_failure = Some(barrier_error.clone());
+                self.actuator_read_only = true;
+                self.health_issues.insert(
+                    "reconciler.worker".to_owned(),
+                    issue("reconciler.worker", "critical", "reconciler", barrier_error),
+                );
                 if attempted_frequency {
                     self.record_frequency_failure(&error);
                 }
@@ -2331,6 +2917,9 @@ impl RuntimeActor {
             && !self.frequency_needs_reconcile(desired)
         {
             self.applied.generation = desired.generation;
+        }
+        if self.drive_mutation_barriers() {
+            return;
         }
         if was_pending
             || self.scheduler_dirty
@@ -2394,6 +2983,15 @@ impl RuntimeActor {
             ));
         }
         if self.actuator_read_only {
+            if let Some(reason) = &self.restore_failure {
+                return Err(RuntimeError::Degraded(reason.clone()));
+            }
+            if let Some(reason) = &self.frequency_safety_failure {
+                return Err(RuntimeError::Degraded(reason.clone()));
+            }
+            if let Some(reason) = &self.reconcile_worker_failure {
+                return Err(RuntimeError::Degraded(reason.clone()));
+            }
             let reason = self
                 .health_issues
                 .get("actuator.degraded")
@@ -2407,56 +3005,144 @@ impl RuntimeActor {
     }
 
     fn check_workload_identity(&mut self) {
-        let Some(active) = self.active_workload.clone() else {
-            return;
-        };
-        if let Ok(current) = self.environment.process_identity(active.identity.pid)
-            && current.identity == active.identity
-        {
-            if current != active {
-                self.active_workload = Some(current);
-                self.scheduler_dirty = true;
-                self.generation = self.generation.saturating_add(1);
-                self.evaluate_and_reconcile();
-            }
+        if self.process_identity_in_flight.is_some() {
             return;
         }
-        self.active_workload = None;
-        self.requested_workload_profile = None;
-        self.observed.active_workload = None;
-        self.scheduler_dirty = true;
-        self.generation = self.generation.saturating_add(1);
-        self.health_issues.insert(
-            "workload.exited".to_owned(),
-            issue(
-                "workload.exited",
-                "info",
-                "workload",
-                "the active workload exited or its PID was reused",
-            ),
+        let Some(expected) = self.active_workload.as_ref().map(|active| active.identity) else {
+            return;
+        };
+        self.start_process_identity_read(
+            expected.pid,
+            ProcessIdentityPurpose::Refresh { expected },
         );
-        self.evaluate_and_reconcile();
     }
 
     fn match_app_profile(&self, process: &ProcessInfo) -> Option<ProfileId> {
         self.configuration.app_rule_engine.match_profile(process)
     }
 
-    fn restore_on_shutdown(&mut self) -> Result<(), RuntimeError> {
-        let Some(actuator) = &self.actuator else {
-            return Ok(());
-        };
+    /// Advance an actor-owned mutation barrier without ever waiting on a
+    /// blocking-worker mutex from the Tokio core thread.
+    ///
+    /// Restoration has priority because logind places it on a hard deadline.
+    /// A parsed reload candidate follows, and ordinary reconciliation can
+    /// resume only after both barriers have completed.
+    fn drive_mutation_barriers(&mut self) -> bool {
+        if self.reconcile_in_flight || self.restore_in_flight.is_some() {
+            return true;
+        }
+        if self.restore_requested {
+            self.start_restore_worker();
+            return true;
+        }
+        if let Some(outcome) = self.pending_reload.take() {
+            self.complete_reload(outcome);
+            return true;
+        }
+        false
+    }
+
+    fn start_restore_worker(&mut self) {
+        debug_assert!(!self.reconcile_in_flight);
+        debug_assert!(self.restore_in_flight.is_none());
+        debug_assert!(self.restore_requested);
+
+        self.restore_requested = false;
+        self.next_restore_id = self.next_restore_id.saturating_add(1);
+        let id = self.next_restore_id;
+        self.restore_in_flight = Some(id);
+        let actuator = self.actuator.clone();
         let mutation_gate = self.mutation_gate.clone();
-        let _gate = mutation_gate
-            .lock()
-            .map_err(|_| RuntimeError::Internal("runtime mutation gate was poisoned".to_owned()))?;
-        actuator
-            .restore_all()
-            .map_err(|error| RuntimeError::Degraded(error.to_string()))?;
-        self.applied = AppliedState::default();
-        self.applied_units.clear();
-        self.observed.frequencies.clear();
-        Ok(())
+        let sender = self.worker_senders.restore.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let _gate = mutation_gate
+                    .lock()
+                    .map_err(|_| "runtime mutation gate was poisoned".to_owned())?;
+                actuator.map_or(Ok(()), |actuator| {
+                    actuator
+                        .restore_all()
+                        .map_err(|error| format!("failed to restore managed resources: {error}"))
+                })
+            })
+            .await
+            .map_err(|error| format!("blocking restore task failed: {error}"))
+            .and_then(std::convert::identity);
+            let _ = sender.send(RestoreOutcome { id, result }).await;
+        });
+    }
+
+    fn finish_restore(&mut self, outcome: RestoreOutcome) {
+        let expected = self.restore_in_flight.take();
+        let result = if expected == Some(outcome.id) {
+            outcome.result
+        } else {
+            Err(format!(
+                "received restore result {} while waiting for {:?}",
+                outcome.id, expected
+            ))
+        };
+
+        match &result {
+            Ok(()) => {
+                self.applied = AppliedState::default();
+                self.applied_units.clear();
+                self.observed.frequencies.clear();
+                self.restored_while_suspended = true;
+                self.health_issues.remove("actuator.sleep_restore");
+            }
+            Err(message) => {
+                self.restore_failure = Some(message.clone());
+                self.restored_while_suspended = false;
+                self.actuator_read_only = true;
+                self.health_issues.insert(
+                    "actuator.sleep_restore".to_owned(),
+                    issue(
+                        "actuator.sleep_restore",
+                        "critical",
+                        "actuator",
+                        message.clone(),
+                    ),
+                );
+            }
+        }
+        self.refresh_actuator_health();
+
+        for waiter in self.sleep_waiters.drain(..) {
+            let reply = match &result {
+                Ok(()) => Ok(()),
+                Err(message) => Err(message.clone()),
+            };
+            let _ = waiter.send(reply);
+        }
+
+        if !self.stop_waiters.is_empty() {
+            self.pending_resume = false;
+            for wake in self.wake_waiters.drain(..) {
+                let _ = wake.send(Err(
+                    "daemon shutdown superseded the pending resume transition".to_owned(),
+                ));
+            }
+            self.stop_requested = true;
+            for waiter in self.stop_waiters.drain(..) {
+                let reply = match &result {
+                    Ok(()) => Ok(()),
+                    Err(message) => Err(RuntimeError::Degraded(message.clone())),
+                };
+                let _ = waiter.send(reply);
+            }
+            return;
+        }
+
+        if self.pending_resume {
+            self.pending_resume = false;
+            self.restored_while_suspended = false;
+            self.resume_from_sleep();
+            for waiter in self.wake_waiters.drain(..) {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+        self.drive_mutation_barriers();
     }
 
     fn health(&self) -> HealthStatus {
@@ -2674,146 +3360,370 @@ impl RuntimeActor {
     }
 }
 
+async fn replace_frequency_safety_caps(
+    fence: Arc<FrequencySafetyFence>,
+    upper_caps: BTreeMap<TargetId, Hertz>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || fence.replace_upper_caps(upper_caps).map(|_| ()))
+        .await
+        .map_err(|error| format!("blocking frequency safety update failed: {error}"))
+        .and_then(std::convert::identity)
+}
+
 /// Independently scheduled Linux observer tasks.
 pub struct ObserverTasks {
-    shutdown: watch::Sender<bool>,
-    joins: Vec<JoinHandle<()>>,
+    control: Arc<ObserverControl>,
+    settings_bridge: JoinHandle<()>,
+    joins: Vec<ObserverThread>,
 }
 
 impl ObserverTasks {
-    pub async fn stop(self) {
-        self.shutdown.send_replace(true);
-        for join in self.joins {
-            let _ = join.await;
+    pub async fn stop(mut self) {
+        self.control.stop();
+        self.settings_bridge.abort();
+        let _ = self.settings_bridge.await;
+
+        let deadline = Instant::now() + OBSERVER_STOP_GRACE;
+        while self.joins.iter().any(|thread| !thread.join.is_finished())
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            )
+            .await;
+        }
+
+        for thread in self.joins.drain(..) {
+            if thread.join.is_finished() {
+                let _ = thread.join.join();
+            }
+            // A read-only driver callback may never return. Dropping an
+            // unfinished JoinHandle detaches that observer so verified
+            // actuator restoration is never delayed beyond the grace period.
         }
     }
 }
 
-/// Start independent load and thermal cadences.
-#[must_use]
+const OBSERVER_STOP_GRACE: Duration = Duration::from_millis(500);
+const OBSERVER_THREAD_STACK_SIZE: usize = 512 * 1024;
+
+struct ObserverThread {
+    join: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct ObserverControlState {
+    settings: ObserverSettings,
+    generation: u64,
+    stopping: bool,
+}
+
+#[derive(Debug)]
+struct ObserverControl {
+    state: Mutex<ObserverControlState>,
+    changed: Condvar,
+}
+
+impl ObserverControl {
+    fn new(settings: ObserverSettings) -> Self {
+        Self {
+            state: Mutex::new(ObserverControlState {
+                settings,
+                generation: 0,
+                stopping: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn replace_settings(&self, settings: ObserverSettings) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopping {
+            return;
+        }
+        state.settings = settings;
+        state.generation = state.generation.saturating_add(1);
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stopping = true;
+        self.changed.notify_all();
+    }
+
+    fn initial(&self) -> (ObserverSettings, u64, bool) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.settings.clone(), state.generation, state.stopping)
+    }
+
+    fn wait(&self, generation: u64, deadline: Instant) -> ObserverWake {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if state.stopping {
+                return ObserverWake::Stop;
+            }
+            if state.generation != generation {
+                return ObserverWake::Settings(state.settings.clone(), state.generation);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return ObserverWake::Deadline;
+            }
+            let wait = deadline.saturating_duration_since(now);
+            let (new_state, _) = self
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = new_state;
+        }
+    }
+
+    fn publish_if_current(&self, generation: u64, publish: impl FnOnce()) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopping || state.generation != generation {
+            return false;
+        }
+        publish();
+        true
+    }
+}
+
+enum ObserverWake {
+    Stop,
+    Settings(ObserverSettings, u64),
+    Deadline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThermalObserverSettings {
+    observer_generation: u64,
+    interval: Duration,
+    paths: Vec<PathBuf>,
+}
+
+/// Start independent load, thermal and frequency read-only workers.
+///
+/// # Errors
+///
+/// Returns an error if the operating system cannot create an observer thread.
 pub fn spawn_linux_observers(
     environment: Arc<LinuxEnvironment>,
     ingress: &ObserverIngress,
-) -> ObserverTasks {
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let load = spawn_load_observer(environment.clone(), ingress.clone(), shutdown_rx.clone());
-    let thermal = spawn_thermal_observer(environment.clone(), ingress.clone(), shutdown_rx.clone());
-    let frequency = spawn_frequency_observer(environment, ingress.clone(), shutdown_rx);
-    ObserverTasks {
-        shutdown,
-        joins: vec![load, thermal, frequency],
+) -> Result<ObserverTasks, String> {
+    let mut settings = ingress.settings();
+    let initial_settings = settings.borrow_and_update().clone();
+    let control = Arc::new(ObserverControl::new(initial_settings));
+    let mut joins = Vec::with_capacity(3);
+
+    let load = spawn_load_observer(environment.clone(), ingress.clone(), control.clone())?;
+    joins.push(load);
+    match spawn_thermal_observer(environment.clone(), ingress.clone(), control.clone()) {
+        Ok(thermal) => joins.push(thermal),
+        Err(error) => {
+            control.stop();
+            return Err(error);
+        }
     }
+    if !ingress.frequency_targets.is_empty() {
+        match spawn_frequency_observer(environment, ingress.clone(), control.clone()) {
+            Ok(frequency) => joins.push(frequency),
+            Err(error) => {
+                control.stop();
+                return Err(error);
+            }
+        }
+    }
+
+    let bridge_control = control.clone();
+    let settings_bridge = tokio::spawn(async move {
+        while settings.changed().await.is_ok() {
+            bridge_control.replace_settings(settings.borrow_and_update().clone());
+        }
+        bridge_control.stop();
+    });
+    Ok(ObserverTasks {
+        control,
+        settings_bridge,
+        joins,
+    })
 }
 
 fn spawn_load_observer(
     environment: Arc<LinuxEnvironment>,
     ingress: ObserverIngress,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    let mut load_settings = ingress.settings();
-    tokio::spawn(async move {
-        let mut sequence = 0_u64;
-        let mut ticker =
-            tokio::time::interval(nonzero_interval(load_settings.borrow().load_interval));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    sequence = sequence.saturating_add(1);
-                    let sample = environment.cpu_times().map_err(|error| error.to_string());
-                    ingress.observe_load(
-                        sequence,
-                        sample,
-                    );
-                }
-                changed = load_settings.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    ticker = tokio::time::interval(nonzero_interval(
-                        load_settings.borrow_and_update().load_interval,
-                    ));
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                }
-            }
-        }
-    })
+    control: Arc<ObserverControl>,
+) -> Result<ObserverThread, String> {
+    let failure_ingress = ingress.clone();
+    spawn_periodic_observer(
+        "uperf-load",
+        control,
+        |settings| nonzero_interval(settings.load_interval),
+        |interval| *interval,
+        move |_| environment.cpu_times().map_err(|error| error.to_string()),
+        move |sequence, sample| ingress.observe_load(sequence, sample),
+        move |message| failure_ingress.observe_load(0, Err(message)),
+    )
 }
 
 fn spawn_thermal_observer(
     environment: Arc<LinuxEnvironment>,
     ingress: ObserverIngress,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    let mut thermal_settings = ingress.settings();
-    tokio::spawn(async move {
-        let mut sequence = 0_u64;
-        let mut ticker =
-            tokio::time::interval(nonzero_interval(thermal_settings.borrow().thermal_interval));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    sequence = sequence.saturating_add(1);
-                    let paths = thermal_settings.borrow().thermal_paths.clone();
-                    let sample = environment.read_thermal_paths(&paths);
-                    ingress.observe_thermal(
-                        sequence,
-                        Ok(sample),
-                    );
-                }
-                changed = thermal_settings.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    ticker = tokio::time::interval(nonzero_interval(
-                        thermal_settings.borrow_and_update().thermal_interval,
-                    ));
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                }
-            }
-        }
-    })
+    control: Arc<ObserverControl>,
+) -> Result<ObserverThread, String> {
+    let failure_ingress = ingress.clone();
+    spawn_periodic_observer(
+        "uperf-thermal",
+        control,
+        |settings| ThermalObserverSettings {
+            observer_generation: settings.generation,
+            interval: nonzero_interval(settings.thermal_interval),
+            paths: settings.thermal_paths.clone(),
+        },
+        |settings| settings.interval,
+        move |settings| {
+            (
+                settings.observer_generation,
+                Ok(environment.read_thermal_paths(&settings.paths)),
+            )
+        },
+        move |sequence, (observer_generation, sample)| {
+            ingress.observe_thermal(sequence, observer_generation, sample);
+        },
+        move |message| {
+            let observer_generation = failure_ingress.settings().borrow().generation;
+            failure_ingress.observe_thermal(0, observer_generation, Err(message));
+        },
+    )
 }
 
 fn spawn_frequency_observer(
     environment: Arc<LinuxEnvironment>,
     ingress: ObserverIngress,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+    control: Arc<ObserverControl>,
+) -> Result<ObserverThread, String> {
     let frequency_targets = ingress.frequency_targets.clone();
-    tokio::spawn(async move {
-        let mut sequence = 0_u64;
-        let mut ticker = tokio::time::interval(FREQUENCY_OBSERVER_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    sequence = sequence.saturating_add(1);
-                    let sample = read_frequency_observation(
-                        environment.as_ref(),
-                        frequency_targets.as_ref(),
-                    );
-                    ingress.observe_frequencies(sequence, Ok(sample));
+    let failure_ingress = ingress.clone();
+    spawn_periodic_observer(
+        "uperf-freq",
+        control,
+        |_| FREQUENCY_OBSERVER_INTERVAL,
+        |interval| *interval,
+        move |_| {
+            Ok(read_frequency_observation(
+                environment.as_ref(),
+                frequency_targets.as_ref(),
+            ))
+        },
+        move |sequence, sample| ingress.observe_frequencies(sequence, sample),
+        move |message| failure_ingress.observe_frequencies(0, Err(message)),
+    )
+}
+
+fn spawn_periodic_observer<C, O>(
+    name: &'static str,
+    control: Arc<ObserverControl>,
+    select_settings: impl Fn(&ObserverSettings) -> C + Send + 'static,
+    interval: impl Fn(&C) -> Duration + Send + 'static,
+    read: impl Fn(&C) -> O + Send + 'static,
+    publish: impl Fn(u64, O) + Send + 'static,
+    report_panic: impl Fn(String) + Send + 'static,
+) -> Result<ObserverThread, String>
+where
+    C: Clone + PartialEq + Send + 'static,
+    O: Send + 'static,
+{
+    let join = thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(OBSERVER_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (initial, mut generation, stopping) = control.initial();
+                if stopping {
+                    return;
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
+                let mut configuration = select_settings(&initial);
+                let mut sequence = 0_u64;
+                let mut deadline = Instant::now();
+                loop {
+                    match control.wait(generation, deadline) {
+                        ObserverWake::Stop => break,
+                        ObserverWake::Settings(settings, new_generation) => {
+                            generation = new_generation;
+                            let new_configuration = select_settings(&settings);
+                            if new_configuration != configuration {
+                                configuration = new_configuration;
+                                deadline = Instant::now();
+                            }
+                        }
+                        ObserverWake::Deadline => {
+                            sequence = sequence.saturating_add(1);
+                            let sample = read(&configuration);
+                            if !control.publish_if_current(generation, || publish(sequence, sample))
+                            {
+                                let (settings, new_generation, stopping) = control.initial();
+                                if stopping {
+                                    break;
+                                }
+                                generation = new_generation;
+                                let new_configuration = select_settings(&settings);
+                                if new_configuration == configuration {
+                                    deadline =
+                                        next_observer_deadline(deadline, interval(&configuration));
+                                } else {
+                                    configuration = new_configuration;
+                                    deadline = Instant::now();
+                                }
+                                continue;
+                            }
+                            deadline = next_observer_deadline(deadline, interval(&configuration));
+                        }
                     }
                 }
+            }));
+            if let Err(payload) = outcome {
+                report_panic(format!(
+                    "{name} observer panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ));
             }
-        }
-    })
+        })
+        .map_err(|error| format!("start {name} observer thread: {error}"))?;
+    Ok(ObserverThread { join })
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+fn next_observer_deadline(previous: Instant, interval: Duration) -> Instant {
+    let interval = nonzero_interval(interval);
+    let now = Instant::now();
+    previous
+        .checked_add(interval)
+        .filter(|scheduled| *scheduled > now)
+        .unwrap_or(now + interval)
 }
 
 fn nonzero_interval(interval: Duration) -> Duration {
@@ -3058,12 +3968,72 @@ mod tests {
     use super::*;
     use uperf_core::{
         AppRuleEngine, CpuId, CpuSet, DeviceCapabilities, DeviceConfig, PolicyConfig, PolicyEngine,
+        UserId,
     };
-    use uperf_platform::{InputDeviceId, TouchContactId};
+    use uperf_platform::{Clock, InputDeviceId, OnlineCpuSource, PlatformResult, TouchContactId};
     use uperf_testkit::{FakeClock, FakeProc, FakeRuntime};
 
     fn contact(device: u64, tracking_id: u32) -> TouchContactId {
         TouchContactId::new(InputDeviceId::new(device), tracking_id)
+    }
+
+    #[derive(Clone)]
+    struct BlockingIdentityRuntime {
+        inner: FakeRuntime,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        entered: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Clock for BlockingIdentityRuntime {
+        fn monotonic_millis(&self) -> MonotonicMillis {
+            self.inner.monotonic_millis()
+        }
+    }
+
+    impl ProcReader for BlockingIdentityRuntime {
+        fn cpu_times(&self) -> PlatformResult<CpuTimeSnapshot> {
+            self.inner.cpu_times()
+        }
+
+        fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+            self.inner.list_processes()
+        }
+
+        fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
+            self.inner.list_threads(process)
+        }
+
+        fn process_identity(&self, pid: ProcessId) -> PlatformResult<ProcessInfo> {
+            let _ = self.entered.send(());
+            let (released, changed) = &*self.release;
+            let released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = changed
+                .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner.process_identity(pid)
+        }
+    }
+
+    impl OnlineCpuSource for BlockingIdentityRuntime {
+        fn online_cpus(&self) -> PlatformResult<CpuSet> {
+            self.inner.online_cpus()
+        }
+    }
+
+    fn test_process(pid: u32, uid: u32) -> ProcessInfo {
+        ProcessInfo {
+            identity: ProcessIdentity {
+                pid: ProcessId::new(pid),
+                start_time_ticks: 123,
+                uid: UserId::new(uid),
+            },
+            owner_control_safe: true,
+            comm: "test-workload".to_owned(),
+            executable: Some("/usr/bin/test-workload".to_owned()),
+            desktop_id: None,
+        }
     }
 
     #[test]
@@ -3084,8 +4054,271 @@ mod tests {
         assert!(frequency_sample_is_stale(None, last));
     }
 
-    #[tokio::test]
-    async fn fake_clock_drives_hint_expiry_through_the_complete_actor() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_frequency_safety_update_does_not_block_the_async_control_plane() {
+        let fence = Arc::new(FrequencySafetyFence::default());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let holder_fence = fence.clone();
+        let holder_release = release.clone();
+        let (locked, lock_observed) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            holder_fence
+                .hold_for_test(|| {
+                    locked.send(()).expect("report held safety fence");
+                    let (released, changed) = &*holder_release;
+                    let released = released
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = changed
+                        .wait_timeout_while(released, Duration::from_millis(250), |released| {
+                            !*released
+                        })
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                })
+                .expect("hold safety fence");
+        });
+        lock_observed
+            .recv_timeout(Duration::from_millis(250))
+            .expect("safety fence held");
+
+        let target = TargetId::new("cpu.test").expect("target ID");
+        let update = tokio::spawn(replace_frequency_safety_caps(
+            fence,
+            [(target, Hertz::new(1_000))].into(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!update.is_finished());
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+        .expect("current-thread control-plane heartbeat");
+        assert!(started.elapsed() < Duration::from_millis(80));
+
+        {
+            let (released, changed) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        holder.join().expect("release safety fence");
+        update
+            .await
+            .expect("join safety update")
+            .expect("apply safety update");
+    }
+
+    fn test_observer_settings(interval: Duration, path: &str) -> ObserverSettings {
+        ObserverSettings {
+            generation: 1,
+            load_interval: interval,
+            thermal_interval: interval,
+            thermal_paths: vec![PathBuf::from(path)],
+            input: InputConfig::default(),
+        }
+    }
+
+    #[test]
+    fn observer_reload_immediately_uses_the_latest_thermal_settings() {
+        let control = Arc::new(ObserverControl::new(test_observer_settings(
+            Duration::from_mins(1),
+            "/sys/class/thermal/old/temp",
+        )));
+        let (published, received) = std::sync::mpsc::channel();
+        let worker = spawn_periodic_observer(
+            "test-thermal",
+            control.clone(),
+            |settings| ThermalObserverSettings {
+                observer_generation: settings.generation,
+                interval: settings.thermal_interval,
+                paths: settings.thermal_paths.clone(),
+            },
+            |settings| settings.interval,
+            |settings| settings.paths[0].clone(),
+            move |_, path| {
+                let _ = published.send(path);
+            },
+            |_| {},
+        )
+        .expect("spawn observer");
+
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_millis(250))
+                .expect("initial observation"),
+            PathBuf::from("/sys/class/thermal/old/temp")
+        );
+        control.replace_settings(test_observer_settings(
+            Duration::from_secs(30),
+            "/sys/class/thermal/new/temp",
+        ));
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_millis(250))
+                .expect("observation after reload"),
+            PathBuf::from("/sys/class/thermal/new/temp")
+        );
+
+        control.stop();
+        worker.join.join().expect("join observer");
+    }
+
+    #[test]
+    fn a_blocked_observer_does_not_delay_an_independent_lane() {
+        let control = Arc::new(ObserverControl::new(test_observer_settings(
+            Duration::from_mins(1),
+            "/sys/class/thermal/test/temp",
+        )));
+        let blocked = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocked_reader = blocked.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let slow = spawn_periodic_observer(
+            "test-slow",
+            control.clone(),
+            |settings| settings.load_interval,
+            |interval| *interval,
+            move |_| {
+                let _ = entered_tx.send(());
+                let (released, changed) = &*blocked_reader;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            },
+            |_, ()| {},
+            |_| {},
+        )
+        .expect("spawn blocked observer");
+        entered_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("blocked observer entered read");
+
+        let (fast_tx, fast_rx) = std::sync::mpsc::channel();
+        let fast = spawn_periodic_observer(
+            "test-fast",
+            control.clone(),
+            |settings| settings.thermal_interval,
+            |interval| *interval,
+            |_| (),
+            move |_, ()| {
+                let _ = fast_tx.send(());
+            },
+            |_| {},
+        )
+        .expect("spawn independent observer");
+        fast_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("independent observer published");
+
+        control.stop();
+        {
+            let (released, changed) = &*blocked;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        slow.join.join().expect("join blocked observer");
+        fast.join.join().expect("join independent observer");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_stop_detaches_a_stuck_read_without_publishing_after_stop() {
+        let control = Arc::new(ObserverControl::new(test_observer_settings(
+            Duration::from_mins(1),
+            "/sys/class/thermal/test/temp",
+        )));
+        let blocked = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocked_reader = blocked.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = publications.clone();
+        let worker = spawn_periodic_observer(
+            "test-stuck",
+            control.clone(),
+            |settings| settings.load_interval,
+            |interval| *interval,
+            move |_| {
+                let _ = entered_tx.send(());
+                let (released, changed) = &*blocked_reader;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            },
+            move |_, ()| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+            |_| {},
+        )
+        .expect("spawn stuck observer");
+        entered_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("stuck observer entered read");
+        let tasks = ObserverTasks {
+            control,
+            settings_bridge: tokio::spawn(std::future::pending()),
+            joins: vec![worker],
+        };
+
+        let started = Instant::now();
+        tasks.stop().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "observer shutdown must detach after its 500ms grace period"
+        );
+
+        {
+            let (released, changed) = &*blocked;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn observer_panic_is_reported_instead_of_silently_stopping() {
+        let control = Arc::new(ObserverControl::new(test_observer_settings(
+            Duration::from_mins(1),
+            "/sys/class/thermal/test/temp",
+        )));
+        let (failed, failure) = std::sync::mpsc::channel();
+        let worker = spawn_periodic_observer(
+            "test-panic",
+            control,
+            |settings| settings.load_interval,
+            |interval| *interval,
+            |_| -> () { panic!("injected observer panic") },
+            |_, ()| {},
+            move |message| {
+                let _ = failed.send(message);
+            },
+        )
+        .expect("spawn panicking observer");
+
+        let message = failure
+            .recv_timeout(Duration::from_millis(250))
+            .expect("observer panic report");
+        assert!(message.contains("test-panic observer panicked"));
+        assert!(message.contains("injected observer panic"));
+        worker.join.join().expect("join supervised observer");
+    }
+
+    fn actor_parts(root: &std::path::Path, clock: FakeClock) -> RuntimeParts {
         let device = DeviceConfig::from_json(include_str!("../../../config/devices/sm8550.json"))
             .expect("device configuration");
         let policy = PolicyConfig::from_json(include_str!("../../../config/policy.json"))
@@ -3117,21 +4350,150 @@ mod tests {
             thermal_zone_paths: BTreeMap::new(),
             warnings: Vec::new(),
         };
-        let clock = FakeClock::new(MonotonicMillis::new(10));
         let platform = Arc::new(FakeRuntime::new(
-            clock.clone(),
+            clock,
             FakeProc::default(),
             CpuSet::from_ids([CpuId::new(0)]),
         ));
-        let temporary = tempfile::tempdir().expect("temporary configuration roots");
-        let (runtime, ingress, state_task) = spawn_runtime(RuntimeParts {
+        RuntimeParts {
             environment: platform,
             discovery,
             configuration,
-            configuration_paths: ConfigurationPaths::below(temporary.path(), temporary.path()),
+            configuration_paths: ConfigurationPaths::below(root, root),
             actuator: None,
             started_at: Instant::now(),
+        }
+    }
+
+    fn actor_for_test(parts: RuntimeParts) -> RuntimeActor {
+        let (observer_settings, _) = watch::channel(ObserverSettings::from_configuration(
+            &parts.configuration,
+            1,
+        ));
+        let (reconcile, _) = mpsc::channel(1);
+        let (restore, _) = mpsc::channel(1);
+        let (frequency_safety, _) = mpsc::channel(1);
+        let (process_identity, _) = mpsc::channel(1);
+        let (app_persistence, _) = mpsc::channel(1);
+        let (reload, _) = mpsc::channel(1);
+        RuntimeActor::new(
+            parts,
+            observer_settings,
+            Arc::new(Mutex::new(())),
+            RuntimeWorkerSenders {
+                reconcile,
+                restore,
+                frequency_safety,
+                process_identity,
+                app_persistence,
+                reload,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identical_frequency_safety_requests_are_coalesced() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let upper_caps: BTreeMap<TargetId, Hertz> = [(
+            TargetId::new("cpu.test").expect("target ID"),
+            Hertz::new(1_000),
+        )]
+        .into();
+
+        actor.request_frequency_safety_update(upper_caps.clone());
+        let first_update = actor.frequency_safety_update_in_flight;
+        assert!(first_update.is_some());
+        actor.request_frequency_safety_update(upper_caps);
+        assert_eq!(actor.frequency_safety_update_in_flight, first_update);
+        assert!(actor.pending_frequency_upper_caps.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frequency_safety_worker_failure_is_a_mandatory_component_failure() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        actor.frequency_safety_update_in_flight = Some(7);
+        actor.finish_frequency_safety_update(FrequencySafetyOutcome {
+            id: 7,
+            result: Err("injected safety fence failure".to_owned()),
         });
+
+        let issue = actor
+            .health_issues
+            .get("safety.frequency_fence")
+            .expect("frequency safety health issue");
+        assert_eq!(issue.component, "actuator");
+        assert_eq!(actor.health().state, "failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_rule_generation_does_not_invalidate_thermal_observations() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let observer_generation = actor.observer_generation;
+        let (reply, _) = oneshot::channel();
+        actor.finish_app_persistence(AppPersistenceOutcome {
+            candidate: actor.configuration.apps.clone(),
+            changed_id: "test-rule".to_owned(),
+            message: "test application rule persisted",
+            reply,
+            result: Ok(()),
+        });
+
+        assert_eq!(actor.config_generation, 2);
+        assert_eq!(actor.observer_generation, observer_generation);
+        assert_eq!(
+            actor.observer_settings.borrow().generation,
+            observer_generation
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_workload_refresh_cannot_clear_a_newer_identity_generation() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let active = test_process(42, 1_000);
+        let expected = active.identity;
+        actor.active_workload = Some(active.clone());
+        actor.observed.active_workload = Some(expected);
+        actor.process_identity_in_flight = Some(ProcessIdentityInFlight {
+            id: 2,
+            is_control_request: true,
+        });
+
+        actor.finish_process_identity(ProcessIdentityOutcome {
+            id: 1,
+            purpose: ProcessIdentityPurpose::Refresh { expected },
+            result: Err("stale read observed a vanished process".to_owned()),
+        });
+
+        assert_eq!(actor.active_workload, Some(active));
+        assert_eq!(actor.observed.active_workload, Some(expected));
+        assert_eq!(
+            actor.process_identity_in_flight.map(|request| request.id),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_clock_drives_hint_expiry_through_the_complete_actor() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let clock = FakeClock::new(MonotonicMillis::new(10));
+        let (runtime, ingress, state_task) =
+            spawn_runtime(actor_parts(temporary.path(), clock.clone()));
         let mut states = runtime.subscribe();
 
         assert!(ingress.try_hint(Scene::Wake));
@@ -3159,6 +4521,308 @@ mod tests {
         .expect("hint expiry publication");
 
         runtime.stop().await.expect("stop runtime");
+        state_task
+            .await
+            .expect("join runtime")
+            .expect("runtime result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_workload_identity_read_does_not_block_sleep_control() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let clock = FakeClock::new(MonotonicMillis::new(10));
+        let procfs = FakeProc::default();
+        procfs.insert_process(test_process(42, 1_000));
+        let inner = FakeRuntime::new(clock.clone(), procfs, CpuSet::from_ids([CpuId::new(0)]));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered, identity_read_entered) = std::sync::mpsc::channel();
+        let mut parts = actor_parts(temporary.path(), clock);
+        parts.environment = Arc::new(BlockingIdentityRuntime {
+            inner,
+            release: release.clone(),
+            entered,
+        });
+        let (runtime, ingress, state_task) = spawn_runtime(parts);
+
+        let workload_runtime = runtime.clone();
+        let workload = tokio::spawn(async move {
+            workload_runtime
+                .set_active_workload(
+                    WorkloadRequest {
+                        pid: 42,
+                        mode: String::new(),
+                        reason: "blocking procfs regression test".to_owned(),
+                    },
+                    1_000,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if identity_read_entered.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workload identity read entered");
+
+        let started = Instant::now();
+        ingress
+            .prepare_for_sleep(true, Duration::from_millis(100))
+            .await
+            .expect("sleep restoration must remain responsive");
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "procfs identity I/O must not occupy the current-thread runtime"
+        );
+        assert!(
+            !workload.is_finished(),
+            "workload registration still waits for identity verification"
+        );
+
+        {
+            let (released, changed) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        workload
+            .await
+            .expect("join workload request")
+            .expect("verified workload request");
+        ingress
+            .prepare_for_sleep(false, Duration::from_secs(1))
+            .await
+            .expect("resume after identity verification");
+        runtime.begin_shutdown().await.expect("begin shutdown");
+        runtime.stop().await.expect("stop runtime");
+        state_task
+            .await
+            .expect("join runtime")
+            .expect("runtime result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workload_identity_deadline_does_not_delay_runtime_exit() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let clock = FakeClock::new(MonotonicMillis::new(10));
+        let procfs = FakeProc::default();
+        procfs.insert_process(test_process(42, 1_000));
+        let inner = FakeRuntime::new(clock.clone(), procfs, CpuSet::from_ids([CpuId::new(0)]));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered, identity_read_entered) = std::sync::mpsc::channel();
+        let mut parts = actor_parts(temporary.path(), clock);
+        parts.environment = Arc::new(BlockingIdentityRuntime {
+            inner,
+            release: release.clone(),
+            entered,
+        });
+        let (runtime, _ingress, state_task) = spawn_runtime(parts);
+
+        let workload_runtime = runtime.clone();
+        let workload = tokio::spawn(async move {
+            workload_runtime
+                .set_active_workload(
+                    WorkloadRequest {
+                        pid: 42,
+                        mode: String::new(),
+                        reason: "identity deadline regression test".to_owned(),
+                    },
+                    1_000,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if identity_read_entered.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workload identity read entered");
+
+        runtime.begin_shutdown().await.expect("begin shutdown");
+        let stop_runtime = runtime.clone();
+        let stop = tokio::spawn(async move { stop_runtime.stop().await });
+        let error = tokio::time::timeout(Duration::from_secs(1), workload)
+            .await
+            .expect("bounded identity request")
+            .expect("join workload request")
+            .expect_err("stuck identity request must time out");
+        assert!(error.to_string().contains("deadline"));
+        tokio::time::timeout(Duration::from_millis(250), stop)
+            .await
+            .expect("runtime stop after identity timeout")
+            .expect("join stop request")
+            .expect("stop result");
+        state_task
+            .await
+            .expect("join runtime")
+            .expect("runtime result");
+
+        {
+            let (released, changed) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_restore_keeps_the_deadline_live_and_honours_the_latest_transition() {
+        let gate = Arc::new(Mutex::new(()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let worker_release = release.clone();
+        let (locked, lock_observed) = std::sync::mpsc::channel();
+        let blocker = thread::spawn(move || {
+            let _gate = worker_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locked.send(()).expect("report held mutation gate");
+            let (released, changed) = &*worker_release;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !*released && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let (next, _) = changed
+                    .wait_timeout(released, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                released = next;
+            }
+        });
+        lock_observed
+            .recv_timeout(Duration::from_millis(250))
+            .expect("mutation gate held");
+
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let parts = actor_parts(temporary.path(), FakeClock::new(MonotonicMillis::new(10)));
+        let (runtime, ingress, state_task) = spawn_runtime_with_mutation_gate(parts, gate);
+
+        let started = Instant::now();
+        let sleep_error = ingress
+            .prepare_for_sleep(true, Duration::from_millis(20))
+            .await
+            .expect_err("held restore must exceed the logind acknowledgement deadline");
+        assert!(sleep_error.contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "the current-thread runtime must not wait on the worker mutex"
+        );
+
+        let wake_ingress = ingress.clone();
+        let wake = tokio::spawn(async move {
+            wake_ingress
+                .prepare_for_sleep(false, Duration::from_secs(1))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !wake.is_finished(),
+            "wake must remain deferred until restoration has finished"
+        );
+
+        let sleep_again_ingress = ingress.clone();
+        let sleep_again = tokio::spawn(async move {
+            sleep_again_ingress
+                .prepare_for_sleep(true, Duration::from_secs(1))
+                .await
+        });
+        let wake_error = wake
+            .await
+            .expect("join superseded wake request")
+            .expect_err("the newer sleep transition must supersede wake");
+        assert!(wake_error.contains("newer sleep transition"));
+        assert!(
+            !sleep_again.is_finished(),
+            "the latest sleep transition must still wait for restoration"
+        );
+
+        {
+            let (released, changed) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        blocker.join().expect("release mutation gate");
+        sleep_again
+            .await
+            .expect("join latest sleep request")
+            .expect("latest sleep after restore");
+        ingress
+            .prepare_for_sleep(false, Duration::from_secs(1))
+            .await
+            .expect("explicit resume after restore");
+
+        runtime.begin_shutdown().await.expect("begin shutdown");
+        runtime.stop().await.expect("stop runtime");
+        state_task
+            .await
+            .expect("join runtime")
+            .expect("runtime result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_stop_callers_share_one_restore_result() {
+        let gate = Arc::new(Mutex::new(()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let worker_release = release.clone();
+        let (locked, lock_observed) = std::sync::mpsc::channel();
+        let blocker = thread::spawn(move || {
+            let _gate = worker_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locked.send(()).expect("report held mutation gate");
+            let (released, changed) = &*worker_release;
+            let released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = changed
+                .wait_timeout_while(released, Duration::from_millis(500), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        });
+        lock_observed
+            .recv_timeout(Duration::from_millis(250))
+            .expect("mutation gate held");
+
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let parts = actor_parts(temporary.path(), FakeClock::new(MonotonicMillis::new(10)));
+        let (runtime, _ingress, state_task) = spawn_runtime_with_mutation_gate(parts, gate);
+        runtime.begin_shutdown().await.expect("begin shutdown");
+        let first_runtime = runtime.clone();
+        let second_runtime = runtime.clone();
+        let first = tokio::spawn(async move { first_runtime.stop().await });
+        let second = tokio::spawn(async move { second_runtime.stop().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        {
+            let (released, changed) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
+        blocker.join().expect("release mutation gate");
+        first
+            .await
+            .expect("join first stop")
+            .expect("first stop result");
+        second
+            .await
+            .expect("join second stop")
+            .expect("second stop result");
         state_task
             .await
             .expect("join runtime")
@@ -3201,6 +4865,7 @@ mod tests {
         let (input_health, _) = watch::channel(None);
         let (runtime_events, mut queue_rx) = mpsc::channel(1);
         let (_, settings) = watch::channel(ObserverSettings {
+            generation: 1,
             load_interval: Duration::from_millis(1),
             thermal_interval: Duration::from_millis(1),
             thermal_paths: Vec::new(),
@@ -3262,6 +4927,7 @@ mod tests {
         let (input_health, _) = watch::channel(None);
         let (runtime_events, mut queue_rx) = mpsc::channel(1);
         let (_, settings) = watch::channel(ObserverSettings {
+            generation: 1,
             load_interval: Duration::from_millis(1),
             thermal_interval: Duration::from_millis(1),
             thermal_paths: Vec::new(),
@@ -3305,6 +4971,7 @@ mod tests {
         let (input_health, _) = watch::channel(None);
         let (runtime_events, _queue_rx) = mpsc::channel(1);
         let (_, settings) = watch::channel(ObserverSettings {
+            generation: 1,
             load_interval: Duration::from_millis(1),
             thermal_interval: Duration::from_millis(1),
             thermal_paths: Vec::new(),

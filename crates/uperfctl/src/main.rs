@@ -17,7 +17,7 @@ const EXIT_UNAVAILABLE: u8 = 3;
 const EXIT_NOT_AUTHORIZED: u8 = 4;
 const EXIT_CONFLICT: u8 = 5;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
