@@ -191,8 +191,6 @@ pub struct DaemonStatus {
     pub config_generation: u64,
     /// Last completely reconciled desired-state generation.
     pub reconcile_generation: u64,
-    /// Daemon uptime in milliseconds.
-    pub uptime_ms: u64,
 }
 
 /// Bounded-rate observational telemetry.

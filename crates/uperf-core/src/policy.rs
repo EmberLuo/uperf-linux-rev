@@ -241,14 +241,6 @@ impl FrequencyPolicy {
         }
         Ok(())
     }
-
-    #[must_use]
-    pub fn normalized_opps(&self) -> Vec<Hertz> {
-        let mut frequencies = self.available_frequencies.clone();
-        frequencies.sort_unstable();
-        frequencies.dedup();
-        frequencies
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1081,12 +1073,6 @@ impl PolicyEngine {
             })
             && desired.tasks == applied.tasks
     }
-}
-
-/// Match non-sensitive process metadata against a workload rule.
-#[must_use]
-pub fn workload_matches(matcher: &WorkloadMatcher, process: &ProcessInfo) -> bool {
-    CompiledWorkloadMatcher::new(matcher).is_ok_and(|compiled| compiled.is_match(process))
 }
 
 #[derive(Debug, Clone, Copy)]

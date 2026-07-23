@@ -2,7 +2,6 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -83,7 +82,6 @@ async fn main() {
 )]
 async fn run(options: Result<Options>) -> Result<()> {
     let options = options?;
-    let started_at = Instant::now();
     let environment = Arc::new(match &options.fixture_root {
         Some(root) => LinuxEnvironment::new(SystemRoots::below(root))
             .with_context(|| format!("open fixture environment {}", root.display()))?,
@@ -177,7 +175,6 @@ async fn run(options: Result<Options>) -> Result<()> {
         configuration,
         configuration_paths: paths,
         actuator,
-        started_at,
     });
     let observers = spawn_linux_observers(environment, &ingress)
         .map_err(|error| anyhow!("start Linux observers: {error}"))?;

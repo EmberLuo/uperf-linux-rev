@@ -612,7 +612,6 @@ pub struct RuntimeParts {
     pub configuration: ResolvedConfiguration,
     pub configuration_paths: ConfigurationPaths,
     pub actuator: Option<Arc<FrequencyActuator>>,
-    pub started_at: Instant,
 }
 
 /// Start the reducer and return API, observer, and join handles.
@@ -722,7 +721,6 @@ struct RuntimeActor {
     reload_in_flight: bool,
     pending_reload: Option<ReloadOutcome>,
     capabilities_changed_pending: bool,
-    started_at: Instant,
     mode: ModeSelection,
     active_workload: Option<ProcessInfo>,
     requested_workload_profile: Option<ProfileId>,
@@ -736,7 +734,6 @@ struct RuntimeActor {
     thermal_state: ThermalState,
     thermal_caps: BTreeMap<TargetId, Hertz>,
     maximum_temperature: Option<MilliCelsius>,
-    thermal_ready: bool,
     previous_cpu_times: Option<CpuTimeSnapshot>,
     last_load_success: Option<MonotonicMillis>,
     last_frequency_success: Option<MonotonicMillis>,
@@ -836,7 +833,6 @@ impl RuntimeActor {
             reload_in_flight: false,
             pending_reload: None,
             capabilities_changed_pending: false,
-            started_at: parts.started_at,
             mode: ModeSelection::Auto,
             active_workload: None,
             requested_workload_profile: None,
@@ -853,12 +849,12 @@ impl RuntimeActor {
             active_touch_contacts: ActiveTouchContacts::default(),
             overrides: BTreeMap::new(),
             thermal_guards,
+            // Startup is fail-closed: the sensor-failure envelope stays active
+            // until the first trusted sample replaces the Degraded state, so the
+            // window is never unbounded.
             thermal_state: ThermalState::Degraded,
             thermal_caps: BTreeMap::new(),
             maximum_temperature: None,
-            // Until the first trusted sample arrives the sensor-failure
-            // envelope is active; startup must not create an unbounded window.
-            thermal_ready: true,
             previous_cpu_times: None,
             last_load_success: None,
             last_frequency_success: None,
@@ -1089,7 +1085,6 @@ impl RuntimeActor {
         let mut previous_health = self.health();
         let mut previous_actuator_read_only = self.actuator_read_only;
         let mut published_telemetry_sequence = self.telemetry_sequence;
-        let mut published_uptime_seconds = self.started_at.elapsed().as_secs();
 
         while !self.stop_requested {
             let mut capabilities_changed = false;
@@ -1189,16 +1184,13 @@ impl RuntimeActor {
                 self.state_revision = self.state_revision.saturating_add(1);
                 previous_state = new_state;
             }
-            let uptime_seconds = self.started_at.elapsed().as_secs();
             let publish = state_changed
                 || health_changed
                 || capabilities_changed
-                || self.telemetry_sequence != published_telemetry_sequence
-                || uptime_seconds != published_uptime_seconds;
+                || self.telemetry_sequence != published_telemetry_sequence;
             if publish {
                 published.send_replace(Arc::new(self.published()));
                 published_telemetry_sequence = self.telemetry_sequence;
-                published_uptime_seconds = uptime_seconds;
             }
 
             // The coherent snapshot must become visible before any signal
@@ -1448,7 +1440,6 @@ impl RuntimeActor {
     fn reduce_thermal(&mut self, observation: Result<Vec<ThermalSample>, String>) {
         let now = self.environment.monotonic_millis();
         self.observed.timestamp = now;
-        self.thermal_ready = true;
         let samples = match observation {
             Ok(samples) => {
                 self.health_issues.remove("observer.thermal");
@@ -1808,7 +1799,6 @@ impl RuntimeActor {
 
     fn resume_from_sleep(&mut self) {
         self.suspended = false;
-        self.thermal_ready = true;
         self.thermal_state = ThermalState::Degraded;
         self.mark_all_thermal_unavailable(self.environment.monotonic_millis());
         self.update_thermal_caps();
@@ -1870,7 +1860,7 @@ impl RuntimeActor {
             || load_changed
             || had_expired_overrides
             || self.desired.is_none()
-            || self.scheduler_dirty && self.thermal_ready && !self.suspended
+            || self.scheduler_dirty && !self.suspended
             || self.frequency_failures != 0 && now >= self.frequency_retry_not_before
             || self.scheduler_failures != 0 && now >= self.scheduler_retry_not_before
         {
@@ -1933,9 +1923,6 @@ impl RuntimeActor {
     }
 
     fn refresh_thermal_staleness(&mut self, now: MonotonicMillis) -> bool {
-        if !self.thermal_ready {
-            return false;
-        }
         let previous = self.thermal_state;
         let mut reading_changed = false;
         let mut states = Vec::with_capacity(self.configuration.thermal_zones.len());
@@ -2346,7 +2333,7 @@ impl RuntimeActor {
         &mut self,
         requests: Vec<FrequencyOverride>,
     ) -> Result<MutationReceipt, RuntimeError> {
-        if !self.thermal_ready || self.thermal_state == ThermalState::Degraded {
+        if self.thermal_state == ThermalState::Degraded {
             return Err(RuntimeError::Degraded(
                 "trusted thermal data is not currently healthy".to_owned(),
             ));
@@ -2544,7 +2531,6 @@ impl RuntimeActor {
                 )
             })
             .collect();
-        self.thermal_ready = true;
         self.thermal_state = ThermalState::Degraded;
         self.mark_all_thermal_unavailable(self.environment.monotonic_millis());
         self.update_thermal_caps();
@@ -2727,8 +2713,7 @@ impl RuntimeActor {
         }
         self.desired = Some(desired.clone());
 
-        if !self.thermal_ready
-            || self.suspended
+        if self.suspended
             || !self.mutations_activated
             || !self.accepting_control
             || self.restore_requested
@@ -3211,7 +3196,6 @@ impl RuntimeActor {
             frequencies: frequencies.clone(),
             config_generation: self.config_generation,
             reconcile_generation: self.applied.generation,
-            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         let cpu_loads = self
             .observed
@@ -4361,7 +4345,6 @@ mod tests {
             configuration,
             configuration_paths: ConfigurationPaths::below(root, root),
             actuator: None,
-            started_at: Instant::now(),
         }
     }
 

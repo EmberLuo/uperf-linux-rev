@@ -1,6 +1,6 @@
 <interface name="org.uperflinux.Daemon1">
   <method name="GetStatus">
-    <arg type="((uu)ss(sbbsa(ssss))sss(b(utu)ssss)(sibb)a(sbttttbttbbb)ttt)" direction="out"/>
+    <arg type="((uu)ss(sbbsa(ssss))sss(b(utu)ssss)(sibb)a(sbttttbttbbb)tt)" direction="out"/>
   </method>
   <method name="GetCapabilities">
     <arg type="((uu)asa(sss)a(sssauttatb)uu)" direction="out"/>

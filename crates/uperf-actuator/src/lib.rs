@@ -221,16 +221,6 @@ impl FrequencyTarget {
         Ok(self)
     }
 
-    /// Snap a requested pin to the nearest real operating point.
-    #[must_use]
-    pub fn snap_pin(&self, requested: Hertz) -> Hertz {
-        self.opps
-            .iter()
-            .copied()
-            .min_by_key(|candidate| candidate.get().abs_diff(requested.get()))
-            .unwrap_or_else(|| requested.clamp(self.hardware_min, self.hardware_max))
-    }
-
     /// Snap a frequency window inward to real operating points.
     ///
     /// # Errors
@@ -1064,22 +1054,6 @@ impl FrequencyActuator {
             )
         });
         Ok(!state.journal.entries.is_empty() || tasks_owned || units_owned)
-    }
-
-    /// Permanently disable mutations for this actuator instance.
-    ///
-    /// This is used when an earlier recovery actuator failed before the normal
-    /// configuration-backed actuator was constructed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the internal state lock is poisoned.
-    pub fn enter_read_only_degraded(&self, reason: impl Into<String>) -> Result<(), ActuatorError> {
-        let mut state = self.lock_state()?;
-        state.mode = ActuatorMode::ReadOnlyDegraded {
-            reason: reason.into(),
-        };
-        Ok(())
     }
 
     /// Carry a failed pre-configuration recovery into a newly constructed
