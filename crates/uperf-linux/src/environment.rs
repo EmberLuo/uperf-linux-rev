@@ -224,6 +224,10 @@ impl ProcReader for LinuxEnvironment {
         self.procfs.cpu_times()
     }
 
+    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+        self.procfs.list_processes()
+    }
+
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
         self.procfs.list_threads(process)
     }

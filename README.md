@@ -183,6 +183,16 @@ desktop-ID matchers are not accepted. The v2 configuration model reserves
 `desktop_id` for a future trusted desktop adapter, but semantic validation
 currently rejects it.
 
+D-Bus API v1.1 also exposes read-only running-workload discovery. The daemon
+checks broad, case-insensitive game and compatibility-layer patterns such as
+Wine, Proton, Steam and common emulators every five seconds. A match is only a
+GUI/CLI candidate: it never selects the workload or changes the global mode.
+Non-root clients see only candidates owned by their UID, full command lines and
+executable paths are not exposed, and selecting a candidate still goes through
+the stable PID/start-time/UID checks described above. The same view reports the
+active workload's matched scheduler rule, desired/applied task counts and
+owned systemd cgroup state.
+
 Debian/Ubuntu packages deliberately leave the service disabled and stopped.
 Review and validate the complete live configuration first, then enable it
 explicitly:

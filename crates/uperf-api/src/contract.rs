@@ -15,7 +15,7 @@ pub struct ApiVersion {
 
 impl ApiVersion {
     /// Contract version implemented by this crate.
-    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+    pub const CURRENT: Self = Self { major: 1, minor: 1 };
 
     /// Whether both endpoints can safely exchange version-1 DTOs.
     #[must_use]
@@ -113,6 +113,51 @@ pub struct WorkloadRequest {
     pub mode: String,
     /// Short audit reason supplied by the client.
     pub reason: String,
+}
+
+/// Read-only scheduler and cgroup state associated with a running workload.
+///
+/// Empty strings mean that no process rule, cgroup class, unit, or warning is
+/// currently associated with the workload. Keeping this as a separate v1.1
+/// DTO lets older v1 clients continue decoding [`DaemonStatus`] unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct SchedulerStatus {
+    /// Whether task scheduling is enabled in the loaded policy.
+    pub enabled: bool,
+    /// Name of the first matching process rule.
+    pub matched_rule: String,
+    /// Number of tasks selected by the latest scheduler classification.
+    pub managed_tasks: u32,
+    /// Number of selected tasks with daemon-verified applied state.
+    pub applied_tasks: u32,
+    /// Logical configured cgroup class.
+    pub cgroup_class: String,
+    /// Owned systemd unit selected for the active workload.
+    pub systemd_unit: String,
+    /// Whether the unit's requested properties have verified applied state.
+    pub cgroup_applied: bool,
+    /// Current non-fatal scheduler/cgroup warning.
+    pub warning: String,
+}
+
+/// A running process discovered as a possible game workload.
+///
+/// Discovery is observational only. Returning an entry never registers it as
+/// the active workload and never changes the global mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct RunningWorkload {
+    /// Stable process identity captured during the scan.
+    pub identity: WorkloadIdentity,
+    /// Kernel `comm` display name.
+    pub name: String,
+    /// Case-insensitive built-in pattern that selected this candidate.
+    pub matched_pattern: String,
+    /// Whether this exact stable identity is the explicitly active workload.
+    pub active: bool,
+    /// Scheduler state; populated only for the active workload.
+    pub scheduler: SchedulerStatus,
 }
 
 /// Thermal state reported by the independent safety path.
@@ -378,8 +423,8 @@ pub struct DiagnosticReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiVersion, AppRule, Capabilities, FrequencyOverride, FrequencyStatus, TargetCapability,
-        WorkloadRequest,
+        ApiVersion, AppRule, Capabilities, FrequencyOverride, FrequencyStatus, RunningWorkload,
+        SchedulerStatus, TargetCapability, WorkloadIdentity, WorkloadRequest,
     };
     use crate::feature;
     use zvariant::{LE, Type, serialized::Context, to_bytes};
@@ -492,5 +537,42 @@ mod tests {
         assert_eq!(json["pid"], 42);
         assert!(json.get("uid").is_none());
         assert!(json.get("start_time_ticks").is_none());
+    }
+
+    #[test]
+    fn running_workload_round_trips_without_executable_or_cmdline() {
+        assert_eq!(
+            RunningWorkload::SIGNATURE.to_string(),
+            "((utu)ssb(bsuussbs))"
+        );
+        let original = RunningWorkload {
+            identity: WorkloadIdentity {
+                pid: 42,
+                start_time_ticks: 100,
+                uid: 1000,
+            },
+            name: "wine64".to_owned(),
+            matched_pattern: "wine".to_owned(),
+            active: true,
+            scheduler: SchedulerStatus {
+                enabled: true,
+                matched_rule: "games".to_owned(),
+                managed_tasks: 4,
+                applied_tasks: 3,
+                cgroup_class: "foreground".to_owned(),
+                systemd_unit: "app-game.scope".to_owned(),
+                cgroup_applied: true,
+                warning: String::new(),
+            },
+        };
+        let encoded =
+            to_bytes(Context::new_dbus(LE, 0), &original).expect("serialize running workload");
+        let (decoded, _) = encoded
+            .deserialize::<RunningWorkload>()
+            .expect("deserialize running workload");
+        assert_eq!(decoded, original);
+        let json = serde_json::to_value(original).expect("serialize running workload JSON");
+        assert!(json.get("executable").is_none());
+        assert!(json.get("cmdline").is_none());
     }
 }

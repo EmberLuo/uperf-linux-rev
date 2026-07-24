@@ -20,7 +20,7 @@ use uperf_actuator::{ActuatorMode, FileStateStore, FrequencyActuator};
 use uperf_api::{
     ActiveWorkload, ApiVersion, AppRule as ApiAppRule, Capabilities, CpuLoad, DaemonStatus,
     FrequencyOverride, FrequencyStatus, HealthIssue, HealthStatus, MutationReceipt, ReloadReport,
-    TelemetrySnapshot, ThermalStatus, WorkloadIdentity, WorkloadRequest, feature,
+    SchedulerStatus, TelemetrySnapshot, ThermalStatus, WorkloadIdentity, WorkloadRequest, feature,
 };
 use uperf_core::{
     AppliedState, AppsConfig, DesiredPlan, FrequencyLimits, HeavyLoadDetector, HeavyLoadState,
@@ -37,7 +37,7 @@ use uperf_platform::{
 
 use crate::{
     config::{ConfigurationPaths, ResolvedConfiguration},
-    reconcile::{FrequencySafetyFence, ReconcileJob, ReconcileOutcome},
+    reconcile::{FrequencySafetyFence, ReconcileJob, ReconcileOutcome, SchedulerReport},
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -81,6 +81,7 @@ pub struct PublishedState {
     pub capabilities: Capabilities,
     pub telemetry: TelemetrySnapshot,
     pub app_rules: Vec<ApiAppRule>,
+    pub scheduler: SchedulerStatus,
 }
 
 /// Events used by the D-Bus layer to emit signals without polling.
@@ -164,6 +165,7 @@ enum Command {
         id: String,
         reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
     },
+    RunningWorkloadObserverHealth(Result<(), String>),
     Activate {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -186,13 +188,19 @@ pub struct RuntimeHandle {
 impl RuntimeHandle {
     #[cfg(test)]
     pub(crate) fn snapshot_only() -> Self {
+        Self::snapshot_only_with(DaemonStatus::default(), SchedulerStatus::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_only_with(status: DaemonStatus, scheduler: SchedulerStatus) -> Self {
         let (commands, _) = mpsc::channel(1);
         let (published, published_rx) = watch::channel(Arc::new(PublishedState {
             state_revision: 0,
-            status: DaemonStatus::default(),
+            status,
             capabilities: Capabilities::default(),
             telemetry: TelemetrySnapshot::default(),
             app_rules: Vec::new(),
+            scheduler,
         }));
         drop(published);
         let (events, _) = broadcast::channel(1);
@@ -311,6 +319,21 @@ impl RuntimeHandle {
     pub async fn remove_app_rule(&self, id: String) -> Result<MutationReceipt, RuntimeError> {
         self.request(|reply| Command::RemoveAppRule { id, reply })
             .await
+    }
+
+    /// Publish health from the independent read-only process observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state task has stopped.
+    pub async fn report_running_workload_health(
+        &self,
+        result: Result<(), String>,
+    ) -> Result<(), RuntimeError> {
+        self.commands
+            .send(Command::RunningWorkloadObserverHealth(result))
+            .await
+            .map_err(|_| RuntimeError::Internal("state task has stopped".to_owned()))
     }
 
     /// Close the control plane without restoring resources yet.
@@ -748,6 +771,7 @@ struct RuntimeActor {
     last_scheduler_scan: MonotonicMillis,
     scheduler_dirty: bool,
     applied_units: BTreeMap<String, SystemdUnitProperties>,
+    scheduler_report: SchedulerReport,
     reconcile_in_flight: bool,
     reconcile_pending: bool,
     restore_in_flight: Option<u64>,
@@ -796,6 +820,7 @@ struct RuntimeStateSignature {
     desired_tasks: BTreeMap<ProcessIdentity, TaskPlan>,
     applied_tasks: BTreeMap<ProcessIdentity, TaskPlan>,
     applied_units: BTreeMap<String, SystemdUnitProperties>,
+    scheduler_report: SchedulerReport,
     suspended: bool,
 }
 
@@ -868,6 +893,7 @@ impl RuntimeActor {
             last_scheduler_scan: MonotonicMillis::new(0),
             scheduler_dirty: false,
             applied_units: BTreeMap::new(),
+            scheduler_report: SchedulerReport::default(),
             reconcile_in_flight: false,
             reconcile_pending: false,
             restore_in_flight: None,
@@ -1003,6 +1029,7 @@ impl RuntimeActor {
                 .map_or_else(BTreeMap::new, |plan| plan.tasks.clone()),
             applied_tasks: self.applied.tasks.clone(),
             applied_units: self.applied_units.clone(),
+            scheduler_report: self.scheduler_report.clone(),
             suspended: self.suspended,
         }
     }
@@ -1261,6 +1288,9 @@ impl RuntimeActor {
                     self.start_remove_app_rule(&id, reply);
                 }
             }
+            Command::RunningWorkloadObserverHealth(result) => {
+                self.reduce_running_workload_observer_health(result);
+            }
             Command::Activate { reply } => {
                 let result = self.require_accepting_control().map(|()| {
                     self.mutations_activated = true;
@@ -1295,6 +1325,26 @@ impl RuntimeActor {
             }
         }
         false
+    }
+
+    fn reduce_running_workload_observer_health(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.health_issues
+                    .remove("observer.running_workloads.stale");
+            }
+            Err(message) => {
+                self.health_issues.insert(
+                    "observer.running_workloads.stale".to_owned(),
+                    issue(
+                        "observer.running_workloads.stale",
+                        "warning",
+                        "process-observer",
+                        message,
+                    ),
+                );
+            }
+        }
     }
 
     fn require_accepting_control(&self) -> Result<(), RuntimeError> {
@@ -2802,6 +2852,12 @@ impl RuntimeActor {
                         .collect::<Vec<_>>();
                     self.applied = outcome.applied;
                     self.applied_units = outcome.applied_units;
+                    if outcome.scheduler_attempted
+                        && outcome.scheduler_error.is_none()
+                        && !was_pending
+                    {
+                        self.scheduler_report = outcome.scheduler_report;
+                    }
                     if frequency_succeeded {
                         for id in removed {
                             self.observed.frequencies.remove(&id);
@@ -3204,6 +3260,7 @@ impl RuntimeActor {
                 .iter()
                 .map(core_rule_to_api)
                 .collect(),
+            scheduler: self.api_scheduler_status(),
             telemetry: TelemetrySnapshot {
                 sequence: self.telemetry_sequence,
                 monotonic_ms: self.observed.timestamp.get(),
@@ -3217,6 +3274,9 @@ impl RuntimeActor {
 
     fn runtime_capabilities(&self) -> Capabilities {
         let mut capabilities = self.configuration.capabilities();
+        capabilities
+            .features
+            .push(feature::RUNNING_WORKLOADS.to_owned());
         let writable = self.actuator.is_some() && !self.actuator_read_only;
         for target in &mut capabilities.targets {
             target.can_override = writable;
@@ -3328,6 +3388,54 @@ impl RuntimeActor {
                 .map_or_else(String::new, |profile| profile.to_string()),
             effective_mode: effective_profile.to_owned(),
             source: "explicit".to_owned(),
+        }
+    }
+
+    fn api_scheduler_status(&self) -> SchedulerStatus {
+        let report_matches_active = self
+            .active_workload
+            .as_ref()
+            .map(|process| process.identity)
+            == self.scheduler_report.workload;
+        if !report_matches_active {
+            return SchedulerStatus {
+                enabled: self.configuration.policy.scheduler.enabled,
+                ..SchedulerStatus::default()
+            };
+        }
+        let warning = self
+            .health_issues
+            .values()
+            .find(|issue| issue.component == "scheduler")
+            .map_or_else(String::new, |issue| issue.message.clone());
+        let systemd_unit = self
+            .scheduler_report
+            .systemd_unit
+            .clone()
+            .unwrap_or_default();
+        SchedulerStatus {
+            enabled: self.configuration.policy.scheduler.enabled,
+            matched_rule: self
+                .scheduler_report
+                .matched_rule
+                .clone()
+                .unwrap_or_default(),
+            managed_tasks: u32::try_from(
+                self.desired
+                    .as_ref()
+                    .map_or(0, |desired| desired.tasks.len()),
+            )
+            .unwrap_or(u32::MAX),
+            applied_tasks: u32::try_from(self.applied.tasks.len()).unwrap_or(u32::MAX),
+            cgroup_class: self
+                .scheduler_report
+                .cgroup_class
+                .clone()
+                .unwrap_or_default(),
+            cgroup_applied: !systemd_unit.is_empty()
+                && self.applied_units.contains_key(&systemd_unit),
+            systemd_unit,
+            warning,
         }
     }
 }
@@ -3967,6 +4075,10 @@ mod tests {
             self.inner.cpu_times()
         }
 
+        fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+            self.inner.list_processes()
+        }
+
         fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
             self.inner.list_threads(process)
         }
@@ -4356,6 +4468,33 @@ mod tests {
                 reload,
             },
         )
+    }
+
+    #[test]
+    fn scheduler_report_never_crosses_active_workload_identity() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let old = test_process(41, 1000);
+        let current = test_process(42, 1000);
+        actor.active_workload = Some(current);
+        actor.scheduler_report = SchedulerReport {
+            workload: Some(old.identity),
+            matched_rule: Some("old-rule".to_owned()),
+            cgroup_class: Some("old-class".to_owned()),
+            systemd_unit: Some("old.scope".to_owned()),
+        };
+
+        let status = actor.api_scheduler_status();
+
+        assert_eq!(status.enabled, actor.configuration.policy.scheduler.enabled);
+        assert!(status.matched_rule.is_empty());
+        assert_eq!(status.managed_tasks, 0);
+        assert!(status.cgroup_class.is_empty());
+        assert!(status.systemd_unit.is_empty());
+        assert!(!status.cgroup_applied);
     }
 
     #[tokio::test(flavor = "current_thread")]

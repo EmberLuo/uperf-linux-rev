@@ -162,6 +162,12 @@ pub fn frequency_override(
     })
 }
 
+/// Convert a telemetry CPU load (hundredths of one percent) to a percentage.
+#[must_use]
+pub fn cpu_load_percent(load: uperf_api::CpuLoad) -> f64 {
+    f64::from(load.utilization_basis_points) / 100.0
+}
+
 fn thermal_view(thermal: &ThermalStatus) -> ThermalView {
     let temperature = if thermal.max_temperature_millicelsius == 0
         && matches!(thermal.state.as_str(), "unavailable" | "stale" | "")

@@ -5,6 +5,9 @@
   <method name="GetCapabilities">
     <arg type="((uu)asa(sss)a(sssauttatb)uu)" direction="out"/>
   </method>
+  <method name="ListRunningWorkloads">
+    <arg type="a((utu)ssb(bsuussbs))" direction="out"/>
+  </method>
   <method name="SetMode">
     <arg name="mode" type="s" direction="in"/>
     <arg type="(tass)" direction="out"/>
@@ -48,6 +51,8 @@
     <arg name="telemetry" type="(tta(uq)(sibb)a(sbttttbttbbb))"/>
   </signal>
   <signal name="CapabilitiesChanged">
+  </signal>
+  <signal name="RunningWorkloadsChanged">
   </signal>
   <property name="ApiVersion" type="(uu)" access="read"/>
   <property name="ConfigGeneration" type="t" access="read"/>

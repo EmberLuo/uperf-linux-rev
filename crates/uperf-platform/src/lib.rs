@@ -171,6 +171,16 @@ pub trait ProcReader: Send + Sync {
     /// Returns a platform error when procfs is unreadable or malformed.
     fn cpu_times(&self) -> PlatformResult<CpuTimeSnapshot>;
 
+    /// List process IDs currently present in procfs.
+    ///
+    /// Returned IDs are snapshots only and must be resolved through
+    /// [`Self::process_identity`] before they are displayed or controlled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the procfs root cannot be enumerated.
+    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>>;
+
     /// Return the thread IDs currently belonging to a process.
     ///
     /// The returned IDs are snapshots only. Callers must resolve and verify a

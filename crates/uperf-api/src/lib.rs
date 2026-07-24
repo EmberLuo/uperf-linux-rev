@@ -14,8 +14,8 @@ pub use client::{Daemon1Proxy, DaemonClient};
 pub use contract::{
     ActiveWorkload, ApiVersion, AppRule, Capabilities, CpuLoad, DaemonStatus, DiagnosticCheck,
     DiagnosticReport, FrequencyOverride, FrequencyStatus, HealthIssue, HealthStatus, ModeInfo,
-    MutationReceipt, ReloadReport, TargetCapability, TelemetrySnapshot, ThermalStatus,
-    WorkloadIdentity, WorkloadRequest,
+    MutationReceipt, ReloadReport, RunningWorkload, SchedulerStatus, TargetCapability,
+    TelemetrySnapshot, ThermalStatus, WorkloadIdentity, WorkloadRequest,
 };
 pub use error::{ClientError, ServiceError};
 
@@ -52,6 +52,8 @@ pub mod feature {
     pub const TASK_SCHEDULER: &str = "task-scheduler";
     /// Owned systemd-unit CPU controls are available.
     pub const SYSTEMD_CGROUP: &str = "systemd-cgroup";
+    /// Read-only discovery of running game-like processes and scheduler state.
+    pub const RUNNING_WORKLOADS: &str = "running-workloads";
     /// The loaded device data is the bundled SM8550 profile.
     ///
     /// Presence does not mean that this machine passed certification.

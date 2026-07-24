@@ -1,7 +1,7 @@
 //! Deterministic fake platform ports for reducer and actuator tests.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -49,6 +49,7 @@ impl Clock for FakeClock {
 pub struct FakeProc {
     cpu_times: Arc<Mutex<Option<CpuTimeSnapshot>>>,
     processes: Arc<Mutex<BTreeMap<ProcessId, ProcessInfo>>>,
+    top_level_processes: Arc<Mutex<BTreeSet<ProcessId>>>,
     threads: Arc<Mutex<BTreeMap<ProcessId, Vec<ProcessId>>>>,
 }
 
@@ -58,11 +59,13 @@ impl FakeProc {
     }
 
     pub fn insert_process(&self, process: ProcessInfo) {
+        lock(&self.top_level_processes).insert(process.identity.pid);
         lock(&self.processes).insert(process.identity.pid, process);
     }
 
     pub fn remove_process(&self, pid: ProcessId) {
         lock(&self.processes).remove(&pid);
+        lock(&self.top_level_processes).remove(&pid);
         lock(&self.threads).remove(&pid);
     }
 
@@ -86,6 +89,10 @@ impl ProcReader for FakeProc {
         lock(&self.cpu_times)
             .clone()
             .ok_or_else(|| PlatformError::invalid("/proc/stat", "fake CPU sample not configured"))
+    }
+
+    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+        Ok(lock(&self.top_level_processes).iter().copied().collect())
     }
 
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
@@ -147,6 +154,10 @@ impl ProcReader for FakeRuntime {
         self.procfs.cpu_times()
     }
 
+    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+        self.procfs.list_processes()
+    }
+
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
         self.procfs.list_threads(process)
     }
@@ -172,11 +183,43 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn process(pid: u32) -> ProcessInfo {
+        ProcessInfo {
+            identity: uperf_core::ProcessIdentity {
+                pid: ProcessId::new(pid),
+                start_time_ticks: u64::from(pid),
+                uid: uperf_core::UserId::new(1000),
+            },
+            owner_control_safe: true,
+            comm: format!("task-{pid}"),
+            executable: None,
+            desktop_id: None,
+        }
+    }
+
     #[test]
     fn fake_clock_is_shared_and_monotonic() {
         let clock = FakeClock::new(MonotonicMillis(10));
         let clone = clock.clone();
         assert_eq!(clock.advance(15), MonotonicMillis(25));
         assert_eq!(clone.monotonic_millis(), MonotonicMillis(25));
+    }
+
+    #[test]
+    fn fake_proc_keeps_top_level_processes_separate_from_threads() {
+        let procfs = FakeProc::default();
+        procfs.insert_process(process(10));
+        procfs.set_threads(ProcessId::new(10), [process(10), process(11), process(12)]);
+
+        assert_eq!(
+            procfs.list_processes().expect("list process leaders"),
+            [ProcessId::new(10)]
+        );
+        assert_eq!(
+            procfs
+                .list_threads(ProcessId::new(10))
+                .expect("list process threads"),
+            [ProcessId::new(10), ProcessId::new(11), ProcessId::new(12)]
+        );
     }
 }

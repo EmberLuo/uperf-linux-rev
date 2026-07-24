@@ -46,6 +46,15 @@ pub(crate) struct ReconcileOutcome {
     pub scheduler_attempted: bool,
     pub scheduler_error: Option<String>,
     pub scheduler_warning: Option<String>,
+    pub scheduler_report: SchedulerReport,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SchedulerReport {
+    pub workload: Option<ProcessIdentity>,
+    pub matched_rule: Option<String>,
+    pub cgroup_class: Option<String>,
+    pub systemd_unit: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +67,8 @@ struct SchedulerResolution {
     tasks: BTreeMap<ProcessIdentity, TaskPlan>,
     cgroup: Option<DesiredCgroup>,
     warning: Option<String>,
+    matched_rule: Option<String>,
+    cgroup_class: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +135,7 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
         scheduler_attempted: job.reconcile_scheduler,
         scheduler_error: None,
         scheduler_warning: None,
+        scheduler_report: SchedulerReport::default(),
     };
     let Ok(gate) = job.mutation_gate.lock() else {
         let message = "runtime mutation gate was poisoned".to_owned();
@@ -146,6 +158,12 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
             Ok(resolution) => {
                 outcome.desired.tasks.clone_from(&resolution.tasks);
                 outcome.scheduler_warning.clone_from(&resolution.warning);
+                outcome.scheduler_report = SchedulerReport {
+                    workload: job.active_workload.as_ref().map(|process| process.identity),
+                    matched_rule: resolution.matched_rule.clone(),
+                    cgroup_class: resolution.cgroup_class.clone(),
+                    systemd_unit: resolution.cgroup.as_ref().map(|intent| intent.unit.clone()),
+                };
                 Some(resolution)
             }
             Err(error) => {
@@ -262,6 +280,8 @@ fn resolve_scheduler(
             tasks: BTreeMap::new(),
             cgroup: None,
             warning: None,
+            matched_rule: None,
+            cgroup_class: None,
         });
     }
     let Some(workload) = workload else {
@@ -269,6 +289,8 @@ fn resolve_scheduler(
             tasks: BTreeMap::new(),
             cgroup: None,
             warning: None,
+            matched_rule: None,
+            cgroup_class: None,
         });
     };
 
@@ -348,6 +370,8 @@ fn resolve_scheduler(
         tasks: decision.tasks,
         cgroup,
         warning,
+        matched_rule: decision.matched_rule,
+        cgroup_class: decision.cgroup_class,
     })
 }
 

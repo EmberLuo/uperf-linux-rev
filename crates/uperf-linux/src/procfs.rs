@@ -62,6 +62,10 @@ impl ProcReader for LinuxProc {
         parse_cpu_times(&path, &contents, self.clock.monotonic_millis())
     }
 
+    fn list_processes(&self) -> PlatformResult<Vec<ProcessId>> {
+        list_numeric_directories(&self.root, "list processes")
+    }
+
     fn list_threads(&self, process: ProcessId) -> PlatformResult<Vec<ProcessId>> {
         let task_directory = self.root.join(process.0.to_string()).join("task");
         list_numeric_directories(&task_directory, "list process tasks")

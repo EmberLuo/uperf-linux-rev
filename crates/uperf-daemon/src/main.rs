@@ -21,7 +21,7 @@ use uperf_daemon::{
     config::{ConfigurationPaths, ResolvedConfiguration},
     observers::{spawn_input_observer, spawn_logind_observer},
     runtime::{RuntimeParts, spawn_linux_observers, spawn_runtime},
-    service::{DaemonService, run_signal_pump},
+    service::{DaemonService, RunningWorkloadScanner, run_signal_pump},
 };
 use uperf_linux::{
     LinuxDiscovery, LinuxEnvironment, LinuxProcessController, SystemRoots, SystemdDbusClient,
@@ -176,6 +176,7 @@ async fn run(options: Result<Options>) -> Result<()> {
         configuration_paths: paths,
         actuator,
     });
+    let running_workloads = Arc::new(RunningWorkloadScanner::new(environment.clone()));
     let observers = spawn_linux_observers(environment, &ingress)
         .map_err(|error| anyhow!("start Linux observers: {error}"))?;
     let input_observer = spawn_input_observer(ingress.clone())
@@ -199,7 +200,11 @@ async fn run(options: Result<Options>) -> Result<()> {
         .object_server()
         .at(
             OBJECT_PATH,
-            DaemonService::new(runtime.clone(), Authorizer::new(authorization)),
+            DaemonService::new(
+                runtime.clone(),
+                Authorizer::new(authorization),
+                running_workloads.clone(),
+            ),
         )
         .await
         .context("export D-Bus object")?;
@@ -215,6 +220,7 @@ async fn run(options: Result<Options>) -> Result<()> {
     let signal_task = tokio::spawn(run_signal_pump(
         connection.clone(),
         runtime.clone(),
+        running_workloads,
         service_shutdown_rx.clone(),
     ));
     let logind_task = (!options.session_bus)

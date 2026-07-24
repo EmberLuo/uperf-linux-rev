@@ -4,8 +4,8 @@ use zbus::Connection;
 
 use crate::{
     ActiveWorkload, ApiVersion, AppRule, Capabilities, ClientError, DaemonStatus, DiagnosticCheck,
-    DiagnosticReport, FrequencyOverride, MutationReceipt, ReloadReport, TelemetrySnapshot,
-    WorkloadRequest,
+    DiagnosticReport, FrequencyOverride, MutationReceipt, ReloadReport, RunningWorkload,
+    TelemetrySnapshot, WorkloadRequest,
 };
 
 #[zbus::proxy(
@@ -53,6 +53,9 @@ pub trait Daemon1 {
     /// Return modes, stable target IDs, and feature support.
     fn get_capabilities(&self) -> zbus::Result<Capabilities>;
 
+    /// Discover running game-like processes without selecting one.
+    fn list_running_workloads(&self) -> zbus::Result<Vec<RunningWorkload>>;
+
     /// Select a global policy mode.
     fn set_mode(&self, mode: &str) -> zbus::Result<MutationReceipt>;
 
@@ -98,6 +101,10 @@ pub trait Daemon1 {
     /// Observational telemetry, emitted by the daemon at no more than 4 Hz.
     #[zbus(signal)]
     fn telemetry_updated(&self, snapshot: TelemetrySnapshot) -> zbus::Result<()>;
+
+    /// Emitted when the read-only running candidate or scheduler snapshot changes.
+    #[zbus(signal)]
+    fn running_workloads_changed(&self) -> zbus::Result<()>;
 }
 
 /// Thin typed client around the version-1 system-bus interface.
@@ -174,6 +181,22 @@ impl DaemonClient {
             .map_err(ClientError::from)?;
         ensure_compatible(capabilities.api_version)?;
         Ok(capabilities)
+    }
+
+    /// Discover running game-like processes and read active scheduler state.
+    ///
+    /// This method is observational only; use [`Self::set_active_workload`] to
+    /// explicitly select one of the returned PIDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the D-Bus call or procfs scan fails.
+    pub async fn running_workloads(&self) -> Result<Vec<RunningWorkload>, ClientError> {
+        self.proxy()
+            .await?
+            .list_running_workloads()
+            .await
+            .map_err(ClientError::from)
     }
 
     /// Select a global policy mode.
