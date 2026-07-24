@@ -2,10 +2,12 @@
 Type=Application
 Name=Uperf Linux
 Comment=Inspect and control the uperf-linux performance scheduler
+Comment[zh_CN]=查看并控制 uperf-linux 性能调度器
 Exec=uperf-gui
 Icon=org.uperflinux.Gui
 Terminal=false
 Categories=Settings;
 Keywords=performance;power;frequency;thermal;scheduler;
+Keywords[zh_CN]=性能;电源;频率;温度;调度器;
 StartupNotify=true
 StartupWMClass=org.uperflinux.Gui

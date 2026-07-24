@@ -18,6 +18,8 @@ Vcs-Git: https://github.com/EmberLuo/uperf-linux-rev.git
 
 Package: uperf-linux
 Architecture: arm64
+Conflicts:
+ uperf-linux-gui
 Depends:
  dbus,
  polkitd | policykit-1,
@@ -25,6 +27,8 @@ Depends:
  util-linux,
  ${misc:Depends},
  ${shlibs:Depends}
+Replaces:
+ uperf-linux-gui
 Description: capability-driven userspace performance scheduler
  A Rust daemon and command-line tools for coordinating Linux ARM64 CPU,
  GPU and workload performance policy.
@@ -36,11 +40,22 @@ Description: capability-driven userspace performance scheduler
 Package: uperf-linux-gui
 Section: utils
 Architecture: arm64
+Conflicts:
+ uperf-linux
 Depends:
- uperf-linux (= ${binary:Version}),
+ dbus,
+ polkitd | policykit-1,
+ systemd,
+ util-linux,
  ${misc:Depends},
  ${shlibs:Depends}
-Description: graphical control panel for uperf-linux
- A GTK4 and libadwaita client for the versioned uperf-linux D-Bus API.
+Replaces:
+ uperf-linux
+Description: capability-driven userspace performance scheduler with GUI
+ A complete graphical edition containing the uperf-linux daemon, command-line
+ tools, read-only probe, system integration, and a GTK4/libadwaita client.
  Targets, operating points, modes and telemetry are populated from daemon
  capabilities rather than from device-specific constants.
+ .
+ This package is an alternative to the headless uperf-linux package; the two
+ editions cannot be installed at the same time.

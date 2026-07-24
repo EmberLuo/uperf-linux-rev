@@ -7,6 +7,8 @@ use uperf_api::{
     TargetCapability, ThermalStatus, feature,
 };
 
+use crate::i18n::{localized_mode_description, localized_mode_label, localized_protocol_value, tr};
+
 /// Presentation state derived only from versioned API DTOs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewModel {
@@ -90,10 +92,10 @@ impl ViewModel {
             });
 
         Self {
-            daemon_state: status.state.clone(),
-            health: status.health.summary.clone(),
-            profile: status.effective_profile.clone(),
-            scene: status.dominant_scene.clone(),
+            daemon_state: localized_protocol_value(&status.state),
+            health: localized_protocol_value(&status.health.summary),
+            profile: localized_protocol_value(&status.effective_profile),
+            scene: localized_protocol_value(&status.dominant_scene),
             modes,
             targets,
             thermal,
@@ -105,8 +107,8 @@ impl ViewModel {
 fn mode_view(mode: &ModeInfo, selected: &str) -> ModeView {
     ModeView {
         id: mode.id.clone(),
-        label: mode.display_name.clone(),
-        description: mode.description.clone(),
+        label: localized_mode_label(&mode.id, &mode.display_name),
+        description: localized_mode_description(&mode.id, &mode.description),
         selected: mode.id == selected,
     }
 }
@@ -172,7 +174,7 @@ fn thermal_view(thermal: &ThermalStatus) -> ThermalView {
     let temperature = if thermal.max_temperature_millicelsius == 0
         && matches!(thermal.state.as_str(), "unavailable" | "stale" | "")
     {
-        "Unavailable".into()
+        tr("Unavailable").into()
     } else {
         format!(
             "{:.1} °C",
@@ -181,18 +183,18 @@ fn thermal_view(thermal: &ThermalStatus) -> ThermalView {
     };
     let mut conditions = Vec::new();
     if thermal.cap_active {
-        conditions.push("safety cap active");
+        conditions.push(tr("safety cap active"));
     }
     if thermal.sensors_stale {
-        conditions.push("sensor data stale");
+        conditions.push(tr("sensor data stale"));
     }
     let detail = if conditions.is_empty() {
-        "Sensors healthy".into()
+        tr("Sensors healthy").into()
     } else {
         conditions.join(", ")
     };
     ThermalView {
-        state: thermal.state.clone(),
+        state: localized_protocol_value(&thermal.state),
         temperature,
         detail,
     }

@@ -1,3 +1,4 @@
+mod i18n;
 mod view_model;
 
 use std::{
@@ -12,6 +13,10 @@ use adw::prelude::*;
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt;
 use gtk::glib;
+use i18n::{
+    LanguageChoice, language_choice, localized_mode_label, localized_protocol_value,
+    save_language_choice, tr, translate_known,
+};
 use uperf_api::{
     AppRule, Capabilities, ClientError, DaemonClient, DaemonStatus, FrequencyOverride,
     FrequencyStatus, RunningWorkload, SchedulerStatus, TelemetrySnapshot, WorkloadRequest, feature,
@@ -21,6 +26,7 @@ use view_model::{TargetView, ViewModel, cpu_load_percent, frequency_override};
 const SERVICE_UNIT: &str = "uperf-linux.service";
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
+type UnitFileChanges = (bool, Vec<(String, String, String)>);
 
 #[derive(Debug)]
 enum ClientCommand {
@@ -33,6 +39,7 @@ enum ClientCommand {
     SetAppRule(AppRule),
     RemoveAppRule(String),
     ReloadConfig,
+    EnableAndStartService,
 }
 
 #[derive(Debug)]
@@ -54,6 +61,8 @@ enum UiEvent {
         kind: RequestErrorKind,
         message: String,
     },
+    ServiceActivationStarted,
+    ServiceActivationFinished(Result<(), String>),
 }
 
 #[derive(Debug)]
@@ -73,12 +82,12 @@ enum RequestErrorKind {
 }
 
 impl RequestErrorKind {
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::NotAuthorized => "Not authorized",
-            Self::InvalidRequest => "Invalid request",
-            Self::IncompatibleApi => "Incompatible API",
-            Self::Rejected => "Request rejected",
+            Self::NotAuthorized => tr("Not authorized"),
+            Self::InvalidRequest => tr("Invalid request"),
+            Self::IncompatibleApi => tr("Incompatible API"),
+            Self::Rejected => tr("Request rejected"),
         }
     }
 }
@@ -118,6 +127,8 @@ struct Ui {
 
     // Dashboard: overview
     connection_row: adw::ActionRow,
+    service_button: gtk::Button,
+    service_action_running: Cell<bool>,
     state_row: adw::ActionRow,
     health_row: adw::ActionRow,
     profile_row: adw::ActionRow,
@@ -209,77 +220,93 @@ impl Ui {
             .build();
 
         // Dashboard widgets
-        let connection_row = status_row("Connection");
-        connection_row.set_subtitle("Connecting…");
-        let state_row = status_row("Lifecycle");
-        let health_row = status_row("Health");
-        let profile_row = status_row("Effective profile");
-        let scene_row = status_row("Dominant scene");
+        let connection_row = status_row(tr("Connection"));
+        connection_row.set_subtitle(tr("Connecting…"));
+        let service_button = gtk::Button::with_label(tr("Enable & Start"));
+        service_button.set_tooltip_text(Some(tr(
+            "Start at boot and connect the GUI to the privileged daemon",
+        )));
+        service_button.set_valign(gtk::Align::Center);
+        service_button.add_css_class("suggested-action");
+        connection_row.add_suffix(&service_button);
+        let state_row = status_row(tr("Lifecycle"));
+        let health_row = status_row(tr("Health"));
+        let profile_row = status_row(tr("Effective profile"));
+        let scene_row = status_row(tr("Dominant scene"));
         let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         mode_box.add_css_class("linked");
         mode_box.set_margin_top(4);
         mode_box.set_margin_bottom(4);
         let thermal_group = adw::PreferencesGroup::builder()
-            .title("Thermal safety")
-            .description("Safety state is authoritative; manual settings cannot bypass it")
+            .title(tr("Thermal safety"))
+            .description(tr(
+                "Safety state is authoritative; manual settings cannot bypass it",
+            ))
             .build();
-        let thermal_row = status_row("Temperature");
+        let thermal_row = status_row(tr("Temperature"));
         let thermal_bar = gtk::ProgressBar::new();
         let workload_group = adw::PreferencesGroup::builder()
-            .title("Active workload")
-            .description("Enter a PID; the daemon resolves and verifies its start time and UID")
+            .title(tr("Active workload"))
+            .description(tr(
+                "Enter a PID; the daemon resolves and verifies its start time and UID",
+            ))
             .build();
-        let workload_row = status_row("Selection");
-        let scheduler_row = status_row("Task scheduler");
-        let cgroup_row = status_row("Systemd cgroup");
-        let pid_entry = adw::EntryRow::builder().title("PID").build();
+        let workload_row = status_row(tr("Selection"));
+        let scheduler_row = status_row(tr("Task scheduler"));
+        let cgroup_row = status_row(tr("Systemd cgroup"));
+        let pid_entry = adw::EntryRow::builder().title(tr("Workload PID")).build();
         let load_group = adw::PreferencesGroup::builder()
-            .title("CPU utilization")
-            .description("Per-CPU load reported by daemon telemetry")
+            .title(tr("CPU utilization"))
+            .description(tr("Per-CPU load reported by daemon telemetry"))
             .build();
         let freq_group = adw::PreferencesGroup::builder()
-            .title("Cluster frequency")
+            .title(tr("Cluster frequency"))
             .build();
 
         // Frequency-page widgets
         let override_group = adw::PreferencesGroup::builder()
-            .title("Manual frequency override")
-            .description(
+            .title(tr("Manual frequency override"))
+            .description(tr(
                 "Manual bounds are transactional, read back by the daemon, and constrained by thermal safety",
-            )
+            ))
             .build();
 
         // Apps-page widgets
         let running_group = adw::PreferencesGroup::builder()
-            .title("Detected running workloads")
-            .description(
+            .title(tr("Detected running workloads"))
+            .description(tr(
                 "Broad game and compatibility-layer matches; detection alone never changes the active mode",
-            )
+            ))
             .build();
         let running_placeholder = adw::ActionRow::builder()
-            .title("No matching processes")
-            .subtitle("Launch a game, Wine/Proton application, emulator, or Steam process.")
+            .title(tr("No matching processes"))
+            .subtitle(tr(
+                "Launch a game, Wine/Proton application, emulator, or Steam process.",
+            ))
             .build();
         let apps_group = adw::PreferencesGroup::builder()
-            .title("Application rules")
-            .description("Persistent global rules that pin a mode for matching processes")
+            .title(tr("Application rules"))
+            .description(tr(
+                "Persistent global rules that pin a mode for matching processes",
+            ))
             .build();
         let apps_placeholder = adw::ActionRow::builder()
-            .title("No application rules")
-            .subtitle("Add a rule below to pin a mode for a matching process.")
+            .title(tr("No application rules"))
+            .subtitle(tr("Add a rule below to pin a mode for a matching process."))
             .build();
         let rule_exe_entry = adw::EntryRow::builder()
-            .title("Executable path (optional)")
+            .title(tr("Executable path (optional)"))
             .build();
         let rule_comm_entry = adw::EntryRow::builder()
-            .title("Process-name regex (optional)")
+            .title(tr("Process-name regex (optional)"))
             .build();
         let rule_mode_dropdown = gtk::DropDown::from_strings(&[]);
 
         // Logs-page widget
         let log_buffer = gtk::TextBuffer::new(None);
         log_buffer.set_text(&format!(
-            "Press Refresh to load the latest {SERVICE_UNIT} journal.\n"
+            "{}\n",
+            tr("Press Refresh to load the latest uperf-linux.service journal.")
         ));
 
         let overlay = adw::ToastOverlay::new();
@@ -288,6 +315,8 @@ impl Ui {
             window,
             overlay,
             connection_row,
+            service_button,
+            service_action_running: Cell::new(false),
             state_row,
             health_row,
             profile_row,
@@ -329,6 +358,11 @@ impl Ui {
             daemon_controls: RefCell::new(Vec::new()),
             commands,
         });
+        {
+            let action_ui = ui.clone();
+            ui.service_button
+                .connect_clicked(move |_| action_ui.enable_and_start_service());
+        }
         ui.assemble();
         ui
     }
@@ -342,16 +376,26 @@ impl Ui {
         let settings = self.build_settings_page();
         let logs = self.build_logs_page();
         for (page, name, title, icon) in [
-            (&dashboard, "dashboard", "Dashboard", "speedometer-symbolic"),
-            (&apps, "apps", "Apps", "applications-games-symbolic"),
+            (
+                &dashboard,
+                "dashboard",
+                tr("Dashboard"),
+                "speedometer-symbolic",
+            ),
+            (&apps, "apps", tr("Apps"), "applications-games-symbolic"),
             (
                 &frequency,
                 "frequency",
-                "Frequency",
+                tr("Frequency"),
                 "power-profile-performance-symbolic",
             ),
-            (&settings, "settings", "Settings", "emblem-system-symbolic"),
-            (&logs, "logs", "Logs", "text-x-generic-symbolic"),
+            (
+                &settings,
+                "settings",
+                tr("Settings"),
+                "emblem-system-symbolic",
+            ),
+            (&logs, "logs", tr("Logs"), "text-x-generic-symbolic"),
         ] {
             let stack_page = view_stack.add_titled(page, Some(name), title);
             stack_page.set_icon_name(Some(icon));
@@ -387,19 +431,19 @@ impl Ui {
     }
 
     fn build_dashboard_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page("Dashboard", "speedometer-symbolic");
+        let page = new_prefs_page(tr("Dashboard"), "speedometer-symbolic");
 
         let mode_group = adw::PreferencesGroup::builder()
-            .title("Power mode")
-            .description("Modes are advertised by the running daemon")
+            .title(tr("Power mode"))
+            .description(tr("Modes are advertised by the running daemon"))
             .build();
         mode_group.add(&self.mode_box);
         self.add_daemon_control(&mode_group);
         page.add(&mode_group);
 
         let overview = adw::PreferencesGroup::builder()
-            .title("Status")
-            .description("Observed state reported by org.uperflinux.Daemon1")
+            .title(tr("Status"))
+            .description(tr("Observed state reported by org.uperflinux.Daemon1"))
             .build();
         overview.add(&self.connection_row);
         overview.add(&self.state_row);
@@ -416,8 +460,8 @@ impl Ui {
         let workload_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         workload_buttons.set_halign(gtk::Align::End);
         workload_buttons.set_margin_top(8);
-        let clear_workload = gtk::Button::with_label("Clear active workload");
-        let set_workload = gtk::Button::with_label("Set active workload");
+        let clear_workload = gtk::Button::with_label(tr("Clear active workload"));
+        let set_workload = gtk::Button::with_label(tr("Set active workload"));
         set_workload.add_css_class("suggested-action");
         workload_buttons.append(&clear_workload);
         workload_buttons.append(&set_workload);
@@ -430,7 +474,7 @@ impl Ui {
             set_workload.connect_clicked(move |_| {
                 match parse_workload(ui.pid_entry.text().as_str()) {
                     Ok(request) => ui.send(ClientCommand::SetWorkload(request)),
-                    Err(message) => ui.toast(&message),
+                    Err(message) => ui.toast(&translate_known(&message)),
                 }
             });
         }
@@ -453,7 +497,7 @@ impl Ui {
     }
 
     fn build_apps_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page("Apps", "applications-games-symbolic");
+        let page = new_prefs_page(tr("Apps"), "applications-games-symbolic");
         self.running_group.add(&self.running_placeholder);
         self.add_daemon_control(&self.running_group);
         page.add(&self.running_group);
@@ -462,12 +506,12 @@ impl Ui {
         page.add(&self.apps_group);
 
         let add_group = adw::PreferencesGroup::builder()
-            .title("Add rule")
-            .description("Match by executable path, process-name regex, or both")
+            .title(tr("Add rule"))
+            .description(tr("Match by executable path, process-name regex, or both"))
             .build();
         add_group.add(&self.rule_exe_entry);
         add_group.add(&self.rule_comm_entry);
-        let mode_row = adw::ActionRow::builder().title("Mode").build();
+        let mode_row = adw::ActionRow::builder().title(tr("Mode")).build();
         self.rule_mode_dropdown.set_valign(gtk::Align::Center);
         mode_row.add_suffix(&self.rule_mode_dropdown);
         add_group.add(&mode_row);
@@ -475,7 +519,7 @@ impl Ui {
         let add_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         add_buttons.set_halign(gtk::Align::End);
         add_buttons.set_margin_top(8);
-        let add_button = gtk::Button::with_label("Add rule");
+        let add_button = gtk::Button::with_label(tr("Add rule"));
         add_button.add_css_class("suggested-action");
         add_buttons.append(&add_button);
         add_group.add(&add_buttons);
@@ -491,13 +535,13 @@ impl Ui {
     }
 
     fn build_frequency_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page("Frequency", "power-profile-performance-symbolic");
+        let page = new_prefs_page(tr("Frequency"), "power-profile-performance-symbolic");
         page.add(&self.override_group);
 
         let buttons_group = adw::PreferencesGroup::new();
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         hbox.set_halign(gtk::Align::Center);
-        let release_all = gtk::Button::with_label("Release all");
+        let release_all = gtk::Button::with_label(tr("Release all"));
         release_all.add_css_class("pill");
         hbox.append(&release_all);
         buttons_group.add(&hbox);
@@ -510,7 +554,7 @@ impl Ui {
             release_all.connect_clicked(move |_| {
                 let ids = ui.override_ids.borrow().clone();
                 if ids.is_empty() {
-                    ui.toast("No overridable targets");
+                    ui.toast(tr("No overridable targets"));
                 } else {
                     ui.send(ClientCommand::ClearAllFrequency(ids));
                 }
@@ -520,15 +564,17 @@ impl Ui {
     }
 
     fn build_settings_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page("Settings", "emblem-system-symbolic");
+        let page = new_prefs_page(tr("Settings"), "emblem-system-symbolic");
         let group = adw::PreferencesGroup::builder()
-            .title("Daemon configuration")
+            .title(tr("Daemon configuration"))
             .build();
         let row = adw::ActionRow::builder()
-            .title("Configuration reload")
-            .subtitle("Edit the config with administrator privileges, then reload it here.")
+            .title(tr("Configuration reload"))
+            .subtitle(tr(
+                "Edit the config with administrator privileges, then reload it here.",
+            ))
             .build();
-        let reload = gtk::Button::with_label("Reload");
+        let reload = gtk::Button::with_label(tr("Reload"));
         reload.set_valign(gtk::Align::Center);
         row.add_suffix(&reload);
         group.add(&row);
@@ -539,13 +585,53 @@ impl Ui {
             let ui = self.clone();
             reload.connect_clicked(move |_| ui.send(ClientCommand::ReloadConfig));
         }
+
+        let language_group = adw::PreferencesGroup::builder()
+            .title(tr("Language"))
+            .build();
+        let language_row = adw::ActionRow::builder()
+            .title(tr("Language"))
+            .subtitle(tr(
+                "Language changes take effect after restarting the application",
+            ))
+            .build();
+        let language_labels = [
+            tr("Follow system language"),
+            tr("English"),
+            tr("Simplified Chinese"),
+        ];
+        let language_dropdown = gtk::DropDown::from_strings(&language_labels);
+        language_dropdown.set_selected(language_choice().index());
+        language_dropdown.set_valign(gtk::Align::Center);
+        language_row.add_suffix(&language_dropdown);
+        language_group.add(&language_row);
+        page.add(&language_group);
+
+        {
+            let ui = self.clone();
+            language_dropdown.connect_selected_notify(move |dropdown| {
+                let Some(choice) = LanguageChoice::from_index(dropdown.selected()) else {
+                    return;
+                };
+                if choice == language_choice() {
+                    return;
+                }
+                match save_language_choice(choice) {
+                    Ok(()) => ui.toast(tr("Language saved. Restart Uperf Linux to apply it.")),
+                    Err(error) => ui.toast(&format!(
+                        "{}: {error}",
+                        tr("Unable to save the language preference")
+                    )),
+                }
+            });
+        }
         page
     }
 
     fn build_logs_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page("Logs", "text-x-generic-symbolic");
+        let page = new_prefs_page(tr("Logs"), "text-x-generic-symbolic");
         let group = adw::PreferencesGroup::builder()
-            .title("Service journal")
+            .title(tr("Service journal"))
             .build();
 
         let scroller = gtk::ScrolledWindow::new();
@@ -566,9 +652,9 @@ impl Ui {
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         hbox.set_halign(gtk::Align::Center);
         hbox.set_margin_top(8);
-        let refresh = gtk::Button::with_label("Refresh");
+        let refresh = gtk::Button::with_label(tr("Refresh"));
         refresh.add_css_class("pill");
-        let clear = gtk::Button::with_label("Clear");
+        let clear = gtk::Button::with_label(tr("Clear"));
         clear.add_css_class("pill");
         hbox.append(&refresh);
         hbox.append(&clear);
@@ -600,36 +686,58 @@ impl Ui {
         for widget in self.daemon_controls.borrow().iter() {
             widget.set_sensitive(connected);
         }
+        self.service_button.set_visible(!connected);
+        self.service_button
+            .set_sensitive(!connected && !self.service_action_running.get());
     }
 
     fn update_connection(&self, state: ConnectionState) {
         match state {
             ConnectionState::Connecting => {
                 self.set_connected(false);
-                self.connection_row.set_subtitle("Connecting…");
+                self.connection_row.set_subtitle(tr("Connecting…"));
             }
             ConnectionState::Connected => {
                 self.set_connected(true);
-                self.connection_row.set_subtitle("Connected");
+                self.connection_row.set_subtitle(tr("Connected"));
             }
             ConnectionState::Reconnecting { delay, reason } => {
                 self.set_connected(false);
                 self.connection_row.set_subtitle(&format!(
-                    "Disconnected · retrying in {} · {reason}",
+                    "{} · {} {} · {reason}",
+                    tr("Disconnected"),
+                    tr("retrying in"),
                     format_retry_delay(delay)
                 ));
             }
             ConnectionState::Unavailable(message) => {
                 self.set_connected(false);
                 self.connection_row
-                    .set_subtitle(&format!("Unavailable · {message}"));
+                    .set_subtitle(&format!("{} · {message}", tr("Unavailable")));
             }
+        }
+    }
+
+    fn enable_and_start_service(&self) {
+        if self.service_action_running.replace(true) {
+            return;
+        }
+        self.service_button.set_sensitive(false);
+        self.service_button.set_label(tr("Enabling…"));
+        if let Err(error) = self.commands.try_send(ClientCommand::EnableAndStartService) {
+            self.service_action_running.set(false);
+            self.service_button.set_sensitive(true);
+            self.service_button.set_label(tr("Enable & Start"));
+            self.toast(&format!(
+                "{}: {error}",
+                tr("Unable to request service activation")
+            ));
         }
     }
 
     fn send(&self, command: ClientCommand) {
         if !self.connected.get() {
-            self.toast("The daemon is disconnected; wait for it to reconnect");
+            self.toast(tr("The daemon is disconnected; wait for it to reconnect"));
             return;
         }
         if let Err(error) = self.commands.try_send(command) {
@@ -681,6 +789,23 @@ impl Ui {
             UiEvent::Connection(state) => self.update_connection(state),
             UiEvent::RequestError { kind, message } => {
                 self.toast(&format!("{}: {message}", kind.label()));
+            }
+            UiEvent::ServiceActivationStarted => {
+                self.service_action_running.set(true);
+                self.service_button.set_sensitive(false);
+                self.service_button.set_label(tr("Enabling…"));
+            }
+            UiEvent::ServiceActivationFinished(result) => {
+                self.service_action_running.set(false);
+                self.service_button.set_label(tr("Enable & Start"));
+                self.service_button.set_sensitive(!self.connected.get());
+                match result {
+                    Ok(()) => self.toast(tr("Service started and enabled for boot")),
+                    Err(message) => self.toast(&format!(
+                        "{}: {message}",
+                        tr("Service activation was cancelled or denied")
+                    )),
+                }
             }
         }
     }
@@ -797,8 +922,8 @@ impl Ui {
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let minimum = gtk::DropDown::from_strings(&label_refs);
             let maximum = gtk::DropDown::from_strings(&label_refs);
-            minimum.set_tooltip_text(Some("Minimum frequency"));
-            maximum.set_tooltip_text(Some("Maximum frequency"));
+            minimum.set_tooltip_text(Some(tr("Minimum frequency")));
+            maximum.set_tooltip_text(Some(tr("Maximum frequency")));
 
             let selected_minimum = target
                 .status
@@ -811,8 +936,8 @@ impl Ui {
             minimum.set_selected(closest_index(&target.choices_hz, selected_minimum));
             maximum.set_selected(closest_index(&target.choices_hz, selected_maximum));
 
-            let clear = gtk::Button::with_label("Clear");
-            let apply = gtk::Button::with_label("Apply…");
+            let clear = gtk::Button::with_label(tr("Clear"));
+            let apply = gtk::Button::with_label(tr("Apply…"));
             apply.add_css_class("destructive-action");
             controls.append(&minimum);
             controls.append(&maximum);
@@ -835,17 +960,17 @@ impl Ui {
                     let minimum_index = usize::try_from(minimum.selected()).unwrap_or(usize::MAX);
                     let maximum_index = usize::try_from(maximum.selected()).unwrap_or(usize::MAX);
                     let Some(minimum_hz) = choices.get(minimum_index).copied() else {
-                        ui.toast("Select a minimum frequency");
+                        ui.toast(&translate_known("Select a minimum frequency"));
                         return;
                     };
                     let Some(maximum_hz) = choices.get(maximum_index).copied() else {
-                        ui.toast("Select a maximum frequency");
+                        ui.toast(&translate_known("Select a maximum frequency"));
                         return;
                     };
                     let request = match frequency_override(&capability, minimum_hz, maximum_hz) {
                         Ok(request) => request,
                         Err(message) => {
-                            ui.toast(&message);
+                            ui.toast(&translate_known(&message));
                             return;
                         }
                     };
@@ -859,12 +984,13 @@ impl Ui {
     fn sync_mode_dropdown(&self) {
         let ids = self.mode_ids.borrow();
         let capabilities = self.capabilities.borrow();
-        let labels: Vec<&str> = capabilities
+        let labels: Vec<String> = capabilities
             .modes
             .iter()
-            .map(|mode| mode.display_name.as_str())
+            .map(|mode| localized_mode_label(&mode.id, &mode.display_name))
             .collect();
-        let model = gtk::StringList::new(&labels);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let model = gtk::StringList::new(&label_refs);
         self.rule_mode_dropdown.set_model(Some(&model));
         if !ids.is_empty() {
             self.rule_mode_dropdown.set_selected(0);
@@ -916,11 +1042,13 @@ impl Ui {
             if active.present {
                 self.workload_row.set_subtitle(&format!(
                     "{} · PID {} · {}",
-                    active.name, active.identity.pid, active.effective_mode
+                    active.name,
+                    active.identity.pid,
+                    localized_protocol_value(&active.effective_mode)
                 ));
                 self.pid_entry.set_text(&active.identity.pid.to_string());
             } else {
-                self.workload_row.set_subtitle("None");
+                self.workload_row.set_subtitle(tr("None"));
             }
         } else {
             self.workload_group.set_visible(false);
@@ -960,14 +1088,15 @@ impl Ui {
     fn confirm_frequency(self: &Rc<Self>, request: FrequencyOverride) {
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
-            .message("Apply privileged frequency limits?")
+            .message(tr("Apply privileged frequency limits?"))
             .detail(format!(
-                "{}: {} – {}. Thermal and hardware limits remain authoritative.",
+                "{}: {} – {}. {}",
                 request.target_id,
                 format_frequency(request.min_hz),
-                format_frequency(request.max_hz)
+                format_frequency(request.max_hz),
+                tr("Thermal and hardware limits remain authoritative.")
             ))
-            .buttons(["Cancel", "Apply"])
+            .buttons([tr("Cancel"), tr("Apply")])
             .cancel_button(0)
             .default_button(0)
             .build();
@@ -994,7 +1123,7 @@ impl Ui {
             capabilities
                 .modes
                 .iter()
-                .map(|mode| mode.display_name.clone())
+                .map(|mode| localized_mode_label(&mode.id, &mode.display_name))
                 .collect()
         };
         let label_refs: Vec<&str> = mode_labels.iter().map(String::as_str).collect();
@@ -1004,11 +1133,11 @@ impl Ui {
                 (Some(exe), Some(comm)) => format!("{exe} · /{comm}/"),
                 (Some(exe), None) => exe.clone(),
                 (None, Some(comm)) => format!("/{comm}/"),
-                (None, None) => "any process".to_owned(),
+                (None, None) => tr("any process").to_owned(),
             };
             let row = adw::ActionRow::builder()
                 .title(&rule.id)
-                .subtitle(format!("{matcher} · priority {}", rule.priority))
+                .subtitle(format!("{matcher} · {} {}", tr("priority"), rule.priority))
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("applications-games-symbolic"));
 
@@ -1043,7 +1172,7 @@ impl Ui {
             let enabled = gtk::Switch::new();
             enabled.set_active(rule.enabled);
             enabled.set_valign(gtk::Align::Center);
-            enabled.set_tooltip_text(Some("Enable rule"));
+            enabled.set_tooltip_text(Some(tr("Enable rule")));
             {
                 let ui = self.clone();
                 let rule = rule.clone();
@@ -1060,7 +1189,7 @@ impl Ui {
 
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
             remove.add_css_class("flat");
-            remove.set_tooltip_text(Some("Remove rule"));
+            remove.set_tooltip_text(Some(tr("Remove rule")));
             {
                 let ui = self.clone();
                 let id = rule.id.clone();
@@ -1097,8 +1226,8 @@ impl Ui {
                 .set_subtitle(&scheduler_status_text(scheduler));
             self.cgroup_row.set_subtitle(&cgroup_status_text(scheduler));
         } else {
-            self.scheduler_row.set_subtitle("No active workload");
-            self.cgroup_row.set_subtitle("No active workload");
+            self.scheduler_row.set_subtitle(tr("No active workload"));
+            self.cgroup_row.set_subtitle(tr("No active workload"));
         }
 
         for workload in workloads {
@@ -1109,11 +1238,11 @@ impl Ui {
             row.add_prefix(&gtk::Image::from_icon_name("applications-games-symbolic"));
 
             let activate = if workload.active {
-                let button = gtk::Button::with_label("Active");
+                let button = gtk::Button::with_label(tr("Active"));
                 button.set_sensitive(false);
                 button
             } else {
-                let button = gtk::Button::with_label("Use");
+                let button = gtk::Button::with_label(tr("Use"));
                 button.add_css_class("suggested-action");
                 let ui = self.clone();
                 let pid = workload.identity.pid;
@@ -1133,12 +1262,14 @@ impl Ui {
         let executable = non_empty(self.rule_exe_entry.text().as_str());
         let comm_regex = non_empty(self.rule_comm_entry.text().as_str());
         if executable.is_none() && comm_regex.is_none() {
-            self.toast("Provide an executable path or a process-name regex");
+            self.toast(&translate_known(
+                "Provide an executable path or a process-name regex",
+            ));
             return;
         }
         let mode_index = usize::try_from(self.rule_mode_dropdown.selected()).unwrap_or(usize::MAX);
         let Some(mode) = self.mode_ids.borrow().get(mode_index).cloned() else {
-            self.toast("Select a mode for the rule");
+            self.toast(&translate_known("Select a mode for the rule"));
             return;
         };
         let rule = AppRule {
@@ -1171,15 +1302,17 @@ impl Ui {
         let process = match process {
             Ok(process) => process,
             Err(error) => {
-                buffer.set_text(&format!("Unable to start journalctl: {error}"));
+                buffer.set_text(&format!("{}: {error}", tr("Unable to start journalctl")));
                 return;
             }
         };
         glib::spawn_future_local(async move {
             match process.communicate_utf8_future(None).await {
                 Ok((Some(output), _)) if !output.is_empty() => buffer.set_text(&output),
-                Ok(_) => buffer.set_text("(journal is empty)"),
-                Err(error) => buffer.set_text(&format!("Unable to read journal: {error}")),
+                Ok(_) => buffer.set_text(tr("(journal is empty)")),
+                Err(error) => {
+                    buffer.set_text(&format!("{}: {error}", tr("Unable to read journal")));
+                }
             }
         });
     }
@@ -1223,30 +1356,41 @@ fn generate_rule_id(existing: &[AppRule]) -> String {
 
 fn target_status_text(status: Option<&FrequencyStatus>) -> String {
     status.map_or_else(
-        || "No fresh state".into(),
+        || tr("No fresh state").into(),
         |status| {
             if !status.applied_verified {
                 return if status.observed_available {
                     format!(
-                        "{} – {} observed · not managed{}",
+                        "{} – {} {} · {}{}",
                         format_frequency(status.observed_min_hz),
                         format_frequency(status.observed_max_hz),
-                        if status.stale { " · stale" } else { "" },
+                        tr("observed"),
+                        tr("not managed"),
+                        if status.stale {
+                            format!(" · {}", tr("stale"))
+                        } else {
+                            String::new()
+                        },
                     )
                 } else {
-                    "State unavailable · not managed".to_owned()
+                    tr("State unavailable · not managed").to_owned()
                 };
             }
-            let stale = if status.stale { " · stale" } else { "" };
-            let overridden = if status.override_active {
-                " · override"
+            let stale = if status.stale {
+                format!(" · {}", tr("stale"))
             } else {
-                ""
+                String::new()
+            };
+            let overridden = if status.override_active {
+                format!(" · {}", tr("override"))
+            } else {
+                String::new()
             };
             format!(
-                "{} – {} applied{overridden}{stale}",
+                "{} – {} {}{overridden}{stale}",
                 format_frequency(status.applied_min_hz),
-                format_frequency(status.applied_max_hz)
+                format_frequency(status.applied_max_hz),
+                tr("applied")
             )
         },
     )
@@ -1286,23 +1430,23 @@ fn closest_index(choices: &[u64], requested: u64) -> u32 {
 
 fn format_retry_delay(delay: Duration) -> String {
     if delay < Duration::from_secs(1) {
-        format!("{} ms", delay.as_millis())
+        format!("{} {}", delay.as_millis(), tr("ms"))
     } else {
-        format!("{} s", delay.as_secs())
+        format!("{} {}", delay.as_secs(), tr("s"))
     }
 }
 
 fn running_workload_subtitle(workload: &RunningWorkload) -> String {
     let source = if workload.matched_pattern == "active" {
-        "explicit active workload".to_owned()
+        tr("explicit active workload").to_owned()
     } else {
-        format!("matched {}", workload.matched_pattern)
+        format!("{} {}", tr("matched"), workload.matched_pattern)
     };
     let mut details = vec![format!("PID {}", workload.identity.pid), source];
     if workload.active {
-        details.push("active".to_owned());
+        details.push(tr("active").to_owned());
         let scheduler = scheduler_status_text(&workload.scheduler);
-        if scheduler != "No active workload" {
+        if scheduler != tr("No active workload") {
             details.push(scheduler);
         }
     }
@@ -1311,18 +1455,22 @@ fn running_workload_subtitle(workload: &RunningWorkload) -> String {
 
 fn scheduler_status_text(status: &SchedulerStatus) -> String {
     if !status.enabled {
-        return "Disabled by policy".to_owned();
+        return tr("Disabled by policy").to_owned();
     }
     if status.matched_rule.is_empty() {
         return if status.warning.is_empty() {
-            "Pending or no matching scheduler rule".to_owned()
+            tr("Pending or no matching scheduler rule").to_owned()
         } else {
-            format!("No applied rule · {}", status.warning)
+            format!("{} · {}", tr("No applied rule"), status.warning)
         };
     }
     let mut text = format!(
-        "Rule {} · {}/{} tasks applied",
-        status.matched_rule, status.applied_tasks, status.managed_tasks
+        "{} {} · {}/{} {}",
+        tr("Rule"),
+        status.matched_rule,
+        status.applied_tasks,
+        status.managed_tasks,
+        tr("tasks applied")
     );
     if !status.warning.is_empty() {
         text.push_str(" · ");
@@ -1333,26 +1481,33 @@ fn scheduler_status_text(status: &SchedulerStatus) -> String {
 
 fn cgroup_status_text(status: &SchedulerStatus) -> String {
     if !status.enabled {
-        return "Disabled by policy".to_owned();
+        return tr("Disabled by policy").to_owned();
     }
     if status.systemd_unit.is_empty() {
         return if status.cgroup_class.is_empty() {
-            "No dedicated unit selected".to_owned()
+            tr("No dedicated unit selected").to_owned()
         } else {
-            format!("Class {} · no dedicated unit", status.cgroup_class)
+            format!(
+                "{} {} · {}",
+                tr("Class"),
+                status.cgroup_class,
+                tr("no dedicated unit")
+            )
         };
     }
     let state = if status.cgroup_applied {
-        "applied"
+        tr("applied")
     } else {
-        "not applied"
+        tr("not applied")
     };
     if status.cgroup_class.is_empty() {
         format!("{} · {state}", status.systemd_unit)
     } else {
         format!(
-            "Class {} · {} · {state}",
-            status.cgroup_class, status.systemd_unit
+            "{} {} · {} · {state}",
+            tr("Class"),
+            status.cgroup_class,
+            status.systemd_unit
         )
     }
 }
@@ -1394,6 +1549,79 @@ fn is_connection_error_name(name: &str) -> bool {
 
 async fn emit(sender: &Sender<UiEvent>, event: UiEvent) -> bool {
     sender.send(event).await.is_ok()
+}
+
+async fn enable_and_start_system_service(events: &Sender<UiEvent>) -> bool {
+    if !emit(events, UiEvent::ServiceActivationStarted).await {
+        return false;
+    }
+    let result = async {
+        let connection = zbus::Connection::system().await?;
+        let manager = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await?;
+
+        let changes: Option<UnitFileChanges> = manager
+            .call_with_flags(
+                "EnableUnitFiles",
+                zbus::proxy::MethodFlags::AllowInteractiveAuth.into(),
+                &(vec![SERVICE_UNIT], false, false),
+            )
+            .await?;
+        if changes.is_none() {
+            return Err(zbus::Error::Failure(
+                "systemd returned no EnableUnitFiles reply".into(),
+            ));
+        }
+
+        let job: Option<zbus::zvariant::OwnedObjectPath> = manager
+            .call_with_flags(
+                "StartUnit",
+                zbus::proxy::MethodFlags::AllowInteractiveAuth.into(),
+                &(SERVICE_UNIT, "replace"),
+            )
+            .await?;
+        if job.is_none() {
+            return Err(zbus::Error::Failure(
+                "systemd returned no StartUnit reply".into(),
+            ));
+        }
+
+        let unit_path: zbus::zvariant::OwnedObjectPath =
+            manager.call("GetUnit", &(SERVICE_UNIT)).await?;
+        let unit = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.systemd1",
+            unit_path.as_str(),
+            "org.freedesktop.systemd1.Unit",
+        )
+        .await?;
+        for _ in 0..50 {
+            let state: String = unit.get_property("ActiveState").await?;
+            match state.as_str() {
+                "active" => return Ok::<(), zbus::Error>(()),
+                "failed" => {
+                    return Err(zbus::Error::Failure(
+                        "uperf-linux.service failed to start".into(),
+                    ));
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        Err(zbus::Error::Failure(
+            "timed out waiting for uperf-linux.service to become active".into(),
+        ))
+    }
+    .await
+    .map_err(|error| error.to_string());
+
+    let succeeded = result.is_ok();
+    emit(events, UiEvent::ServiceActivationFinished(result)).await;
+    succeeded
 }
 
 async fn report_client_error(events: &Sender<UiEvent>, error: ClientError) -> Result<(), String> {
@@ -1446,6 +1674,13 @@ async fn handle_command(
     events: &Sender<UiEvent>,
     command: ClientCommand,
 ) -> Result<(), String> {
+    let command = match command {
+        ClientCommand::EnableAndStartService => {
+            enable_and_start_system_service(events).await;
+            return Ok(());
+        }
+        command => command,
+    };
     let mut refresh_rules = false;
     let mut refresh_workloads = false;
     let result = match command {
@@ -1491,6 +1726,7 @@ async fn handle_command(
                 .map(|receipt| receipt.message)
         }
         ClientCommand::ReloadConfig => client.reload_config().await.map(|report| report.message),
+        ClientCommand::EnableAndStartService => unreachable!("handled before daemon commands"),
     };
     match result {
         Ok(message) => {
@@ -1698,10 +1934,15 @@ async fn wait_before_retry(
         tokio::select! {
             () = &mut timer => return true,
             command = commands.recv() => match command {
+                Ok(ClientCommand::EnableAndStartService) => {
+                    if enable_and_start_system_service(events).await {
+                        return true;
+                    }
+                }
                 Ok(_) => {
                     if !emit(events, UiEvent::RequestError {
                         kind: RequestErrorKind::Rejected,
-                        message: "daemon disconnected before the command was sent".into(),
+                        message: tr("daemon disconnected before the command was sent").into(),
                     }).await {
                         return false;
                     }
@@ -1783,6 +2024,7 @@ fn build_application(application: &adw::Application) {
 }
 
 fn main() -> glib::ExitCode {
+    i18n::initialize();
     let application = adw::Application::builder()
         .application_id("org.uperflinux.Gui")
         .build();

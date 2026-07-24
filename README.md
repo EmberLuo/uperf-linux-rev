@@ -193,13 +193,25 @@ the stable PID/start-time/UID checks described above. The same view reports the
 active workload's matched scheduler rule, desired/applied task counts and
 owned systemd cgroup state.
 
+Debian/Ubuntu releases provide two self-contained alternatives:
+`uperf-linux` is the headless edition, while `uperf-linux-gui` contains the
+same daemon and tools plus the GUI. Installing the GUI edition does not install
+the headless package; APT replaces one edition with the other when switching.
+
 Debian/Ubuntu packages deliberately leave the service disabled and stopped.
 Review and validate the complete live configuration first, then enable it
-explicitly:
+explicitly. The GUI edition exposes an **Enable & Start** action while
+disconnected; it asks PolicyKit to enable and start only
+`uperf-linux.service`, then reconnects automatically. The equivalent command
+is:
 
 ```bash
 sudo systemctl enable --now uperf-linux.service
 ```
+
+The GUI follows the system language by default and includes English and
+Simplified Chinese. A persistent language selector is available under
+Settings; reopening the application applies a changed language.
 
 See [packaging and installation](docs/packaging.md) and the
 [SM8550 certification checklist](docs/sm8550-certification.md) before any

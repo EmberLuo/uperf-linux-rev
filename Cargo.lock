@@ -1317,7 +1317,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "uperf-actuator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32fast",
  "serde",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "schemars",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "futures-util",
@@ -1380,11 +1380,12 @@ dependencies = [
  "libadwaita",
  "tokio",
  "uperf-api",
+ "zbus",
 ]
 
 [[package]]
 name = "uperf-linux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "evdev",
  "libc",
@@ -1399,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -1408,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-probe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -1418,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "uperf-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "uperf-core",
  "uperf-platform",
@@ -1426,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "uperfctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",

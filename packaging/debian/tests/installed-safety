@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+package="${1:-uperf-linux}"
+
 if systemctl is-enabled --quiet uperf-linux.service; then
     echo "uperf-linux.service was enabled by package installation" >&2
     exit 1
@@ -38,7 +40,7 @@ install -d -m 0700 /run/uperf-linux
 printf '{}\n' >"$journal"
 created_journal=yes
 
-if /var/lib/dpkg/info/uperf-linux.prerm remove; then
+if "/var/lib/dpkg/info/$package.prerm" remove; then
     echo "package prerm did not block removal with pending recovery evidence" >&2
     exit 1
 fi

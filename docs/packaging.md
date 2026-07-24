@@ -1,15 +1,32 @@
 # Packaging and installation
 
-## Package split
+## Package editions
 
-The Debian metadata produces two ARM64 packages:
+The Debian metadata produces two mutually exclusive, self-contained ARM64
+editions:
 
 - `uperf-linux`: daemon, CLI, read-only probe, systemd unit, D-Bus policy,
-  PolicyKit actions, schemas, defaults, and the SM8550 device profile;
-- `uperf-linux-gui`: optional GTK4/libadwaita client, desktop entry, AppStream
-  metadata, and icon. It depends on the exact core package version.
+  PolicyKit actions, schemas, defaults, and the SM8550 device profile, without
+  desktop dependencies;
+- `uperf-linux-gui`: the same complete core payload plus the GTK4/libadwaita
+  client, desktop entry, AppStream metadata, and icon. It does not require the
+  separate `uperf-linux` package.
 
-GTK is not linked into the daemon or command-line tools.
+The editions conflict with and replace one another because they own the same
+daemon and configuration paths. Installing one edition with APT therefore
+switches from the other instead of allowing two packages to own the same
+privileged service. GTK remains linked only into the GUI executable, not the
+daemon or command-line tools.
+
+Install exactly one edition:
+
+```bash
+# Headless
+sudo apt install uperf-linux
+
+# Complete GUI edition; uperf-linux is not a dependency
+sudo apt install uperf-linux-gui
+```
 
 The repository groups distribution assets below `packaging/`. A release
 source tree must expose `packaging/debian` as its top-level `debian`
@@ -33,7 +50,7 @@ Rust source packages when network-free reproducibility is required.
 | `/usr/bin/uperf-linux` | root daemon |
 | `/usr/bin/uperfctl` | D-Bus client and offline migration/validation |
 | `/usr/bin/uperf-probe` | read-only discovery |
-| `/usr/bin/uperf-gui` | optional GUI package |
+| `/usr/bin/uperf-gui` | GUI edition only |
 | `/etc/uperf-linux/device.json` | conffile initialized from SM8550 profile |
 | `/etc/uperf-linux/policy.json` | policy conffile |
 | `/usr/share/uperf-linux/devices/` | immutable device profiles |
@@ -44,15 +61,22 @@ Rust source packages when network-free reproducibility is required.
 
 ## Deliberately disabled after install
 
-`dh_installsystemd` is called with both `--no-enable` and `--no-start`.
-Installation therefore cannot mutate hardware merely because a package was
-installed. The administrator must:
+For both editions, `dh_installsystemd` is called with both `--no-enable` and
+`--no-start`. Installation therefore cannot mutate hardware merely because a
+package was installed. The administrator must:
 
 1. confirm that the device match, policy masks, target OPPs, and trusted
    thermal zone types agree with `uperf-probe`;
 2. stage `device.json`, `policy.json`, and the current or default `apps.json`
    in one directory and run `uperfctl config validate DIRECTORY`;
 3. enable and start `uperf-linux.service` explicitly.
+
+The GUI edition presents an **Enable & Start** button when the daemon is
+unavailable. It calls the fixed systemd D-Bus methods for
+`uperf-linux.service` with interactive PolicyKit authorization, which is
+equivalent to `systemctl enable --now uperf-linux.service`. It does not invoke
+a shell or accept a client-supplied unit name. Successful activation is
+followed by automatic D-Bus reconnection.
 
 The same conservative rule applies to upgrades: a service stopped for package
 replacement is not started again implicitly. Revalidate, inspect any retained
@@ -66,7 +90,8 @@ allowlist and durable journal.
 ## Upgrade and removal safety
 
 The systemd runtime directory is preserved across stop because it contains
-recovery evidence. On remove, deconfigure, or upgrade, `prerm`:
+recovery evidence. On remove, deconfigure, upgrade, or switching editions,
+`prerm`:
 
 1. stops a running daemon and requires the stop to succeed;
 2. checks `/run/uperf-linux/recovery.json`;

@@ -58,15 +58,21 @@ jobs:
               grep --quiet '[.]symtab'
           done
 
-      - name: Stage core and GUI package payloads
+      - name: Stage headless and self-contained GUI package payloads
         run: |
           make --file packaging/debian/rules override_dh_auto_install
           test -x debian/uperf-linux/usr/bin/uperf-linux
           test -x debian/uperf-linux/usr/bin/uperfctl
           test -x debian/uperf-linux/usr/bin/uperf-probe
+          test -x debian/uperf-linux-gui/usr/bin/uperf-linux
+          test -x debian/uperf-linux-gui/usr/bin/uperfctl
+          test -x debian/uperf-linux-gui/usr/bin/uperf-probe
           test -x debian/uperf-linux-gui/usr/bin/uperf-gui
           test -f debian/uperf-linux/etc/uperf-linux/device.json
+          test -f debian/uperf-linux-gui/etc/uperf-linux/device.json
           test -f debian/uperf-linux/usr/share/uperf-linux/schema/device-v2.schema.json
+          test -f debian/uperf-linux-gui/usr/share/uperf-linux/schema/device-v2.schema.json
+          test -f debian/uperf-linux-gui/usr/lib/systemd/system/uperf-linux.service
           test -f debian/uperf-linux-gui/usr/share/applications/org.uperflinux.Gui.desktop
 
       - name: Validate bundled configuration

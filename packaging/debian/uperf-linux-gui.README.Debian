@@ -1,0 +1,33 @@
+uperf-linux GUI edition for Debian and Ubuntu
+================================================
+
+This package is the complete GUI edition. It contains the same daemon, CLI,
+probe, system integration, configuration, and safety behavior as the headless
+uperf-linux package, plus the GTK application.
+
+The package deliberately does not enable or start uperf-linux.service.
+The installed /etc/uperf-linux/device.json is the bundled SM8550 profile;
+do not use it on a different system without replacing it with a reviewed
+device profile.
+
+Validate the complete live configuration before enabling the service:
+
+  workdir="$(mktemp -d)"
+  install -m 0644 /etc/uperf-linux/device.json "$workdir/device.json"
+  install -m 0644 /etc/uperf-linux/policy.json "$workdir/policy.json"
+  if test -f /var/lib/uperf-linux/apps.json; then
+      install -m 0600 /var/lib/uperf-linux/apps.json "$workdir/apps.json"
+  else
+      install -m 0644 /usr/share/uperf-linux/defaults/apps.json \
+          "$workdir/apps.json"
+  fi
+  uperfctl config validate "$workdir"
+  rm -rf "$workdir"
+
+After inspection and successful validation, an administrator may run:
+
+  systemctl enable --now uperf-linux.service
+
+The package removal script stops the daemon and refuses to continue when
+/run/uperf-linux/recovery.json remains. Do not delete that file manually:
+it is the evidence needed to restore mutations made during the current boot.

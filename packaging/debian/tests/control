@@ -1,3 +1,7 @@
 Tests: installed-safety
 Depends: systemd, uperf-linux
 Restrictions: isolation-machine, needs-root
+
+Tests: installed-safety-gui
+Depends: systemd, uperf-linux-gui
+Restrictions: isolation-machine, needs-root

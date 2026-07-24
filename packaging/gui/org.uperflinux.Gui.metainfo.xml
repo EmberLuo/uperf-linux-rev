@@ -5,6 +5,7 @@
   <project_license>GPL-3.0-or-later</project_license>
   <name>Uperf Linux</name>
   <summary>Control the uperf-linux userspace performance scheduler</summary>
+  <summary xml:lang="zh-CN">控制 uperf-linux 用户态性能调度器</summary>
   <developer id="org.uperflinux">
     <name>uperf-linux contributors</name>
   </developer>
@@ -14,12 +15,17 @@
       discovered frequency targets, and supported modes. Its controls are
       generated from the versioned D-Bus capability report.
     </p>
+    <p xml:lang="zh-CN">
+      Uperf Linux 显示守护进程健康状态、温控状态、活动工作负载、检测到的频率目标和支持的模式。
+      所有控制项均根据带版本的 D-Bus capability 报告动态生成。
+    </p>
   </description>
   <launchable type="desktop-id">org.uperflinux.Gui.desktop</launchable>
   <provides>
     <binary>uperf-gui</binary>
   </provides>
   <releases>
+    <release version="0.1.1" date="2026-07-24" type="development"/>
     <release version="0.1.0" date="2026-07-23" type="development"/>
   </releases>
   <url type="homepage">https://github.com/EmberLuo/uperf-linux-rev</url>

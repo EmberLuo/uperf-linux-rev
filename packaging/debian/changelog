@@ -1,7 +1,16 @@
+uperf-linux-rev (0.1.1) unstable; urgency=medium
+
+  * Add PolicyKit-authorized service enable and start controls to the GUI.
+  * Add English and Simplified Chinese GUI localization.
+  * Ship the GUI edition as a complete alternative to the headless package.
+
+ -- uperf-linux contributors <noreply@example.invalid>  Fri, 24 Jul 2026 00:00:00 +0800
+
 uperf-linux-rev (0.1.0) unstable; urgency=medium
 
   * Initial capability-driven Rust implementation.
-  * Ship the SM8550 device profile, version 2 schemas, system service,
-    D-Bus policy, PolicyKit actions, CLI, probe, and optional GTK client.
+  * Ship mutually exclusive headless and self-contained GUI editions.
+  * Both editions include the SM8550 profile, version 2 schemas, system
+    service, D-Bus policy, PolicyKit actions, CLI, and probe.
 
  -- uperf-linux contributors <noreply@example.invalid>  Thu, 23 Jul 2026 00:00:00 +0800
