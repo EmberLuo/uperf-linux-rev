@@ -204,6 +204,8 @@ pub struct DeviceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_match: Option<DeviceMatch>,
     #[serde(default)]
+    pub cpu_groups: BTreeMap<String, CpuSet>,
+    #[serde(default)]
     #[schemars(length(max = MAX_CPU_POLICIES))]
     pub cpu_policies: Vec<CpuPolicyConfig>,
     #[serde(default)]
@@ -294,6 +296,21 @@ impl Validate for DeviceConfig {
                 validate_sysfs_directory(&format!("{base}.sysfs_path"), path, &mut issues);
             }
             validate_frequency_model(policy, &base, &mut issues);
+        }
+        for (name, cpus) in &self.cpu_groups {
+            validate_name(&format!("cpu_groups.{name}"), name, &mut issues);
+            if cpus.is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("cpu_groups.{name}"),
+                    "must contain at least one CPU",
+                ));
+            }
+            if !cpus.is_subset(&used_cpus) {
+                issues.push(ValidationIssue::new(
+                    format!("cpu_groups.{name}"),
+                    "references a CPU outside the device CPU policies",
+                ));
+            }
         }
 
         for (index, target) in self
@@ -530,6 +547,8 @@ pub struct WorkloadMatcher {
 #[serde(deny_unknown_fields)]
 pub struct TaskProfileConfig {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_group: Option<String>,
     pub plan: TaskPlan,
 }
 
@@ -558,6 +577,9 @@ pub struct ProcessRuleConfig {
 #[serde(deny_unknown_fields)]
 pub struct CgroupClassConfig {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cpu_group: Option<String>,
+    #[serde(default)]
     pub allowed_cpus: CpuSet,
     pub cpu_weight: u16,
 }
@@ -859,6 +881,14 @@ impl ConfigBundle {
             .flat_map(|policy| policy.related_cpus.iter().copied())
             .collect::<CpuSet>();
         for (index, profile) in self.policy.scheduler.task_profiles.iter().enumerate() {
+            if let Some(group) = &profile.affinity_group
+                && !self.device.cpu_groups.contains_key(group)
+            {
+                issues.push(ValidationIssue::new(
+                    format!("policy.scheduler.task_profiles[{index}].affinity_group"),
+                    format!("references unknown device CPU group {group:?}"),
+                ));
+            }
             if let Some(affinity) = &profile.plan.affinity
                 && !affinity.is_subset(&configured_cpus)
             {
@@ -869,6 +899,14 @@ impl ConfigBundle {
             }
         }
         for (index, class) in self.policy.scheduler.cgroup_classes.iter().enumerate() {
+            if let Some(group) = &class.allowed_cpu_group
+                && !self.device.cpu_groups.contains_key(group)
+            {
+                issues.push(ValidationIssue::new(
+                    format!("policy.scheduler.cgroup_classes[{index}].allowed_cpu_group"),
+                    format!("references unknown device CPU group {group:?}"),
+                ));
+            }
             if !class.allowed_cpus.is_subset(&configured_cpus) {
                 issues.push(ValidationIssue::new(
                     format!("policy.scheduler.cgroup_classes[{index}].allowed_cpus"),
@@ -878,6 +916,34 @@ impl ConfigBundle {
         }
 
         finish_validation(issues)
+    }
+
+    /// Resolve device-defined logical CPU groups into the concrete scheduler
+    /// CPU sets consumed by the policy engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same cross-document validation errors as
+    /// [`Self::validate_cross_references`] before materializing any reference.
+    pub fn materialize_cpu_groups(&self) -> Result<PolicyConfig, ValidationErrors> {
+        self.validate_cross_references()?;
+        let mut policy = self.policy.clone();
+        for profile in &mut policy.scheduler.task_profiles {
+            if let Some(group) = profile.affinity_group.take() {
+                profile.plan.affinity = self.device.cpu_groups.get(&group).cloned();
+            }
+        }
+        for class in &mut policy.scheduler.cgroup_classes {
+            if let Some(group) = class.allowed_cpu_group.take() {
+                class.allowed_cpus = self
+                    .device
+                    .cpu_groups
+                    .get(&group)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        Ok(policy)
     }
 }
 
@@ -987,6 +1053,15 @@ fn validate_scheduler(config: &SchedulerConfig, issues: &mut Vec<ValidationIssue
                 "duplicate task profile id",
             ));
         }
+        if let Some(group) = &profile.affinity_group {
+            validate_name(&format!("{base}.affinity_group"), group, issues);
+            if profile.plan.affinity.is_some() {
+                issues.push(ValidationIssue::new(
+                    base.clone(),
+                    "affinity_group and plan.affinity are mutually exclusive",
+                ));
+            }
+        }
         validate_task_plan(&format!("{base}.plan"), &profile.plan, issues);
     }
 
@@ -1005,10 +1080,19 @@ fn validate_scheduler(config: &SchedulerConfig, issues: &mut Vec<ValidationIssue
                 "duplicate cgroup class id",
             ));
         }
-        if class.allowed_cpus.is_empty() {
+        if let Some(group) = &class.allowed_cpu_group {
+            validate_name(&format!("{base}.allowed_cpu_group"), group, issues);
+        }
+        if class.allowed_cpu_group.is_some() && !class.allowed_cpus.is_empty() {
+            issues.push(ValidationIssue::new(
+                base.clone(),
+                "allowed_cpu_group and allowed_cpus are mutually exclusive",
+            ));
+        }
+        if class.allowed_cpu_group.is_none() && class.allowed_cpus.is_empty() {
             issues.push(ValidationIssue::new(
                 format!("{base}.allowed_cpus"),
-                "must contain at least one CPU",
+                "must contain at least one CPU when allowed_cpu_group is unset",
             ));
         }
         if !(1..=10_000).contains(&class.cpu_weight) {
@@ -1267,8 +1351,9 @@ mod tests {
     fn valid_device() -> DeviceConfig {
         DeviceConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
-            device_id: "sm8550".into(),
+            device_id: "test-soc".into(),
             device_match: None,
+            cpu_groups: BTreeMap::new(),
             cpu_policies: vec![
                 CpuPolicyConfig {
                     id: target("cpu.efficiency"),
@@ -1486,6 +1571,7 @@ mod tests {
         let mut policy = valid_policy();
         policy.scheduler.task_profiles.push(TaskProfileConfig {
             id: "outside".into(),
+            affinity_group: None,
             plan: TaskPlan {
                 affinity: Some(CpuSet::from_ids([CpuId(99)])),
                 ..TaskPlan::default()
@@ -1506,6 +1592,55 @@ mod tests {
                 .issues()
                 .iter()
                 .any(|issue| issue.message.contains("outside the device"))
+        );
+    }
+
+    #[test]
+    fn bundle_materializes_device_cpu_groups_for_scheduler_policy() {
+        let mut device = valid_device();
+        device.cpu_policies[1].sysfs_path = None;
+        device.thermal_zones.push(ThermalZoneConfig {
+            id: "soc".into(),
+            zone_type: "soc-thermal".into(),
+            sysfs_path: None,
+            warning: MilliCelsius(70_000),
+            throttled: MilliCelsius(80_000),
+            critical: MilliCelsius(90_000),
+            hysteresis: MilliCelsius(5_000),
+            dwell_ms: 100,
+            stale_after_ms: 1_000,
+        });
+        let all = device
+            .cpu_policies
+            .iter()
+            .flat_map(|policy| policy.related_cpus.iter().copied())
+            .collect::<CpuSet>();
+        device.cpu_groups.insert("all".into(), all.clone());
+        let mut policy = valid_policy();
+        policy.scheduler.task_profiles.push(TaskProfileConfig {
+            id: "grouped".into(),
+            affinity_group: Some("all".into()),
+            plan: TaskPlan::default(),
+        });
+        policy.scheduler.cgroup_classes.push(CgroupClassConfig {
+            id: "grouped".into(),
+            allowed_cpu_group: Some("all".into()),
+            allowed_cpus: CpuSet::new(),
+            cpu_weight: 100,
+        });
+
+        let materialized = ConfigBundle { device, policy }
+            .materialize_cpu_groups()
+            .expect("known CPU groups");
+        assert_eq!(
+            materialized.scheduler.task_profiles[0].plan.affinity,
+            Some(all.clone())
+        );
+        assert_eq!(materialized.scheduler.cgroup_classes[0].allowed_cpus, all);
+        assert_eq!(materialized.scheduler.task_profiles[0].affinity_group, None);
+        assert_eq!(
+            materialized.scheduler.cgroup_classes[0].allowed_cpu_group,
+            None
         );
     }
 

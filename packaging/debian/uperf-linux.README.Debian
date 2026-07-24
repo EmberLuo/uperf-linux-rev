@@ -2,14 +2,15 @@ uperf-linux for Debian and Ubuntu
 =================================
 
 The package deliberately does not enable or start uperf-linux.service.
-The installed /etc/uperf-linux/device.json is the bundled SM8550 profile;
-do not use it on a different system without replacing it with a reviewed
-device profile.
+When /etc/uperf-linux/device.json is absent, the daemon selects one exact
+device-tree match from /usr/share/uperf-linux/devices. A retained or manually
+created /etc file is an administrator override and takes precedence.
 
 Validate the complete live configuration before enabling the service:
 
   workdir="$(mktemp -d)"
-  install -m 0644 /etc/uperf-linux/device.json "$workdir/device.json"
+  profile=/usr/share/uperf-linux/devices/REVIEWED-PROFILE.json
+  install -m 0644 "$profile" "$workdir/device.json"
   install -m 0644 /etc/uperf-linux/policy.json "$workdir/policy.json"
   if test -f /var/lib/uperf-linux/apps.json; then
       install -m 0600 /var/lib/uperf-linux/apps.json "$workdir/apps.json"

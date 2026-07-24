@@ -3,9 +3,10 @@
 This directory contains the strict configuration bundle used by tests and
 packaging:
 
-- `devices/sm8550.json`: the first device-profile and certification target;
-- `policy.json`: default profiles, scene patches, observers, and scheduler
-  policy for that target;
+- `devices/*.json`: independently installable device profiles selected by exact
+  device-tree identity;
+- `policy.json`: device-neutral profiles, scene patches, observers, and
+  scheduler policy using logical CPU groups;
 - `apps.json`: an empty seed for daemon-managed application rules;
 - `schema/*-v2.schema.json`: Draft 2020-12 schemas generated from the public
   `uperf-core` configuration types.
@@ -14,10 +15,16 @@ Installed mutable and immutable paths intentionally differ:
 
 | Repository asset | Installed path |
 | --- | --- |
-| `devices/sm8550.json` | `/usr/share/uperf-linux/devices/sm8550.json` and initial `/etc/uperf-linux/device.json` |
+| `devices/*.json` | `/usr/share/uperf-linux/devices/*.json` |
 | `policy.json` | `/usr/share/uperf-linux/defaults/policy.json` and initial `/etc/uperf-linux/policy.json` |
 | `apps.json` | `/usr/share/uperf-linux/defaults/apps.json` only |
 | `schema/*.json` | `/usr/share/uperf-linux/schema/` |
+
+The daemon scans every `*.json` in the installed device directory and requires
+exactly one `device_match`. `/etc/uperf-linux/device.json` is an optional
+administrator override, not a package-generated default. Device profiles map
+logical groups such as `efficient`, `balanced`, `performance`, and `all` to
+the concrete CPU IDs referenced by the shared policy.
 
 `/var/lib/uperf-linux/apps.json` is intentionally not package-owned. The
 daemon treats a missing file as an empty rule set and creates it when an
@@ -34,5 +41,6 @@ out-of-band. JSON Schema checks structure, while `uperfctl config validate`
 also performs semantic and cross-file validation.
 
 The committed schemas are release artifacts. Any pull request that changes a
-configuration type must regenerate all three schemas and review the resulting
-contract diff.
+configuration type must run
+`cargo run --package uperf-core --example generate_schemas` and review the
+resulting contract diff.

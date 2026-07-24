@@ -4047,8 +4047,8 @@ fn target_signature(
 mod tests {
     use super::*;
     use uperf_core::{
-        AppRuleEngine, CpuId, CpuSet, DeviceCapabilities, DeviceConfig, PolicyConfig, PolicyEngine,
-        UserId,
+        AppRuleEngine, ConfigBundle, CpuId, CpuSet, DeviceCapabilities, DeviceConfig, PolicyConfig,
+        PolicyEngine, UserId,
     };
     use uperf_platform::{Clock, InputDeviceId, OnlineCpuSource, PlatformResult, TouchContactId};
     use uperf_testkit::{FakeClock, FakeProc, FakeRuntime};
@@ -4399,10 +4399,46 @@ mod tests {
     }
 
     fn actor_parts(root: &std::path::Path, clock: FakeClock) -> RuntimeParts {
-        let device = DeviceConfig::from_json(include_str!("../../../config/devices/sm8550.json"))
-            .expect("device configuration");
-        let policy = PolicyConfig::from_json(include_str!("../../../config/policy.json"))
-            .expect("policy configuration");
+        let device = DeviceConfig::from_json(
+            r#"{
+                "schema_version": 2,
+                "device_id": "test-soc",
+                "device_match": { "compatible": "vendor,test-soc" },
+                "cpu_groups": {
+                    "all": [0],
+                    "balanced": [0],
+                    "efficient": [0],
+                    "performance": [0]
+                },
+                "cpu_policies": [{
+                    "id": "cpu.main",
+                    "related_cpus": [0],
+                    "floor_hz": 1000,
+                    "reference_hz": 2000,
+                    "efficient_cap_hz": 3000
+                }],
+                "thermal_zones": [{
+                    "id": "soc",
+                    "zone_type": "soc-thermal",
+                    "warning": 70000,
+                    "throttled": 80000,
+                    "critical": 90000,
+                    "hysteresis": 5000,
+                    "dwell_ms": 500,
+                    "stale_after_ms": 1000
+                }]
+            }"#,
+        )
+        .expect("device configuration");
+        let configured_policy =
+            PolicyConfig::from_json(include_str!("../../../config/policy.json"))
+                .expect("policy configuration");
+        let policy = ConfigBundle {
+            device: device.clone(),
+            policy: configured_policy,
+        }
+        .materialize_cpu_groups()
+        .expect("device CPU groups");
         let apps = AppsConfig::from_json(include_str!("../../../config/apps.json"))
             .expect("application rules");
         let thermal_zones = device.thermal_zones.clone();
@@ -4418,9 +4454,8 @@ mod tests {
         };
         let discovery = LinuxDiscovery {
             capabilities: DeviceCapabilities {
-                device_name: Some("fake SM8550".to_owned()),
-                compatible: vec!["qcom,sm8550".to_owned()],
-                matched_profile: Some("qcom-sm8550".to_owned()),
+                device_name: Some("fake test SoC".to_owned()),
+                compatible: vec!["vendor,test-soc".to_owned()],
                 cpu_policies: Vec::new(),
                 devfreq_targets: Vec::new(),
                 thermal_zones: Vec::new(),

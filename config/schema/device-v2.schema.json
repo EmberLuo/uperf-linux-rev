@@ -3,6 +3,13 @@
   "title": "DeviceConfig",
   "type": "object",
   "properties": {
+    "cpu_groups": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/CpuSet"
+      },
+      "default": {}
+    },
     "cpu_policies": {
       "type": "array",
       "default": [],

@@ -157,10 +157,12 @@ struct Ui {
 
     // Dashboard: per-target frequency (rebuilt from capabilities)
     freq_group: adw::PreferencesGroup,
+    freq_dynamic_rows: RefCell<Vec<adw::ActionRow>>,
     freq_rows: RefCell<BTreeMap<String, gtk::Label>>,
 
     // Frequency page (rebuilt from capabilities)
     override_group: adw::PreferencesGroup,
+    override_dynamic_rows: RefCell<Vec<adw::ActionRow>>,
     target_status: RefCell<BTreeMap<String, gtk::Label>>,
     override_ids: RefCell<Vec<String>>,
 
@@ -335,8 +337,10 @@ impl Ui {
             load_group,
             load_rows: RefCell::new(BTreeMap::new()),
             freq_group,
+            freq_dynamic_rows: RefCell::new(Vec::new()),
             freq_rows: RefCell::new(BTreeMap::new()),
             override_group,
+            override_dynamic_rows: RefCell::new(Vec::new()),
             target_status: RefCell::new(BTreeMap::new()),
             override_ids: RefCell::new(Vec::new()),
             running_group,
@@ -855,8 +859,8 @@ impl Ui {
         self.sync_mode_dropdown();
 
         // Dashboard per-target frequency labels.
-        while let Some(child) = self.freq_group.first_child() {
-            self.freq_group.remove(&child);
+        for row in self.freq_dynamic_rows.borrow_mut().drain(..) {
+            self.freq_group.remove(&row);
         }
         self.freq_rows.borrow_mut().clear();
         for target in &view.targets {
@@ -866,6 +870,7 @@ impl Ui {
             let label = value_label();
             row.add_suffix(&label);
             self.freq_group.add(&row);
+            self.freq_dynamic_rows.borrow_mut().push(row);
             self.freq_rows
                 .borrow_mut()
                 .insert(target.capability.id.clone(), label);
@@ -873,8 +878,8 @@ impl Ui {
         self.freq_group.set_visible(!view.targets.is_empty());
 
         // Frequency-page override rows.
-        while let Some(child) = self.override_group.first_child() {
-            self.override_group.remove(&child);
+        for row in self.override_dynamic_rows.borrow_mut().drain(..) {
+            self.override_group.remove(&row);
         }
         self.target_status.borrow_mut().clear();
         self.override_ids.borrow_mut().clear();
@@ -979,6 +984,7 @@ impl Ui {
             }
         }
         self.override_group.add(&row);
+        self.override_dynamic_rows.borrow_mut().push(row);
     }
 
     fn sync_mode_dropdown(&self) {

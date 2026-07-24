@@ -10,7 +10,7 @@ use uperf_platform::SysfsIo;
     clippy::too_many_lines,
     reason = "one end-to-end fixture keeps all discovered resources and assertions co-located"
 )]
-fn discovers_sparse_cpu_policies_dynamic_opps_and_sm8550() {
+fn discovers_sparse_cpu_policies_dynamic_opps_and_device_identity() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();
     create_roots(root);
@@ -58,19 +58,19 @@ fn discovers_sparse_cpu_policies_dynamic_opps_and_sm8550() {
 
     write(
         &root.join("sys/firmware/devicetree/base/model"),
-        b"Qualcomm SM8550 test\0",
+        b"Vendor test SoC\0",
     );
     write(
         &root.join("sys/firmware/devicetree/base/compatible"),
-        b"qcom,sm8550\0qcom,test-board\0",
+        b"vendor,test-soc\0vendor,test-board\0",
     );
 
     let environment = LinuxEnvironment::new(SystemRoots::below(root)).unwrap();
     let discovery = environment.discover().unwrap();
 
     assert_eq!(
-        discovery.capabilities.matched_profile.as_deref(),
-        Some("qcom-sm8550")
+        discovery.capabilities.compatible,
+        ["vendor,test-soc", "vendor,test-board"]
     );
     assert_eq!(discovery.capabilities.cpu_policies.len(), 2);
     assert_eq!(
@@ -150,7 +150,7 @@ fn discovers_devices_tree_devfreq_when_class_is_absent() {
     write(&ufs.join("cur_freq"), "100000000\n");
     write(
         &ufs.join("device/of_node/compatible"),
-        b"qcom,sm8550-ufshc\0",
+        b"vendor,test-ufshc\0",
     );
 
     let environment = LinuxEnvironment::new(SystemRoots::below(root)).unwrap();
@@ -170,7 +170,7 @@ fn discovers_devices_tree_devfreq_when_class_is_absent() {
     );
     assert_eq!(
         discovery.capabilities.devfreq_targets[0].compatible,
-        ["qcom,sm8550-ufshc"]
+        ["vendor,test-ufshc"]
     );
     assert_eq!(
         discovery.capabilities.devfreq_targets[1].compatible,
@@ -181,6 +181,29 @@ fn discovers_devices_tree_devfreq_when_class_is_absent() {
             .frequency_targets
             .values()
             .all(|paths| paths.minimum.starts_with("/sys/devices/"))
+    );
+}
+
+#[test]
+fn reports_compatible_values_without_a_chip_registry() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    create_roots(root);
+    write(
+        &root.join("sys/firmware/devicetree/base/compatible"),
+        b"vendor,next-soc-gpu\0vendor,next-soc\0vendor,test-board\0",
+    );
+
+    let environment = LinuxEnvironment::new(SystemRoots::below(root)).unwrap();
+    let discovery = environment.discover().unwrap();
+
+    assert_eq!(
+        discovery.capabilities.compatible,
+        [
+            "vendor,next-soc-gpu",
+            "vendor,next-soc",
+            "vendor,test-board"
+        ]
     );
 }
 

@@ -1,6 +1,7 @@
 //! Read-only hardware and operating-system capability probe.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsString,
     io::{self, Write},
@@ -9,8 +10,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use uperf_core::{
-    CONFIG_SCHEMA_VERSION, CpuPolicyConfig, DevfreqTargetConfig, DeviceConfig, DeviceMatch, Hertz,
-    Validate,
+    CONFIG_SCHEMA_VERSION, CpuPolicyConfig, CpuSet, DevfreqTargetConfig, DeviceConfig, DeviceMatch,
+    Hertz, Validate,
 };
 use uperf_linux::{LinuxEnvironment, SystemRoots};
 
@@ -158,13 +159,29 @@ fn device_draft(capabilities: &uperf_core::DeviceCapabilities) -> Result<DeviceC
             sensor_failure_cap_hz: Some(target.limits.min),
         })
         .collect();
+    let all_cpus = capabilities
+        .cpu_policies
+        .iter()
+        .flat_map(|policy| policy.cpus.iter().copied())
+        .collect::<CpuSet>();
+    let mut cpu_groups = BTreeMap::from([
+        ("all".to_owned(), all_cpus.clone()),
+        ("balanced".to_owned(), all_cpus),
+    ]);
+    if let Some(first) = capabilities.cpu_policies.first() {
+        cpu_groups.insert("efficient".to_owned(), first.cpus.clone());
+    }
+    if let Some(last) = capabilities.cpu_policies.last() {
+        cpu_groups.insert("performance".to_owned(), last.cpus.clone());
+    }
     let draft = DeviceConfig {
         schema_version: CONFIG_SCHEMA_VERSION,
-        device_id: capabilities
-            .matched_profile
-            .clone()
-            .unwrap_or_else(|| "draft-unidentified".to_owned()),
+        device_id: capabilities.compatible.first().map_or_else(
+            || "draft-unidentified".to_owned(),
+            |id| format!("draft-{id}"),
+        ),
         device_match,
+        cpu_groups,
         cpu_policies,
         devfreq_targets,
         // Trust and thermal thresholds require administrator review. An empty

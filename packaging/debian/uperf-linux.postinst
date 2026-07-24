@@ -3,7 +3,7 @@ set -e
 
 if [ "$1" = "configure" ]; then
     echo "uperf-linux was not enabled or started by this package operation."
-    echo "Review /etc/uperf-linux and validate the complete live configuration"
+    echo "Review the matched device profile and /etc/uperf-linux policy, then validate"
     echo "as described in /usr/share/doc/uperf-linux/README.Debian before enabling it."
 fi
 

@@ -32,6 +32,7 @@ use zbus::Connection;
 #[derive(Debug)]
 struct Options {
     config_dir: PathBuf,
+    device_profile_dir: PathBuf,
     state_dir: PathBuf,
     runtime_dir: PathBuf,
     fixture_root: Option<PathBuf>,
@@ -57,6 +58,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             config_dir: PathBuf::from("/etc/uperf-linux"),
+            device_profile_dir: PathBuf::from("/usr/share/uperf-linux/devices"),
             state_dir: PathBuf::from("/var/lib/uperf-linux"),
             runtime_dir: PathBuf::from("/run/uperf-linux"),
             fixture_root: None,
@@ -87,7 +89,8 @@ async fn run(options: Result<Options>) -> Result<()> {
             .with_context(|| format!("open fixture environment {}", root.display()))?,
         None => LinuxEnvironment::host().context("open Linux environment")?,
     });
-    let paths = ConfigurationPaths::below(&options.config_dir, &options.state_dir);
+    let paths = ConfigurationPaths::below(&options.config_dir, &options.state_dir)
+        .with_device_profiles(&options.device_profile_dir);
     let mutation_setup = if options.read_only {
         None
     } else {
@@ -145,6 +148,10 @@ async fn run(options: Result<Options>) -> Result<()> {
     // daemon from this boot.
     let configuration =
         ResolvedConfiguration::load(&paths, &discovery).context("load configuration generation")?;
+    eprintln!(
+        "uperf-linux: selected device profile {}",
+        configuration.device.device_id
+    );
     let actuator = if let Some(setup) = mutation_setup {
         let sysfs = Arc::new(
             environment
@@ -568,6 +575,9 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options>
             "--config-dir" => {
                 options.config_dir = next_path(&mut arguments, "--config-dir")?;
             }
+            "--device-profile-dir" => {
+                options.device_profile_dir = next_path(&mut arguments, "--device-profile-dir")?;
+            }
             "--state-dir" => {
                 options.state_dir = next_path(&mut arguments, "--state-dir")?;
             }
@@ -585,7 +595,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options>
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: uperf-linux [--config-dir PATH] [--state-dir PATH] \\\n+                     [--runtime-dir PATH] [--read-only] [--session] [--fixture-root PATH]"
+                    "Usage: uperf-linux [--config-dir PATH] [--device-profile-dir PATH] \\\n+                     [--state-dir PATH] [--runtime-dir PATH] [--read-only] \\\n+                     [--session] [--fixture-root PATH]"
                 );
                 std::process::exit(0);
             }
@@ -685,7 +695,6 @@ mod tests {
             capabilities: DeviceCapabilities {
                 device_name: Some("test-board".to_owned()),
                 compatible: vec!["vendor,test-board".to_owned()],
-                matched_profile: None,
                 cpu_policies: vec![CpuPolicyCapability {
                     id: discovered_id.clone(),
                     policy_name: "policy-test".to_owned(),
@@ -748,7 +757,6 @@ mod tests {
             capabilities: DeviceCapabilities {
                 device_name: Some("test-board".to_owned()),
                 compatible: vec!["vendor,test-board".to_owned()],
-                matched_profile: Some("test".to_owned()),
                 cpu_policies: Vec::new(),
                 devfreq_targets: Vec::new(),
                 thermal_zones: vec![ThermalZoneCapability {

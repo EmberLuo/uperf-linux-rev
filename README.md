@@ -59,7 +59,7 @@ The daemon reads a strict JSON Schema v2 bundle:
 
 | Path | Ownership and role |
 | --- | --- |
-| `/etc/uperf-linux/device.json` | root-reviewed device selectors and safety limits |
+| `/etc/uperf-linux/device.json` | optional root-reviewed override for the matched shared profile |
 | `/etc/uperf-linux/policy.json` | root-reviewed profiles, hints, load, thermal, and scheduler rules |
 | `/var/lib/uperf-linux/apps.json` | daemon-managed global application rules; missing means an empty set |
 | `/run/uperf-linux/recovery.json` | current-boot transaction journal; not configuration |
@@ -71,9 +71,18 @@ The package also installs immutable templates in
 validator additionally checks ranges, duplicate IDs, regexes, references,
 CPU masks, and unsafe paths.
 
-The bundled `device.json` is for SM8550. On another system, run the probe and
-create a reviewed device profile before starting the daemon. Do not weaken the
-device-match check merely to make startup succeed.
+When the optional override is absent, the daemon parses every JSON file in
+`/usr/share/uperf-linux/devices`, selects the single profile whose
+`device_match` exactly matches the discovered device-tree compatible/model,
+and rejects zero or ambiguous matches. Fresh packages do not create a
+device-specific `/etc` file. An older retained `/etc/uperf-linux/device.json`
+remains an explicit administrator override and takes precedence.
+
+Each profile declares logical `cpu_groups`. Once a profile is the unique exact
+identity match, every topology, frequency, devfreq, thermal, and cross-policy
+selector must resolve against the live machine before the normal journaled
+actuator is constructed. Adding a SoC therefore requires one device JSON plus
+its tests or probe evidence, not a Rust or packaging edit.
 
 ## Read-only discovery
 
@@ -115,10 +124,12 @@ cross sysroots are distribution-specific.
 Validate one file or a directory containing the complete three-file bundle:
 
 ```bash
-cargo run --locked --package uperfctl -- config validate config/devices/sm8550.json
+for profile in config/devices/*.json; do
+  cargo run --locked --package uperfctl -- config validate "$profile"
+done
 
 install -d target/config-check
-install -m 0644 config/devices/sm8550.json target/config-check/device.json
+install -m 0644 config/devices/PROFILE.json target/config-check/device.json
 install -m 0644 config/policy.json target/config-check/policy.json
 install -m 0644 config/apps.json target/config-check/apps.json
 cargo run --locked --package uperfctl -- config validate target/config-check
@@ -171,9 +182,8 @@ without accepting client-supplied identity fields. Global mode changes use the
 use the `admin` action.
 
 `GetCapabilities.features` contains exact identifiers, not searchable tags;
-clients must test whole values. In particular, `device-profile-sm8550` means
-that the bundled SM8550 device data is loaded, not that the current
-machine/kernel combination is certified.
+clients must test whole values. Device support is reported with the generic
+`device-profile` feature; chip names are data, not API feature constants.
 
 Persistent application rules in D-Bus v1 are administrator-owned global
 rules. They contain an optional exact `executable` path (the full

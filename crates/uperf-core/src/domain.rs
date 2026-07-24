@@ -476,10 +476,6 @@ pub struct DeviceCapabilities {
     /// Device-tree compatible strings in most-specific-first order.
     #[serde(default)]
     pub compatible: Vec<String>,
-    /// Known device profile suggested by identity discovery. This is not a
-    /// hardware-certification result.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matched_profile: Option<String>,
     #[serde(default)]
     pub cpu_policies: Vec<CpuPolicyCapability>,
     #[serde(default)]

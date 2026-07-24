@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -20,7 +20,8 @@ use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 /// Files participating in one configuration generation.
 #[derive(Clone, Debug)]
 pub struct ConfigurationPaths {
-    pub device: PathBuf,
+    pub device_override: PathBuf,
+    pub device_profiles: PathBuf,
     pub policy: PathBuf,
     pub apps: PathBuf,
 }
@@ -29,10 +30,17 @@ impl ConfigurationPaths {
     #[must_use]
     pub fn below(config_directory: impl AsRef<Path>, state_directory: impl AsRef<Path>) -> Self {
         Self {
-            device: config_directory.as_ref().join("device.json"),
+            device_override: config_directory.as_ref().join("device.json"),
+            device_profiles: config_directory.as_ref().join("devices"),
             policy: config_directory.as_ref().join("policy.json"),
             apps: state_directory.as_ref().join("apps.json"),
         }
+    }
+
+    #[must_use]
+    pub fn with_device_profiles(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.device_profiles = directory.into();
+        self
     }
 }
 
@@ -116,7 +124,7 @@ impl ResolvedConfiguration {
     /// fails syntactic or semantic validation, or a configured resource cannot
     /// be resolved uniquely against the discovered hardware.
     pub fn load(paths: &ConfigurationPaths, discovery: &LinuxDiscovery) -> Result<Self> {
-        let device_json = read_required(&paths.device)?;
+        let device = load_device_config(paths, discovery)?;
         let policy_json = read_required(&paths.policy)?;
         let apps_json = match File::open(&paths.apps) {
             Ok(file) => read_open_config(file, &paths.apps)?,
@@ -128,21 +136,19 @@ impl ResolvedConfiguration {
             }
         };
 
-        let device = DeviceConfig::from_json(&device_json)
-            .with_context(|| format!("validate {}", paths.device.display()))?;
-        let policy = PolicyConfig::from_json(&policy_json)
+        let configured_policy = PolicyConfig::from_json(&policy_json)
             .with_context(|| format!("validate {}", paths.policy.display()))?;
         let apps = AppsConfig::from_json(&apps_json)
             .with_context(|| format!("validate {}", paths.apps.display()))?;
-        ConfigBundle {
+        let bundle = ConfigBundle {
             device: device.clone(),
-            policy: policy.clone(),
-        }
-        .validate_cross_references()
-        .context("validate references across device, policy, and application rules")?;
+            policy: configured_policy,
+        };
+        let policy = bundle
+            .materialize_cpu_groups()
+            .context("validate references across device and policy configuration")?;
         let policy_engine = PolicyEngine::new(policy.clone())?;
         let app_rule_engine = AppRuleEngine::new(&apps)?;
-        validate_device_match(&device, discovery)?;
         let (targets, warnings) = resolve_targets(&device, discovery)?;
         let thermal_zones = resolve_thermal_zones(&device, discovery)?;
 
@@ -231,9 +237,7 @@ impl ResolvedConfiguration {
         if self.policy.input.enabled {
             features.push(feature::EVDEV_SCENES.to_owned());
         }
-        if self.device.device_id == "qcom-sm8550" {
-            features.push(feature::DEVICE_PROFILE_SM8550.to_owned());
-        }
+        features.push(feature::DEVICE_PROFILE.to_owned());
         Capabilities {
             api_version: ApiVersion::CURRENT,
             features,
@@ -266,6 +270,85 @@ impl ResolvedConfiguration {
                 .collect(),
             config_schema_min: CONFIG_SCHEMA_VERSION,
             config_schema_max: CONFIG_SCHEMA_VERSION,
+        }
+    }
+}
+
+fn load_device_config(
+    paths: &ConfigurationPaths,
+    discovery: &LinuxDiscovery,
+) -> Result<DeviceConfig> {
+    match File::open(&paths.device_override) {
+        Ok(file) => {
+            let json = read_open_config(file, &paths.device_override)?;
+            let device = DeviceConfig::from_json(&json)
+                .with_context(|| format!("validate {}", paths.device_override.display()))?;
+            validate_device_match(&device, discovery)?;
+            Ok(device)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            load_catalog_device(paths, discovery)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read {}", paths.device_override.display()))
+        }
+    }
+}
+
+fn load_catalog_device(
+    paths: &ConfigurationPaths,
+    discovery: &LinuxDiscovery,
+) -> Result<DeviceConfig> {
+    let entries = fs::read_dir(&paths.device_profiles).with_context(|| {
+        format!(
+            "read device profile directory {}",
+            paths.device_profiles.display()
+        )
+    })?;
+    let mut profile_paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| {
+                format!(
+                    "read entry in device profile directory {}",
+                    paths.device_profiles.display()
+                )
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            profile_paths.push(path);
+        }
+    }
+    profile_paths.sort();
+
+    let mut matches = Vec::new();
+    for path in profile_paths {
+        let json = read_required(&path)?;
+        let device = DeviceConfig::from_json(&json)
+            .with_context(|| format!("validate shared device profile {}", path.display()))?;
+        if device_matches(&device, discovery) {
+            matches.push((device, path));
+        }
+    }
+
+    match matches.as_mut_slice() {
+        [(device, _)] => Ok(device.clone()),
+        [] => bail!(
+            "no device profile in {} exactly matches compatible values {:?} and model {:?}",
+            paths.device_profiles.display(),
+            discovery.capabilities.compatible,
+            discovery.capabilities.device_name
+        ),
+        _ => {
+            let descriptions = matches
+                .iter()
+                .map(|(device, path)| format!("{} ({})", device.device_id, path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("multiple shared device profiles match discovered hardware: {descriptions}")
         }
     }
 }
@@ -318,6 +401,21 @@ fn validate_device_match(device: &DeviceConfig, discovery: &LinuxDiscovery) -> R
         );
     }
     Ok(())
+}
+
+fn device_matches(device: &DeviceConfig, discovery: &LinuxDiscovery) -> bool {
+    let Some(selector) = &device.device_match else {
+        return false;
+    };
+    selector.compatible.as_ref().is_none_or(|compatible| {
+        discovery
+            .capabilities
+            .compatible
+            .iter()
+            .any(|value| value == compatible)
+    }) && selector.product_name.as_ref().is_none_or(|product_name| {
+        discovery.capabilities.device_name.as_deref() == Some(product_name.as_str())
+    })
 }
 
 #[allow(
@@ -646,13 +744,16 @@ mod tests {
 
     use tempfile::tempdir;
     use uperf_core::{
-        AppsConfig, ConfigBundle, CpuId, CpuPolicyCapability, CpuSet, DevfreqCapability,
-        DeviceCapabilities, DeviceConfig, FrequencyLimits, Hertz, MAX_CONFIG_FILE_BYTES,
-        PolicyConfig, TargetId, ThermalZoneCapability,
+        AppsConfig, ConfigBundle, CpuId, CpuPolicyCapability, CpuSet, DeviceCapabilities,
+        DeviceConfig, FrequencyLimits, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig, TargetId,
+        ThermalZoneCapability,
     };
     use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
-    use super::{ConfigurationPaths, ResolvedConfiguration, read_required, resolve_thermal_zones};
+    use super::{
+        ConfigurationPaths, ResolvedConfiguration, load_device_config, read_required,
+        resolve_thermal_zones,
+    };
 
     #[test]
     fn configuration_reader_rejects_oversized_files() {
@@ -664,24 +765,108 @@ mod tests {
     }
 
     #[test]
-    fn bundled_sm8550_configuration_is_cross_file_valid() {
-        let device = DeviceConfig::from_json(include_str!("../../../config/devices/sm8550.json"))
-            .expect("device configuration");
+    fn every_bundled_device_configuration_is_cross_file_valid() {
         let policy = PolicyConfig::from_json(include_str!("../../../config/policy.json"))
             .expect("policy configuration");
         let _apps = AppsConfig::from_json(include_str!("../../../config/apps.json"))
             .expect("apps configuration");
-        ConfigBundle { device, policy }
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/devices");
+        let mut count = 0;
+        for entry in fs::read_dir(directory).expect("bundled device directory") {
+            let path = entry.expect("device directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let json = fs::read_to_string(&path).expect("read bundled device configuration");
+            let device = DeviceConfig::from_json(&json).unwrap_or_else(|error| {
+                panic!(
+                    "validate bundled device configuration {}: {error}",
+                    path.display()
+                )
+            });
+            ConfigBundle {
+                device,
+                policy: policy.clone(),
+            }
             .validate_cross_references()
-            .expect("cross-file configuration");
+            .unwrap_or_else(|error| panic!("validate {} against policy: {error}", path.display()));
+            count += 1;
+        }
+        assert!(count > 0, "at least one bundled device profile is required");
     }
 
     #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the complete SM8550 fixture is intentionally kept in one test so its cross-resource relationships remain visible"
-    )]
-    fn bundled_sm8550_configuration_resolves_against_its_linux_fixture() {
+    fn catalog_selects_one_exact_match_and_override_takes_precedence() {
+        let temporary = tempdir().expect("temporary root");
+        let profiles = temporary.path().join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            profiles.join("soc-a.json"),
+            synthetic_device_json("vendor-soc-a", "vendor,soc-a"),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("soc-b.json"),
+            synthetic_device_json("vendor-soc-b", "vendor,soc-b"),
+        )
+        .unwrap();
+        let paths =
+            ConfigurationPaths::below(temporary.path().join("etc"), temporary.path().join("state"))
+                .with_device_profiles(&profiles);
+        let discovery = identity_discovery(&["vendor,board", "vendor,soc-b"]);
+
+        let selected = load_device_config(&paths, &discovery).expect("one catalog match");
+        assert_eq!(selected.device_id, "vendor-soc-b");
+
+        fs::create_dir_all(paths.device_override.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.device_override,
+            synthetic_device_json("vendor-soc-b", "vendor,soc-b"),
+        )
+        .unwrap();
+        let selected = load_device_config(&paths, &discovery).expect("administrator override");
+        assert_eq!(selected.device_id, "vendor-soc-b");
+    }
+
+    #[test]
+    fn catalog_rejects_ambiguous_and_substring_matches() {
+        let temporary = tempdir().expect("temporary root");
+        let profiles = temporary.path().join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            profiles.join("soc.json"),
+            synthetic_device_json("vendor-soc", "vendor,soc"),
+        )
+        .unwrap();
+        let paths =
+            ConfigurationPaths::below(temporary.path().join("etc"), temporary.path().join("state"))
+                .with_device_profiles(&profiles);
+
+        let substring_only = identity_discovery(&["vendor,soc-gpu"]);
+        let error = load_device_config(&paths, &substring_only)
+            .expect_err("compatible matching must be exact");
+        assert!(error.to_string().contains("no device profile"));
+
+        let mut duplicate: serde_json::Value =
+            serde_json::from_slice(&synthetic_device_json("vendor-soc", "vendor,soc")).unwrap();
+        duplicate["device_id"] = serde_json::Value::from("vendor-soc-duplicate");
+        fs::write(
+            profiles.join("duplicate.json"),
+            serde_json::to_vec(&duplicate).unwrap(),
+        )
+        .unwrap();
+        let discovery = identity_discovery(&["vendor,soc"]);
+        let error =
+            load_device_config(&paths, &discovery).expect_err("ambiguous profiles must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple shared device profiles")
+        );
+    }
+
+    #[test]
+    fn device_configuration_resolves_against_a_linux_fixture() {
         let temporary = tempdir().expect("temporary root");
         let config_directory = temporary.path().join("etc");
         let state_directory = temporary.path().join("state");
@@ -689,7 +874,7 @@ mod tests {
         fs::create_dir_all(&state_directory).unwrap();
         fs::write(
             config_directory.join("device.json"),
-            include_bytes!("../../../config/devices/sm8550.json"),
+            synthetic_device_json("vendor-test-soc", "vendor,test-soc"),
         )
         .unwrap();
         fs::write(
@@ -703,131 +888,62 @@ mod tests {
         )
         .unwrap();
 
-        let cpu_specs = [
-            (
-                "cpu.policy0",
-                [0, 1, 2].as_slice(),
-                [307_200_000, 1_344_000_000, 1_785_600_000, 2_016_000_000].as_slice(),
-            ),
-            (
-                "cpu.policy3",
-                [3, 4, 5, 6].as_slice(),
-                [499_200_000, 1_920_000_000, 2_457_600_000, 2_803_200_000].as_slice(),
-            ),
-            (
-                "cpu.policy7",
-                [7].as_slice(),
-                [595_200_000, 2_227_200_000, 2_726_400_000, 2_956_800_000].as_slice(),
-            ),
-        ];
-        let mut cpu_policies = Vec::new();
+        let id = TargetId::new("cpu.policy0").unwrap();
+        let limits = FrequencyLimits {
+            min: Hertz::new(1_000),
+            max: Hertz::new(4_000),
+        };
+        let cpu_policies = vec![CpuPolicyCapability {
+            id: id.clone(),
+            policy_name: "policy0".to_owned(),
+            cpus: CpuSet::from_ids([CpuId::new(0)]),
+            limits,
+            available_frequencies: vec![
+                Hertz::new(1_000),
+                Hertz::new(2_000),
+                Hertz::new(3_000),
+                Hertz::new(4_000),
+            ],
+            governor: Some("schedutil".to_owned()),
+        }];
         let mut frequency_targets = BTreeMap::new();
-        for (name, cpus, frequencies) in cpu_specs {
-            let id = TargetId::new(name).unwrap();
-            let available = frequencies
-                .iter()
-                .copied()
-                .map(Hertz::new)
-                .collect::<Vec<_>>();
-            let limits = FrequencyLimits {
-                min: available[0],
-                max: *available.last().unwrap(),
-            };
-            cpu_policies.push(CpuPolicyCapability {
-                id: id.clone(),
-                policy_name: name.trim_start_matches("cpu.").to_owned(),
-                cpus: CpuSet::from_ids(cpus.iter().copied().map(CpuId::new)),
-                limits,
-                available_frequencies: available,
-                governor: Some("schedutil".to_owned()),
-            });
-            let directory = PathBuf::from("/sys/devices/system/cpu/cpufreq")
-                .join(name.trim_start_matches("cpu."));
-            frequency_targets.insert(
-                id.clone(),
-                FrequencyTargetPaths {
-                    id,
-                    minimum: directory.join("scaling_min_freq"),
-                    maximum: directory.join("scaling_max_freq"),
-                    current: directory.join("scaling_cur_freq"),
-                    hertz_per_unit: 1_000,
-                },
-            );
-        }
-
-        let gpu_id = TargetId::new("devfreq.3d00000.gpu").unwrap();
         frequency_targets.insert(
-            gpu_id.clone(),
+            id.clone(),
             FrequencyTargetPaths {
-                id: gpu_id.clone(),
-                minimum: PathBuf::from("/sys/class/devfreq/3d00000.gpu/min_freq"),
-                maximum: PathBuf::from("/sys/class/devfreq/3d00000.gpu/max_freq"),
-                current: PathBuf::from("/sys/class/devfreq/3d00000.gpu/cur_freq"),
+                id,
+                minimum: PathBuf::from("/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"),
+                maximum: PathBuf::from("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"),
+                current: PathBuf::from("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq"),
                 hertz_per_unit: 1,
             },
         );
-        let thermal_types = [
-            "cpuss0-thermal",
-            "cpuss1-thermal",
-            "cpuss2-thermal",
-            "cpuss3-thermal",
-            "gpuss-0-thermal",
-        ];
-        let thermal_zones = thermal_types
-            .iter()
-            .enumerate()
-            .map(|(index, zone_type)| ThermalZoneCapability {
-                id: format!("thermal_zone{index}"),
-                zone_type: (*zone_type).to_owned(),
-                current: None,
-            })
-            .collect::<Vec<_>>();
-        let thermal_zone_paths = thermal_zones
-            .iter()
-            .map(|zone| {
-                (
-                    zone.id.clone(),
-                    PathBuf::from("/sys/class/thermal").join(&zone.id),
-                )
-            })
-            .collect();
         let discovery = LinuxDiscovery {
             capabilities: DeviceCapabilities {
-                device_name: Some("SM8550 fixture".to_owned()),
-                compatible: vec!["qcom,sm8550".to_owned()],
-                matched_profile: Some("qcom-sm8550".to_owned()),
+                device_name: Some("test SoC fixture".to_owned()),
+                compatible: vec!["vendor,test-soc".to_owned()],
                 cpu_policies,
-                devfreq_targets: vec![DevfreqCapability {
-                    id: gpu_id,
-                    // The bundled selector intentionally uses the stable entry
-                    // name while discovery may expose a different driver name.
-                    device_name: "kgsl-3d0".to_owned(),
-                    compatible: vec!["qcom,adreno".to_owned()],
-                    limits: FrequencyLimits {
-                        min: Hertz::new(220_000_000),
-                        max: Hertz::new(680_000_000),
-                    },
-                    available_frequencies: vec![
-                        Hertz::new(220_000_000),
-                        Hertz::new(295_000_000),
-                        Hertz::new(680_000_000),
-                    ],
-                    governor: Some("simple_ondemand".to_owned()),
+                devfreq_targets: Vec::new(),
+                thermal_zones: vec![ThermalZoneCapability {
+                    id: "thermal_zone0".to_owned(),
+                    zone_type: "soc-thermal".to_owned(),
+                    current: None,
                 }],
-                thermal_zones,
                 input_devices: Vec::new(),
             },
             frequency_targets,
-            thermal_zone_paths,
+            thermal_zone_paths: BTreeMap::from([(
+                "thermal_zone0".to_owned(),
+                PathBuf::from("/sys/class/thermal/thermal_zone0"),
+            )]),
             warnings: Vec::new(),
         };
         let resolved = ResolvedConfiguration::load(
             &ConfigurationPaths::below(&config_directory, &state_directory),
             &discovery,
         )
-        .expect("bundled SM8550 configuration must resolve");
-        assert_eq!(resolved.targets.len(), 4);
-        assert_eq!(resolved.thermal_zones.len(), 5);
+        .expect("device configuration must resolve");
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.thermal_zones.len(), 1);
     }
 
     #[test]
@@ -861,7 +977,6 @@ mod tests {
             capabilities: DeviceCapabilities {
                 device_name: None,
                 compatible: Vec::new(),
-                matched_profile: None,
                 cpu_policies: Vec::new(),
                 devfreq_targets: Vec::new(),
                 thermal_zones: vec![ThermalZoneCapability {
@@ -893,5 +1008,56 @@ mod tests {
             resolve_thermal_zones(&device, &discovery).is_err(),
             "an exact path must not bypass the trusted thermal-zone type"
         );
+    }
+
+    fn identity_discovery(compatible: &[&str]) -> LinuxDiscovery {
+        LinuxDiscovery {
+            capabilities: DeviceCapabilities {
+                device_name: Some("test board".to_owned()),
+                compatible: compatible.iter().map(|value| (*value).to_owned()).collect(),
+                cpu_policies: Vec::new(),
+                devfreq_targets: Vec::new(),
+                thermal_zones: Vec::new(),
+                input_devices: Vec::new(),
+            },
+            frequency_targets: BTreeMap::new(),
+            thermal_zone_paths: BTreeMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn synthetic_device_json(device_id: &str, compatible: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "device_id": device_id,
+            "device_match": { "compatible": compatible },
+            "cpu_groups": {
+                "all": [0],
+                "balanced": [0],
+                "efficient": [0],
+                "performance": [0]
+            },
+            "cpu_policies": [{
+                "id": "cpu.main",
+                "related_cpus": [0],
+                "floor_hz": 1_000,
+                "reference_hz": 2_000,
+                "efficient_cap_hz": 3_000,
+                "admin_cap_hz": 4_000,
+                "critical_cap_hz": 1_000,
+                "sensor_failure_cap_hz": 1_000
+            }],
+            "thermal_zones": [{
+                "id": "soc",
+                "zone_type": "soc-thermal",
+                "warning": 70_000,
+                "throttled": 80_000,
+                "critical": 90_000,
+                "hysteresis": 5_000,
+                "dwell_ms": 500,
+                "stale_after_ms": 1_000
+            }]
+        }))
+        .expect("serialize synthetic device configuration")
     }
 }

@@ -4,6 +4,12 @@
   "device_match": {
     "compatible": "qcom,sm8550"
   },
+  "cpu_groups": {
+    "all": [0, 1, 2, 3, 4, 5, 6, 7],
+    "balanced": [0, 1, 2, 3, 4, 5, 6],
+    "efficient": [0, 1, 2],
+    "performance": [3, 4, 5, 6, 7]
+  },
   "cpu_policies": [
     {
       "id": "cpu.efficiency",

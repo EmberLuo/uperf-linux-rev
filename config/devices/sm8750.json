@@ -1,0 +1,91 @@
+{
+  "schema_version": 2,
+  "device_id": "qcom-sm8750",
+  "device_match": {
+    "compatible": "qcom,sm8750"
+  },
+  "cpu_groups": {
+    "all": [0, 1, 2, 3, 4, 5, 6, 7],
+    "balanced": [0, 1, 2, 3, 4, 5, 6],
+    "efficient": [0, 1, 2, 3, 4, 5],
+    "performance": [6, 7]
+  },
+  "cpu_policies": [
+    {
+      "id": "cpu.performance",
+      "related_cpus": [0, 1, 2, 3, 4, 5],
+      "floor_hz": 500000000,
+      "reference_hz": 1800000000,
+      "efficient_cap_hz": 2800000000,
+      "admin_cap_hz": 3530000000
+    },
+    {
+      "id": "cpu.prime",
+      "related_cpus": [6, 7],
+      "floor_hz": 600000000,
+      "reference_hz": 2200000000,
+      "efficient_cap_hz": 3200000000,
+      "admin_cap_hz": 4320000000
+    }
+  ],
+  "devfreq_targets": [
+    {
+      "id": "gpu",
+      "device_name": "3d00000.gpu",
+      "manual_only": true,
+      "admin_cap_hz": 900000000
+    }
+  ],
+  "thermal_zones": [
+    {
+      "id": "cpu-cluster-0-a",
+      "zone_type": "cpuss-0-0",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-cluster-0-b",
+      "zone_type": "cpuss-0-1",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-cluster-1-a",
+      "zone_type": "cpuss-1-0",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "cpu-cluster-1-b",
+      "zone_type": "cpuss-1-1",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    },
+    {
+      "id": "gpu-soc",
+      "zone_type": "gpuss-0",
+      "warning": 75000,
+      "throttled": 85000,
+      "critical": 95000,
+      "hysteresis": 5000,
+      "dwell_ms": 500,
+      "stale_after_ms": 1000
+    }
+  ]
+}

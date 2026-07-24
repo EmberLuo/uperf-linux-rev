@@ -119,8 +119,8 @@
     "task_profiles": [
       {
         "id": "background",
+        "affinity_group": "efficient",
         "plan": {
-          "affinity": [0, 1, 2],
           "nice": 10,
           "scheduling_class": "batch",
           "uclamp": {
@@ -131,8 +131,8 @@
       },
       {
         "id": "balanced",
+        "affinity_group": "balanced",
         "plan": {
-          "affinity": [0, 1, 2, 3, 4, 5, 6],
           "nice": 0,
           "scheduling_class": "other",
           "uclamp": {
@@ -143,8 +143,8 @@
       },
       {
         "id": "latency",
+        "affinity_group": "performance",
         "plan": {
-          "affinity": [3, 4, 5, 6, 7],
           "nice": -5,
           "scheduling_class": "other",
           "uclamp": {
@@ -158,12 +158,12 @@
     "cgroup_classes": [
       {
         "id": "foreground",
-        "allowed_cpus": [0, 1, 2, 3, 4, 5, 6, 7],
+        "allowed_cpu_group": "all",
         "cpu_weight": 500
       },
       {
         "id": "background",
-        "allowed_cpus": [0, 1, 2, 3, 4, 5, 6],
+        "allowed_cpu_group": "balanced",
         "cpu_weight": 100
       }
     ]

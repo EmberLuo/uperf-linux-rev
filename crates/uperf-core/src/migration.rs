@@ -99,6 +99,7 @@ pub fn migrate_c_v1(root: &Value) -> Result<MigrationResult, MigrationError> {
         schema_version: CONFIG_SCHEMA_VERSION,
         device_id,
         device_match: None,
+        cpu_groups: BTreeMap::new(),
         cpu_policies,
         devfreq_targets,
         thermal_zones: Vec::new(),
@@ -524,7 +525,7 @@ mod tests {
 
     fn c_config() -> Value {
         serde_json::json!({
-            "meta": { "name": "sm8550 migrated", "schemaVersion": 1 },
+            "meta": { "name": "test SoC migrated", "schemaVersion": 1 },
             "modules": {
                 "switcher": {
                     "perapp": "/etc/uperf-linux/perapp_powermode",

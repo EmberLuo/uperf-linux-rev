@@ -25,10 +25,9 @@ override_dh_auto_install:
 		debian/uperf-linux/usr/share/dbus-1/system.d/org.uperflinux.Daemon1.conf
 	install -Dm0644 packaging/polkit/org.uperflinux.policy \
 		debian/uperf-linux/usr/share/polkit-1/actions/org.uperflinux.policy
-	install -Dm0644 config/devices/sm8550.json \
-		debian/uperf-linux/usr/share/uperf-linux/devices/sm8550.json
-	install -Dm0644 config/devices/sm8550.json \
-		debian/uperf-linux/etc/uperf-linux/device.json
+	install -d debian/uperf-linux/usr/share/uperf-linux/devices
+	install -m0644 config/devices/*.json \
+		debian/uperf-linux/usr/share/uperf-linux/devices/
 	install -Dm0644 config/policy.json \
 		debian/uperf-linux/usr/share/uperf-linux/defaults/policy.json
 	install -Dm0644 config/policy.json \

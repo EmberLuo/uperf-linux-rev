@@ -67,8 +67,15 @@
     "CgroupClassConfig": {
       "type": "object",
       "properties": {
+        "allowed_cpu_group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "allowed_cpus": {
-          "$ref": "#/$defs/CpuSet"
+          "$ref": "#/$defs/CpuSet",
+          "default": []
         },
         "cpu_weight": {
           "type": "integer",
@@ -83,7 +90,6 @@
       "additionalProperties": false,
       "required": [
         "id",
-        "allowed_cpus",
         "cpu_weight"
       ]
     },
@@ -399,6 +405,12 @@
     "TaskProfileConfig": {
       "type": "object",
       "properties": {
+        "affinity_group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },

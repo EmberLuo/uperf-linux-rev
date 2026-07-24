@@ -68,8 +68,11 @@ jobs:
           test -x debian/uperf-linux-gui/usr/bin/uperfctl
           test -x debian/uperf-linux-gui/usr/bin/uperf-probe
           test -x debian/uperf-linux-gui/usr/bin/uperf-gui
-          test -f debian/uperf-linux/etc/uperf-linux/device.json
-          test -f debian/uperf-linux-gui/etc/uperf-linux/device.json
+          for profile in config/devices/*.json; do
+            name="$(basename "${profile}")"
+            cmp "${profile}" "debian/uperf-linux/usr/share/uperf-linux/devices/${name}"
+            cmp "${profile}" "debian/uperf-linux-gui/usr/share/uperf-linux/devices/${name}"
+          done
           test -f debian/uperf-linux/usr/share/uperf-linux/schema/device-v2.schema.json
           test -f debian/uperf-linux-gui/usr/share/uperf-linux/schema/device-v2.schema.json
           test -f debian/uperf-linux-gui/usr/lib/systemd/system/uperf-linux.service
@@ -77,12 +80,16 @@ jobs:
 
       - name: Validate bundled configuration
         run: |
-          install -d target/config-check
-          install -m 0644 config/devices/sm8550.json target/config-check/device.json
-          install -m 0644 config/policy.json target/config-check/policy.json
-          install -m 0644 config/apps.json target/config-check/apps.json
-          cargo +1.96.0 run --locked --package uperfctl -- \
-            config validate target/config-check
+          for profile in config/devices/*.json; do
+            device="$(basename "${profile}" .json)"
+            check_dir="target/config-check-${device}"
+            install -d "${check_dir}"
+            install -m 0644 "${profile}" "${check_dir}/device.json"
+            install -m 0644 config/policy.json "${check_dir}/policy.json"
+            install -m 0644 config/apps.json "${check_dir}/apps.json"
+            cargo +1.96.0 run --locked --package uperfctl -- \
+              config validate "${check_dir}"
+          done
 
       - name: Validate packaging assets
         run: |

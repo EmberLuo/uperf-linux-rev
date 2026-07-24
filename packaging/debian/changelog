@@ -3,6 +3,10 @@ uperf-linux-rev (0.1.1) unstable; urgency=medium
   * Add PolicyKit-authorized service enable and start controls to the GUI.
   * Add English and Simplified Chinese GUI localization.
   * Ship the GUI edition as a complete alternative to the headless package.
+  * Fix a GUI capability refresh loop after the daemon first connects.
+  * Add an eight-core SM8750 device profile.
+  * Make device support JSON-driven with automatic exact profile matching,
+    logical CPU groups, and directory-wide packaging.
 
  -- uperf-linux contributors <noreply@example.invalid>  Fri, 24 Jul 2026 00:00:00 +0800
 

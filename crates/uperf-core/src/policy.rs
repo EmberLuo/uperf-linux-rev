@@ -1215,6 +1215,7 @@ mod tests {
             task_profiles: vec![
                 TaskProfileConfig {
                     id: "leader".to_owned(),
+                    affinity_group: None,
                     plan: TaskPlan {
                         nice: Some(-2),
                         scheduling_class: Some(SchedulingClass::Other),
@@ -1223,6 +1224,7 @@ mod tests {
                 },
                 TaskProfileConfig {
                     id: "render".to_owned(),
+                    affinity_group: None,
                     plan: TaskPlan {
                         nice: Some(-5),
                         ..TaskPlan::default()
@@ -1230,6 +1232,7 @@ mod tests {
                 },
                 TaskProfileConfig {
                     id: "later".to_owned(),
+                    affinity_group: None,
                     plan: TaskPlan {
                         nice: Some(10),
                         ..TaskPlan::default()
@@ -1271,6 +1274,7 @@ mod tests {
             ],
             cgroup_classes: vec![crate::CgroupClassConfig {
                 id: "foreground".to_owned(),
+                allowed_cpu_group: None,
                 allowed_cpus: CpuSet::from(vec![CpuId(0)]),
                 cpu_weight: 500,
             }],

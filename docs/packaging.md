@@ -6,7 +6,7 @@ The Debian metadata produces two mutually exclusive, self-contained ARM64
 editions:
 
 - `uperf-linux`: daemon, CLI, read-only probe, systemd unit, D-Bus policy,
-  PolicyKit actions, schemas, defaults, and the SM8550 device profile, without
+  PolicyKit actions, schemas, defaults, and all device profiles, without
   desktop dependencies;
 - `uperf-linux-gui`: the same complete core payload plus the GTK4/libadwaita
   client, desktop entry, AppStream metadata, and icon. It does not require the
@@ -51,7 +51,7 @@ Rust source packages when network-free reproducibility is required.
 | `/usr/bin/uperfctl` | D-Bus client and offline migration/validation |
 | `/usr/bin/uperf-probe` | read-only discovery |
 | `/usr/bin/uperf-gui` | GUI edition only |
-| `/etc/uperf-linux/device.json` | conffile initialized from SM8550 profile |
+| `/etc/uperf-linux/device.json` | optional administrator profile override |
 | `/etc/uperf-linux/policy.json` | policy conffile |
 | `/usr/share/uperf-linux/devices/` | immutable device profiles |
 | `/usr/share/uperf-linux/defaults/` | immutable policy and app-rule seeds |
@@ -65,9 +65,9 @@ For both editions, `dh_installsystemd` is called with both `--no-enable` and
 `--no-start`. Installation therefore cannot mutate hardware merely because a
 package was installed. The administrator must:
 
-1. confirm that the device match, policy masks, target OPPs, and trusted
-   thermal zone types agree with `uperf-probe`;
-2. stage `device.json`, `policy.json`, and the current or default `apps.json`
+1. confirm that the automatically matched profile, target OPPs, logical CPU
+   groups, and trusted thermal zone types agree with `uperf-probe`;
+2. stage the matched profile as `device.json`, `policy.json`, and the current or default `apps.json`
    in one directory and run `uperfctl config validate DIRECTORY`;
 3. enable and start `uperf-linux.service` explicitly.
 

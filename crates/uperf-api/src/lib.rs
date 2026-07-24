@@ -54,10 +54,8 @@ pub mod feature {
     pub const SYSTEMD_CGROUP: &str = "systemd-cgroup";
     /// Read-only discovery of running game-like processes and scheduler state.
     pub const RUNNING_WORKLOADS: &str = "running-workloads";
-    /// The loaded device data is the bundled SM8550 profile.
-    ///
-    /// Presence does not mean that this machine passed certification.
-    pub const DEVICE_PROFILE_SM8550: &str = "device-profile-sm8550";
+    /// A device profile was selected from the catalog or administrator override.
+    pub const DEVICE_PROFILE: &str = "device-profile";
 }
 
 /// Oldest configuration schema accepted by this API generation.

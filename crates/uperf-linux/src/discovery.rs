@@ -57,13 +57,12 @@ pub(crate) fn discover(
     let (thermal_zones, thermal_zone_paths) =
         discover_thermal(sys_root, sysfs, clock, &mut warnings)?;
     let input_devices = discover_input(sys_root, sysfs, &mut warnings)?;
-    let (device_name, compatible, matched_profile) = device_identity(sys_root);
+    let (device_name, compatible) = device_identity(sys_root);
 
     Ok(LinuxDiscovery {
         capabilities: DeviceCapabilities {
             device_name,
             compatible,
-            matched_profile,
             cpu_policies,
             devfreq_targets,
             thermal_zones,
@@ -76,12 +75,11 @@ pub(crate) fn discover(
 }
 
 pub(crate) fn discover_device_identity(sys_root: &Path) -> LinuxDiscovery {
-    let (device_name, compatible, matched_profile) = device_identity(sys_root);
+    let (device_name, compatible) = device_identity(sys_root);
     LinuxDiscovery {
         capabilities: DeviceCapabilities {
             device_name,
             compatible,
-            matched_profile,
             cpu_policies: Vec::new(),
             devfreq_targets: Vec::new(),
             thermal_zones: Vec::new(),
@@ -603,7 +601,7 @@ fn discover_input(
     Ok(result)
 }
 
-fn device_identity(sys_root: &Path) -> (Option<String>, Vec<String>, Option<String>) {
+fn device_identity(sys_root: &Path) -> (Option<String>, Vec<String>) {
     let device_tree = sys_root.join("firmware/devicetree/base");
     let device_name = fs::read(device_tree.join("model"))
         .ok()
@@ -615,11 +613,7 @@ fn device_identity(sys_root: &Path) -> (Option<String>, Vec<String>, Option<Stri
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let matched_profile = compatible
-        .iter()
-        .any(|entry| entry == "qcom,sm8550")
-        .then(|| "qcom-sm8550".to_owned());
-    (device_name, compatible, matched_profile)
+    (device_name, compatible)
 }
 
 fn cpu_available_frequencies(

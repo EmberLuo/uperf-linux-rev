@@ -25,7 +25,19 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-install -m 0644 /etc/uperf-linux/device.json "$workdir/device.json"
+device_profile=
+for candidate in /usr/share/uperf-linux/devices/*.json; do
+    if [ -f "$candidate" ]; then
+        device_profile=$candidate
+        break
+    fi
+done
+if [ -z "$device_profile" ]; then
+    echo "package contains no device profile" >&2
+    exit 1
+fi
+
+install -m 0644 "$device_profile" "$workdir/device.json"
 install -m 0644 /etc/uperf-linux/policy.json "$workdir/policy.json"
 install -m 0644 /usr/share/uperf-linux/defaults/apps.json "$workdir/apps.json"
 
