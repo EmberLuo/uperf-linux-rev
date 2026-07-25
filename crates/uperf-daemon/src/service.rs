@@ -273,15 +273,8 @@ impl DaemonService {
         self.runtime.reload().await.map_err(map_runtime_error)
     }
 
-    async fn list_app_rules(
-        &self,
-        #[zbus(connection)] connection: &Connection,
-        #[zbus(header)] header: Header<'_>,
-    ) -> Result<Vec<AppRule>, ServiceError> {
-        self.authorizer
-            .require_action(connection, &header, ADMIN_ACTION)
-            .await?;
-        Ok(self.runtime.snapshot().app_rules.clone())
+    fn list_app_rules(&self) -> Vec<AppRule> {
+        self.runtime.snapshot().app_rules.clone()
     }
 
     async fn set_app_rule(
@@ -662,6 +655,17 @@ mod tests {
         let mut xml = String::new();
         service.introspect_to_writer(&mut xml, 0);
         assert_eq!(xml, include_str!("daemon1-introspection.xml"));
+    }
+
+    #[test]
+    fn listing_app_rules_is_a_read_only_snapshot_without_authorization() {
+        let service = DaemonService::new(
+            RuntimeHandle::snapshot_only(),
+            Authorizer::new(AuthorizationMode::PolicyKit),
+            Arc::new(RunningWorkloadScanner::unavailable()),
+        );
+
+        assert!(service.list_app_rules().is_empty());
     }
 
     fn process(pid: u32, uid: u32, comm: &str, executable: &str) -> ProcessInfo {

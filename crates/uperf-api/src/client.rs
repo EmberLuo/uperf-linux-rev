@@ -77,7 +77,7 @@ pub trait Daemon1 {
     /// Parse, validate, instantiate, and atomically swap configuration.
     fn reload_config(&self) -> zbus::Result<ReloadReport>;
 
-    /// List persistent rules visible to the authorized caller.
+    /// List persistent rules from the daemon's read-only snapshot.
     fn list_app_rules(&self) -> zbus::Result<Vec<AppRule>>;
 
     /// Create or replace one persistent rule.
@@ -313,7 +313,7 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the D-Bus call is unavailable or unauthorized.
+    /// Returns an error when the D-Bus call is unavailable.
     pub async fn app_rules(&self) -> Result<Vec<AppRule>, ClientError> {
         self.proxy()
             .await?

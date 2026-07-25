@@ -178,8 +178,9 @@ only a PID; the daemon reads its start time and UID before authorization and
 records that stable identity itself. A caller can register only its own
 workload unless it is root. Clearing operates on the daemon's current identity
 without accepting client-supplied identity fields. Global mode changes use the
-`control` PolicyKit action; frequency overrides, reloads, and persistent rules
-use the `admin` action.
+`control` PolicyKit action. Listing persistent rules is read-only; creating,
+changing, or removing them, along with frequency overrides and reloads, uses
+the `admin` action.
 
 `GetCapabilities.features` contains exact identifiers, not searchable tags;
 clients must test whole values. Device support is reported with the generic
