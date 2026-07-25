@@ -241,6 +241,18 @@ is:
 sudo systemctl enable --now uperf-linux.service
 ```
 
+The GUI dashboard leads with focus following, because that is what decides
+scheduling on an unattended desktop. The card names the application currently
+holding focus and separates the three ways focus can look enabled without being
+enabled: the daemon has `scheduler.focus.enabled` off (or predates API v1.2),
+the GNOME reporter is installed but switched off, or the last report was
+refused. Where the GUI can fix it, one button does — switching the reporter on
+works over the session bus, so it stays available while the daemon is
+unreachable. Below it, **Effective workload** shows what the daemon is actually
+tuning for and which source chose it. Selecting a workload by PID is a manual
+override, so it lives on the Apps page behind **Manual selection** rather than
+on the dashboard.
+
 The GUI follows the system language by default and includes English and
 Simplified Chinese. A persistent language selector is available under
 Settings; reopening the application applies a changed language.

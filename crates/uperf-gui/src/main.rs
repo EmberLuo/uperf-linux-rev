@@ -1,3 +1,4 @@
+mod focus_reporter;
 mod i18n;
 mod view_model;
 
@@ -22,11 +23,18 @@ use uperf_api::{
     FrequencyOverride, FrequencyStatus, RunningWorkload, SchedulerStatus, TelemetrySnapshot,
     WorkloadRequest, feature,
 };
-use view_model::{TargetView, ViewModel, cpu_load_percent, frequency_override};
+use view_model::{
+    FocusAction, FocusState, FocusView, ReporterState, TargetView, ViewModel, cpu_load_percent,
+    frequency_override,
+};
 
 const SERVICE_UNIT: &str = "uperf-linux.service";
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
+/// How often the reporter is re-probed while its state is something the user may
+/// be fixing right now. A working reporter is left alone and only re-read when
+/// GNOME Shell announces a change, so the idle desktop stays idle.
+const REPORTER_RECHECK_INTERVAL: Duration = Duration::from_secs(20);
 type UnitFileChanges = (bool, Vec<(String, String, String)>);
 
 #[derive(Debug)]
@@ -41,6 +49,14 @@ enum ClientCommand {
     RemoveAppRule(String),
     ReloadConfig,
     EnableAndStartService,
+}
+
+/// Session-bus work, kept on its own channel because it must keep working while
+/// the system-bus daemon is unreachable: a user whose daemon is down can still
+/// switch the reporter on, and a user with no reporter still needs the daemon.
+#[derive(Debug)]
+enum ReporterCommand {
+    Enable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +86,8 @@ enum UiEvent {
     },
     ServiceActivationStarted,
     ServiceActivationFinished(Result<(), String>),
+    /// Reporter state observed on the session bus, which the daemon cannot see.
+    Reporter(ReporterState),
 }
 
 #[derive(Debug)]
@@ -153,13 +171,25 @@ struct Ui {
     thermal_row: adw::ActionRow,
     thermal_bar: gtk::ProgressBar,
 
+    // Dashboard: focus, the headline of the whole product
+    focus_group: adw::PreferencesGroup,
+    focus_row: adw::ActionRow,
+    focus_icon: gtk::Image,
+    focus_button: gtk::Button,
+    focus_action: Cell<FocusAction>,
+    focus_holder_row: adw::ActionRow,
+    focus_command_row: adw::ActionRow,
+    focus_command_label: gtk::Label,
+
     // Dashboard: workload / scheduler
     workload_group: adw::PreferencesGroup,
     workload_row: adw::ActionRow,
     scheduler_row: adw::ActionRow,
     cgroup_row: adw::ActionRow,
-    pid_entry: adw::EntryRow,
     clear_workload_button: gtk::Button,
+
+    // Apps page: manual PID selection, deliberately not a first-screen action
+    pid_entry: adw::EntryRow,
 
     // Dashboard: per-CPU utilization (rebuilt as CPU IDs are discovered)
     load_group: adw::PreferencesGroup,
@@ -193,12 +223,14 @@ struct Ui {
     // Shared state
     capabilities: RefCell<Capabilities>,
     status: RefCell<DaemonStatus>,
+    reporter: Cell<ReporterState>,
     rules: RefCell<Vec<AppRule>>,
     workloads: RefCell<Vec<RunningWorkload>>,
     mode_ids: RefCell<Vec<String>>,
     connected: Cell<bool>,
     daemon_controls: RefCell<Vec<gtk::Widget>>,
     commands: Sender<ClientCommand>,
+    reporter_commands: Sender<ReporterCommand>,
 }
 
 fn status_row(title: &str) -> adw::ActionRow {
@@ -223,7 +255,11 @@ fn new_prefs_page(title: &str, icon: &str) -> adw::PreferencesPage {
 
 impl Ui {
     #[allow(clippy::too_many_lines)]
-    fn new(application: &adw::Application, commands: Sender<ClientCommand>) -> Rc<Self> {
+    fn new(
+        application: &adw::Application,
+        commands: Sender<ClientCommand>,
+        reporter_commands: Sender<ReporterCommand>,
+    ) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(application)
             .title("Uperf Linux")
@@ -264,10 +300,39 @@ impl Ui {
             .build();
         let thermal_row = status_row(tr("Temperature"));
         let thermal_bar = gtk::ProgressBar::new();
-        let workload_group = adw::PreferencesGroup::builder()
-            .title(tr("Active workload"))
+        let focus_group = adw::PreferencesGroup::builder()
+            .title(tr("Focus following"))
             .description(tr(
-                "Enter a PID; the daemon resolves and verifies its start time and UID",
+                "Scheduling follows the application you are using; the daemon authorizes every report",
+            ))
+            .build();
+        let focus_row = adw::ActionRow::builder().title(tr("Checking…")).build();
+        let focus_icon = gtk::Image::from_icon_name("content-loading-symbolic");
+        focus_row.add_prefix(&focus_icon);
+        let focus_button = gtk::Button::new();
+        focus_button.set_valign(gtk::Align::Center);
+        focus_button.set_visible(false);
+        focus_row.add_suffix(&focus_button);
+        let focus_holder_row = adw::ActionRow::builder()
+            .title(tr("Focused application"))
+            .build();
+        focus_holder_row.add_prefix(&gtk::Image::from_icon_name("view-reveal-symbolic"));
+        focus_holder_row.set_visible(false);
+        let focus_command_row = adw::ActionRow::builder()
+            .title(tr("Run this to fix it"))
+            .build();
+        let focus_command_label = gtk::Label::new(None);
+        focus_command_label.add_css_class("monospace");
+        focus_command_label.add_css_class("dim-label");
+        focus_command_label.set_selectable(true);
+        focus_command_label.set_wrap(true);
+        focus_command_label.set_xalign(0.0);
+        focus_command_row.add_suffix(&focus_command_label);
+        focus_command_row.set_visible(false);
+        let workload_group = adw::PreferencesGroup::builder()
+            .title(tr("Effective workload"))
+            .description(tr(
+                "What the daemon is actually tuning for, and how far the plan was applied",
             ))
             .build();
         let workload_row = status_row(tr("Selection"));
@@ -350,12 +415,20 @@ impl Ui {
             thermal_group,
             thermal_row,
             thermal_bar,
+            focus_group,
+            focus_row,
+            focus_icon,
+            focus_button,
+            focus_action: Cell::new(FocusAction::None),
+            focus_holder_row,
+            focus_command_row,
+            focus_command_label,
             workload_group,
             workload_row,
             scheduler_row,
             cgroup_row,
-            pid_entry,
             clear_workload_button,
+            pid_entry,
             load_group,
             load_rows: RefCell::new(BTreeMap::new()),
             freq_group,
@@ -377,17 +450,24 @@ impl Ui {
             log_buffer,
             capabilities: RefCell::new(Capabilities::default()),
             status: RefCell::new(DaemonStatus::default()),
+            reporter: Cell::new(ReporterState::default()),
             rules: RefCell::new(Vec::new()),
             workloads: RefCell::new(Vec::new()),
             mode_ids: RefCell::new(Vec::new()),
             connected: Cell::new(false),
             daemon_controls: RefCell::new(Vec::new()),
             commands,
+            reporter_commands,
         });
         {
             let action_ui = ui.clone();
             ui.service_button
                 .connect_clicked(move |_| action_ui.enable_and_start_service());
+        }
+        {
+            let action_ui = ui.clone();
+            ui.focus_button
+                .connect_clicked(move |_| action_ui.run_focus_action());
         }
         ui.assemble();
         ui
@@ -459,6 +539,40 @@ impl Ui {
     fn build_dashboard_page(self: &Rc<Self>) -> adw::PreferencesPage {
         let page = new_prefs_page(tr("Dashboard"), "speedometer-symbolic");
 
+        // Focus leads the page: the product promise is that scheduling follows
+        // the application in use, so its state and its holder come first.
+        //
+        // This is the one group that is deliberately *not* gated on a
+        // capability. When the daemon does not advertise focus support the card
+        // is the only place that can say why, which is exactly the failure users
+        // hit.
+        self.focus_group.add(&self.focus_row);
+        self.focus_group.add(&self.focus_holder_row);
+        self.focus_group.add(&self.focus_command_row);
+        page.add(&self.focus_group);
+
+        // Effective workload: what focus (or an explicit pick) actually produced.
+        self.workload_group.add(&self.workload_row);
+        self.workload_group.add(&self.scheduler_row);
+        self.workload_group.add(&self.cgroup_row);
+        let workload_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        workload_buttons.set_halign(gtk::Align::End);
+        workload_buttons.set_margin_top(8);
+        workload_buttons.append(&self.clear_workload_button);
+        self.workload_group.add(&workload_buttons);
+        self.add_daemon_control(&self.workload_group);
+        page.add(&self.workload_group);
+
+        {
+            let ui = self.clone();
+            self.clear_workload_button.connect_clicked(move |_| {
+                let target = clear_target_for_workload(&ui.status.borrow().active_workload);
+                if let Some(target) = target {
+                    ui.send(ClientCommand::ClearWorkload(target));
+                }
+            });
+        }
+
         let mode_group = adw::PreferencesGroup::builder()
             .title(tr("Power mode"))
             .description(tr("Modes are advertised by the running daemon"))
@@ -479,41 +593,6 @@ impl Ui {
         page.add(&overview);
         page.add(&self.health_issues_group);
 
-        // Active workload / scheduler card.
-        self.workload_group.add(&self.workload_row);
-        self.workload_group.add(&self.scheduler_row);
-        self.workload_group.add(&self.cgroup_row);
-        self.workload_group.add(&self.pid_entry);
-        let workload_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        workload_buttons.set_halign(gtk::Align::End);
-        workload_buttons.set_margin_top(8);
-        let set_workload = gtk::Button::with_label(tr("Set active workload"));
-        set_workload.add_css_class("suggested-action");
-        workload_buttons.append(&self.clear_workload_button);
-        workload_buttons.append(&set_workload);
-        self.workload_group.add(&workload_buttons);
-        self.add_daemon_control(&self.workload_group);
-        page.add(&self.workload_group);
-
-        {
-            let ui = self.clone();
-            set_workload.connect_clicked(move |_| {
-                match parse_workload(ui.pid_entry.text().as_str()) {
-                    Ok(request) => ui.send(ClientCommand::SetWorkload(request)),
-                    Err(message) => ui.toast(&translate_known(&message)),
-                }
-            });
-        }
-        {
-            let ui = self.clone();
-            self.clear_workload_button.connect_clicked(move |_| {
-                let target = clear_target_for_workload(&ui.status.borrow().active_workload);
-                if let Some(target) = target {
-                    ui.send(ClientCommand::ClearWorkload(target));
-                }
-            });
-        }
-
         page.add(&self.freq_group);
         page.add(&self.load_group);
 
@@ -532,6 +611,8 @@ impl Ui {
         self.running_group.add(&self.running_placeholder);
         self.add_daemon_control(&self.running_group);
         page.add(&self.running_group);
+
+        page.add(&self.build_manual_workload_group());
 
         self.apps_group.add(&self.apps_placeholder);
         page.add(&self.apps_group);
@@ -563,6 +644,54 @@ impl Ui {
             add_button.connect_clicked(move |_| ui.submit_new_rule());
         }
         page
+    }
+
+    /// Hand-typed PID selection, collapsed and off the first screen.
+    ///
+    /// It used to be the dashboard's primary action, which taught the wrong
+    /// model: an explicit pick *suppresses* focus rather than complementing it.
+    /// It stays available because it is the only way to steer a process the
+    /// compositor never focuses, such as a headless build.
+    fn build_manual_workload_group(self: &Rc<Self>) -> adw::PreferencesGroup {
+        let group = adw::PreferencesGroup::builder()
+            .title(tr("Manual selection"))
+            .description(tr(
+                "An explicit selection overrides focus until you clear it again",
+            ))
+            .build();
+        let expander = adw::ExpanderRow::builder()
+            .title(tr("Select a workload by PID"))
+            .subtitle(tr(
+                "The daemon resolves and verifies the start time and UID itself",
+            ))
+            .build();
+        let set_workload = gtk::Button::with_label(tr("Set"));
+        set_workload.add_css_class("suggested-action");
+        set_workload.set_valign(gtk::Align::Center);
+        // Nothing to submit until a PID is typed, so the primary action stays
+        // insensitive instead of answering with a parse-error toast.
+        set_workload.set_sensitive(false);
+        self.pid_entry.add_suffix(&set_workload);
+        expander.add_row(&self.pid_entry);
+        group.add(&expander);
+        self.add_daemon_control(&group);
+
+        {
+            let button = set_workload.clone();
+            self.pid_entry.connect_changed(move |entry| {
+                button.set_sensitive(!entry.text().trim().is_empty());
+            });
+        }
+        {
+            let ui = self.clone();
+            set_workload.connect_clicked(move |_| ui.submit_manual_workload());
+        }
+        {
+            let ui = self.clone();
+            self.pid_entry
+                .connect_entry_activated(move |_| ui.submit_manual_workload());
+        }
+        group
     }
 
     fn build_frequency_page(self: &Rc<Self>) -> adw::PreferencesPage {
@@ -720,6 +849,9 @@ impl Ui {
         self.service_button.set_visible(!connected);
         self.service_button
             .set_sensitive(!connected && !self.service_action_running.get());
+        // The card's daemon half changes meaning the moment the link does, and no
+        // status arrives while disconnected to redraw it.
+        self.update_focus_card(&self.focus_view());
     }
 
     fn update_connection(&self, state: ConnectionState) {
@@ -763,6 +895,35 @@ impl Ui {
                 "{}: {error}",
                 tr("Unable to request service activation")
             ));
+        }
+    }
+
+    fn submit_manual_workload(self: &Rc<Self>) {
+        match parse_workload(self.pid_entry.text().as_str()) {
+            Ok(request) => self.send(ClientCommand::SetWorkload(request)),
+            Err(message) => self.toast(&translate_known(&message)),
+        }
+    }
+
+    /// Run whichever single action the focus card is currently offering.
+    ///
+    /// Enabling the reporter talks to the session bus rather than the daemon, so
+    /// it must not be gated on the daemon connection: a user whose daemon is
+    /// down can still fix the reporter half of the problem.
+    fn run_focus_action(&self) {
+        match self.focus_action.get() {
+            FocusAction::None => {}
+            FocusAction::EnableReporter => {
+                if let Err(error) = self.reporter_commands.try_send(ReporterCommand::Enable) {
+                    self.toast(&format!(
+                        "{}: {error}",
+                        tr("Unable to enable the focus reporter")
+                    ));
+                }
+            }
+            FocusAction::ClearExplicit => {
+                self.send(ClientCommand::ClearWorkload(WorkloadClearTarget::Explicit));
+            }
         }
     }
 
@@ -826,6 +987,11 @@ impl Ui {
                 self.service_button.set_sensitive(false);
                 self.service_button.set_label(tr("Enabling…"));
             }
+            UiEvent::Reporter(reporter) => {
+                if self.reporter.replace(reporter) != reporter {
+                    self.update_status_widgets();
+                }
+            }
             UiEvent::ServiceActivationFinished(result) => {
                 self.service_action_running.set(false);
                 self.service_button.set_label(tr("Enable & Start"));
@@ -848,7 +1014,7 @@ impl Ui {
     fn rebuild_capability_widgets(self: &Rc<Self>) {
         let capabilities = self.capabilities.borrow().clone();
         let status = self.status.borrow().clone();
-        let view = ViewModel::from_api(&capabilities, &status);
+        let view = ViewModel::from_api(&capabilities, &status, self.reporter.get());
 
         // Mode toggle group.
         while let Some(child) = self.mode_box.first_child() {
@@ -1033,13 +1199,14 @@ impl Ui {
     fn update_status_widgets(&self) {
         let capabilities = self.capabilities.borrow().clone();
         let status = self.status.borrow().clone();
-        let view = ViewModel::from_api(&capabilities, &status);
+        let view = ViewModel::from_api(&capabilities, &status, self.reporter.get());
 
         self.state_row.set_subtitle(&view.daemon_state);
         self.health_row.set_subtitle(&view.health.summary);
         self.rebuild_health_issues(&view.health.issues);
         self.profile_row.set_subtitle(&view.profile);
         self.scene_row.set_subtitle(&view.scene);
+        self.update_focus_card(&self.focus_view());
 
         // Keep the mode toggle group in sync without re-triggering commands.
         self.syncing_modes.set(true);
@@ -1088,13 +1255,85 @@ impl Ui {
                     ));
                 }
                 self.workload_row.set_subtitle(&details.join(" · "));
-                self.pid_entry.set_text(&active.identity.pid.to_string());
             } else {
                 self.workload_row.set_subtitle(tr("None"));
             }
         } else {
             self.workload_group.set_visible(false);
             self.clear_workload_button.set_sensitive(false);
+        }
+    }
+
+    /// The focus card's current content.
+    ///
+    /// While the daemon is unreachable its capabilities are empty, which is
+    /// indistinguishable from a daemon that switched focus off, so the card falls
+    /// back to the reporter half rather than blaming a policy key.
+    fn focus_view(&self) -> FocusView {
+        if self.connected.get() {
+            ViewModel::from_api(
+                &self.capabilities.borrow(),
+                &self.status.borrow(),
+                self.reporter.get(),
+            )
+            .focus
+        } else {
+            FocusView::disconnected(self.reporter.get())
+        }
+    }
+
+    /// Render the focus card from the view model, which has already decided both
+    /// the wording and the single action; nothing here re-derives intent.
+    fn update_focus_card(&self, focus: &FocusView) {
+        self.focus_row.set_title(&focus.summary);
+        self.focus_row.set_subtitle(&focus.detail);
+        self.focus_icon.set_icon_name(Some(focus_icon(focus.state)));
+        // Only a working focus path gets the accent colour, so "looks enabled but
+        // is not" cannot be mistaken for "working" at a glance.
+        for (class, wanted) in [
+            ("success", focus.state == FocusState::Following),
+            ("warning", focus_is_obstructed(focus.state)),
+        ] {
+            if wanted {
+                self.focus_icon.add_css_class(class);
+            } else {
+                self.focus_icon.remove_css_class(class);
+            }
+        }
+
+        if let Some(holder) = &focus.holder {
+            self.focus_holder_row.set_visible(true);
+            self.focus_holder_row.set_subtitle(holder);
+        } else {
+            self.focus_holder_row.set_visible(false);
+        }
+
+        let action = focus.action();
+        self.focus_action.set(action);
+        match action {
+            FocusAction::None => self.focus_button.set_visible(false),
+            FocusAction::EnableReporter => {
+                self.focus_button.set_visible(true);
+                self.focus_button.set_label(tr("Turn on"));
+                self.focus_button.add_css_class("suggested-action");
+                // Session-bus work, so it stays usable while the daemon is down.
+                self.focus_button.set_sensitive(true);
+            }
+            FocusAction::ClearExplicit => {
+                self.focus_button.set_visible(true);
+                self.focus_button.set_label(tr("Follow focus again"));
+                self.focus_button.remove_css_class("suggested-action");
+                self.focus_button.set_sensitive(self.connected.get());
+            }
+        }
+
+        // Show the command whenever one exists: the button covers the happy path,
+        // the text covers a broken or absent `gnome-extensions` D-Bus surface.
+        if let Some(command) = &focus.command {
+            self.focus_command_row.set_visible(true);
+            self.focus_command_label.set_text(command);
+        } else {
+            self.focus_command_row.set_visible(false);
         }
     }
 
@@ -1403,6 +1642,27 @@ fn workload_request(pid: u32) -> WorkloadRequest {
         mode: String::new(),
         reason: "selected in uperf-gui".into(),
     }
+}
+
+/// Icon for one focus state, using only names from the freedesktop symbolic set
+/// that GNOME ships, so no icon falls back to a missing-image placeholder.
+const fn focus_icon(state: FocusState) -> &'static str {
+    match state {
+        FocusState::Following => "emblem-ok-symbolic",
+        FocusState::Overridden => "media-playback-pause-symbolic",
+        FocusState::Rejected => "dialog-warning-symbolic",
+        FocusState::Waiting => "content-loading-symbolic",
+        FocusState::Unsupported => "action-unavailable-symbolic",
+    }
+}
+
+/// Whether the state is one of the "looks enabled but is not" cases that need to
+/// read as a problem rather than as a neutral wait.
+const fn focus_is_obstructed(state: FocusState) -> bool {
+    matches!(
+        state,
+        FocusState::Unsupported | FocusState::Rejected | FocusState::Overridden
+    )
 }
 
 fn clear_target_for_workload(active: &ActiveWorkload) -> Option<WorkloadClearTarget> {
@@ -2063,6 +2323,100 @@ async fn client_supervisor(commands: Receiver<ClientCommand>, events: Sender<UiE
     }
 }
 
+/// Track the bundled reporter on the session bus for as long as the GUI runs.
+///
+/// Three things move the state: GNOME Shell's own `ExtensionStateChanged`, the
+/// user pressing the card's button, and a slow timer that only matters while the
+/// state is one the user might be fixing by hand outside the GUI.
+async fn reporter_supervisor(commands: Receiver<ReporterCommand>, events: Sender<UiEvent>) {
+    // No session bus at all: leave the state Unknown so the card offers no
+    // GNOME-specific advice it cannot back up.
+    let Ok(connection) = zbus::Connection::session().await else {
+        return;
+    };
+    let mut state = focus_reporter::probe(&connection).await;
+    if !emit(&events, UiEvent::Reporter(state)).await {
+        return;
+    }
+    let mut changes = focus_reporter::watch(&connection).await;
+
+    loop {
+        let recheck = tokio::time::sleep(REPORTER_RECHECK_INTERVAL);
+        tokio::select! {
+            command = commands.recv() => match command {
+                Ok(ReporterCommand::Enable) => {
+                    if let Err(error) = focus_reporter::enable(&connection).await
+                        && !emit(&events, UiEvent::Notice(format!(
+                            "{}: {error}", tr("Unable to enable the focus reporter"),
+                        ))).await
+                    {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            },
+            signal = next_reporter_signal(changes.as_mut()) => {
+                if signal.is_none() {
+                    // The shell went away; re-subscribing also re-resolves the
+                    // name, and the periodic re-probe keeps the state honest.
+                    changes = focus_reporter::watch(&connection).await;
+                }
+            },
+            () = recheck, if reporter_state_is_actionable(state) => {},
+        }
+
+        let observed = focus_reporter::probe(&connection).await;
+        if observed != state {
+            state = observed;
+            if !emit(&events, UiEvent::Reporter(state)).await {
+                return;
+            }
+        }
+    }
+}
+
+/// Await the next reporter signal, or park forever when there is no shell to
+/// listen to, so `select!` keeps polling its other branches.
+async fn next_reporter_signal(
+    changes: Option<&mut zbus::proxy::SignalStream<'static>>,
+) -> Option<zbus::Message> {
+    match changes {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether a state is worth re-polling on a timer. A working or absent reporter
+/// changes only through the shell, which signals; the in-between states are the
+/// ones a user fixes from a terminal while looking at this window.
+const fn reporter_state_is_actionable(state: ReporterState) -> bool {
+    matches!(
+        state,
+        ReporterState::Disabled | ReporterState::Missing | ReporterState::Unknown
+    )
+}
+
+fn start_reporter_watch(commands: Receiver<ReporterCommand>, events: &Sender<UiEvent>) {
+    let thread_events = events.clone();
+    let result = thread::Builder::new()
+        .name("uperf-session".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                // Without this thread the focus card simply stays at Unknown,
+                // which is the same as running outside GNOME. Nothing else in
+                // the GUI depends on it, so there is no failure to report.
+                return;
+            };
+            runtime.block_on(reporter_supervisor(commands, thread_events));
+        });
+    if let Err(error) = result {
+        eprintln!("cannot start the focus reporter watch: {error}");
+    }
+}
+
 fn start_client(commands: Receiver<ClientCommand>, events: &Sender<UiEvent>) {
     let thread_events = events.clone();
     let result = thread::Builder::new()
@@ -2092,10 +2446,12 @@ fn start_client(commands: Receiver<ClientCommand>, events: &Sender<UiEvent>) {
 
 fn build_application(application: &adw::Application) {
     let (commands_tx, commands_rx) = async_channel::unbounded();
+    let (reporter_tx, reporter_rx) = async_channel::unbounded();
     let (events_tx, events_rx) = async_channel::unbounded();
-    let ui = Ui::new(application, commands_tx);
+    let ui = Ui::new(application, commands_tx, reporter_tx);
     ui.present();
     start_client(commands_rx, &events_tx);
+    start_reporter_watch(reporter_rx, &events_tx);
     glib::spawn_future_local(async move {
         while let Ok(event) = events_rx.recv().await {
             ui.handle(event);
@@ -2117,9 +2473,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ErrorDisposition, ReconnectBackoff, RequestErrorKind, WorkloadClearTarget,
-        cgroup_status_text, classify_client_error, clear_target_for_workload, format_frequency,
-        generate_rule_id, parse_workload, running_workload_subtitle, scheduler_status_text,
+        ErrorDisposition, FocusState, ReconnectBackoff, ReporterState, RequestErrorKind,
+        WorkloadClearTarget, cgroup_status_text, classify_client_error, clear_target_for_workload,
+        focus_icon, focus_is_obstructed, format_frequency, generate_rule_id, parse_workload,
+        reporter_state_is_actionable, running_workload_subtitle, scheduler_status_text,
         thermal_fraction,
     };
     use uperf_api::{
@@ -2169,6 +2526,60 @@ mod tests {
             None,
             "an absent workload has nothing to clear"
         );
+    }
+
+    #[test]
+    fn only_a_live_focus_lease_reads_as_success() {
+        assert!(!focus_is_obstructed(FocusState::Following));
+        assert!(
+            !focus_is_obstructed(FocusState::Waiting),
+            "waiting for the first report is normal, not a fault"
+        );
+        for state in [
+            FocusState::Unsupported,
+            FocusState::Rejected,
+            FocusState::Overridden,
+        ] {
+            assert!(
+                focus_is_obstructed(state),
+                "{state:?} looks enabled but is not steering anything"
+            );
+        }
+    }
+
+    #[test]
+    fn every_focus_state_has_its_own_icon() {
+        let icons = [
+            FocusState::Unsupported,
+            FocusState::Following,
+            FocusState::Overridden,
+            FocusState::Rejected,
+            FocusState::Waiting,
+        ]
+        .map(focus_icon);
+        let mut unique = icons.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            icons.len(),
+            "states must stay distinguishable"
+        );
+    }
+
+    #[test]
+    fn only_unresolved_reporter_states_are_polled() {
+        assert!(!reporter_state_is_actionable(ReporterState::Enabled));
+        for state in [
+            ReporterState::Disabled,
+            ReporterState::Missing,
+            ReporterState::Unknown,
+        ] {
+            assert!(
+                reporter_state_is_actionable(state),
+                "{state:?} can change without a shell signal reaching us"
+            );
+        }
     }
 
     #[test]

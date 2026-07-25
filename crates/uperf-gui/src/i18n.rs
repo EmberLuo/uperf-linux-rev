@@ -151,11 +151,13 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "广泛匹配游戏和兼容层；仅检测到进程不会改变当前模式"
         }
         "Cancel" => "取消",
+        "Checking…" => "正在检查…",
         "Class" => "类别",
         "Clear" => "清除",
         "Clear active workload" => "清除活动工作负载",
         "Clear explicit workload" => "清除显式工作负载",
         "Clear focused workload" => "清除焦点工作负载",
+        "Clear the explicit workload to follow focus again" => "清除显式工作负载后即可重新跟随焦点",
         "Cluster frequency" => "集群频率",
         "Configuration reload" => "重新加载配置",
         "Connected" => "已连接",
@@ -172,6 +174,7 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "使用管理员权限编辑配置后，在此重新加载。"
         }
         "Effective profile" => "当前生效配置",
+        "Effective workload" => "生效工作负载",
         "Enable & Start" => "启用并启动",
         "Enable rule" => "启用规则",
         "Enabling…" => "正在启用…",
@@ -180,7 +183,12 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "输入 PID；守护进程会解析并验证其启动时间和 UID"
         }
         "Executable path (optional)" => "可执行文件路径（可选）",
+        "Focus following" => "焦点跟随",
+        "Focus state is unknown until the daemon connects" => "在守护进程连接之前无法得知焦点状态",
+        "Focused application" => "焦点应用",
+        "Follow focus again" => "重新跟随焦点",
         "Follow system language" => "跟随系统语言",
+        "Following the focused application" => "正在跟随焦点应用",
         "Frequency" => "频率",
         "Health" => "健康状态",
         "Health issues" => "健康状态详情",
@@ -188,6 +196,9 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "守护进程报告的完整详情，包括提示信息"
         }
         "Incompatible API" => "API 不兼容",
+        "Install the GNOME reporter, or report focus with uperfctl foreground" => {
+            "请安装 GNOME 上报扩展，或使用 uperfctl foreground 手动上报焦点"
+        }
         "Invalid request" => "无效请求",
         "Language" => "语言",
         "Language changes take effect after restarting the application" => {
@@ -200,7 +211,12 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Launch a game, Wine/Proton application, emulator, or Steam process." => {
             "请启动游戏、Wine/Proton 应用、模拟器或 Steam 进程。"
         }
+        "Last report refused" => "上一次上报被拒绝",
         "Logs" => "日志",
+        "Manual selection" => "手动选择",
+        "An explicit selection overrides focus until you clear it again" => {
+            "显式选择会覆盖焦点跟随，直到再次清除"
+        }
         "Manual bounds are transactional, read back by the daemon, and constrained by thermal safety" => {
             "手动频率范围以事务方式应用并由守护进程回读，同时受温控安全限制"
         }
@@ -216,14 +232,18 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "No applied rule" => "没有已应用规则",
         "No application rules" => "没有应用规则",
         "No dedicated unit selected" => "未选择专用 unit",
+        "No application is currently reported as focused" => "当前没有任何应用被上报为焦点",
+        "No focus reporter found" => "未找到焦点上报扩展",
         "No fresh state" => "没有最新状态",
         "No matching processes" => "没有匹配的进程",
         "No overridable targets" => "没有可覆盖的目标",
         "None" => "无",
+        "Off" => "已关闭",
         "Not authorized" => "未授权",
         "Observed state reported by org.uperflinux.Daemon1" => {
             "org.uperflinux.Daemon1 报告的实际状态"
         }
+        "Paused by an explicit selection" => "已被显式选择暂停",
         "Pending or no matching scheduler rule" => "等待应用或没有匹配的调度规则",
         "Per-CPU load reported by daemon telemetry" => "守护进程遥测报告的逐 CPU 负载",
         "Persistent global rules that pin a mode for matching processes" => {
@@ -238,17 +258,23 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Release all" => "全部释放",
         "Reload" => "重新加载",
         "Remove rule" => "删除规则",
+        "Reporter is installed but off" => "上报扩展已安装但未启用",
         "Request rejected" => "请求被拒绝",
         "Rule" => "规则",
+        "Run this to fix it" => "运行以下命令修复",
         "Safety state is authoritative; manual settings cannot bypass it" => {
             "安全状态具有最高优先级，手动设置无法绕过"
         }
+        "Scheduling follows the application you are using; the daemon authorizes every report" => {
+            "调度跟随你正在使用的应用；每次上报都会由守护进程鉴权"
+        }
+        "Select a workload by PID" => "按 PID 选择工作负载",
         "Selection" => "当前选择",
         "Service activation was cancelled or denied" => "服务启用已取消或被拒绝",
         "Service journal" => "服务日志",
         "Service started and enabled for boot" => "服务已启动，并设置为开机自动启动",
         "Set active workload" => "设置活动工作负载",
-        "Settings" => "设置",
+        "Set" | "Settings" => "设置",
         "Simplified Chinese" => "简体中文",
         "Start at boot and connect the GUI to the privileged daemon" => {
             "设置开机自动启动，并将 GUI 连接到特权守护进程"
@@ -260,14 +286,32 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Systemd cgroup" => "Systemd cgroup",
         "Task scheduler" => "任务调度",
         "Temperature" => "温度",
+        "The daemon has focus scheduling disabled; enable" => "守护进程已禁用焦点调度，请启用",
+        "The daemon resolves and verifies the start time and UID itself" => {
+            "守护进程会自行解析并验证启动时间和 UID"
+        }
+        "The focused application is the effective workload" => "焦点应用即当前生效的工作负载",
         "Thermal and hardware limits remain authoritative." => "温控与硬件限制仍具有最高优先级。",
         "Thermal safety" => "温控安全",
+        "This daemon is older than the focus contract; update uperf-linux" => {
+            "该守护进程版本早于焦点接口，请更新 uperf-linux"
+        }
+        "Turn on" => "启用",
+        "Turn the GNOME focus reporter on to let focus steer scheduling" => {
+            "启用 GNOME 焦点上报扩展后，焦点才能驱动调度"
+        }
+        "Unable to enable the focus reporter" => "无法启用焦点上报扩展",
         "Unable to read journal" => "无法读取日志",
         "Unable to request service activation" => "无法请求启用服务",
         "Unable to save the language preference" => "无法保存语言设置",
         "Unable to start journalctl" => "无法启动 journalctl",
         "Unavailable" => "不可用",
         "Use" => "使用",
+        "Waiting for a focus report" => "等待焦点上报",
+        "Waiting for the daemon" => "等待守护进程",
+        "What the daemon is actually tuning for, and how far the plan was applied" => {
+            "守护进程实际针对的对象，以及调度计划的应用进度"
+        }
         "Workload PID" => "工作负载 PID",
         "any process" => "任意进程",
         "applied" => "已应用",
