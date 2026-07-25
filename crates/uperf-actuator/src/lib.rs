@@ -3,6 +3,9 @@
 //! This crate is the only layer allowed to turn a desired frequency range into
 //! machine mutations.  It deliberately accepts discovered logical targets
 //! instead of arbitrary paths from API clients.
+//! While a frequency target is journaled, its user-facing min/max request
+//! nodes are exclusively owned by this actuator; effective sysfs values cannot
+//! distinguish direct writes from constraints owned by other kernel clients.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,6 +13,8 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crc32fast::hash as crc32;
@@ -30,9 +35,14 @@ const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_JOURNAL_SCHEMA_VERSION: u32 = 2;
 // v3 adds exact legal frequency pairs, per-field task/unit ownership, and
 // stable systemd unit instance identities.
-const JOURNAL_SCHEMA_VERSION: u32 = 3;
+const OWNERSHIP_JOURNAL_SCHEMA_VERSION: u32 = 3;
+// v4 defines a frequency entry's original request as the full hardware range,
+// so restoring it releases the actuator's userspace QoS request.
+const JOURNAL_SCHEMA_VERSION: u32 = 4;
 const MAX_JOURNAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_ENVELOPE_BYTES: usize = 5 * 1024 * 1024;
+const FREQUENCY_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
+const FREQUENCY_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Atomic, durable journal file store.
 ///
@@ -811,6 +821,15 @@ struct PreparedTaskMutation {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedFrequencyMutation {
+    target: FrequencyTarget,
+    before_effective: FrequencyLimits,
+    previous_request: FrequencyLimits,
+    desired_request: FrequencyLimits,
+    needs_write: bool,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedUnitMutation {
     instance: SystemdUnitInstanceIdentity,
     before: SystemdUnitProperties,
@@ -1020,7 +1039,7 @@ impl FrequencyActuator {
         });
         let units_owned = state.journal.units.values().any(|entry| {
             entry.owned_fields.map_or(
-                state.journal.schema_version < JOURNAL_SCHEMA_VERSION,
+                state.journal.schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION,
                 |mask| !mask.is_empty(),
             )
         });
@@ -1186,7 +1205,8 @@ impl FrequencyActuator {
                 "systemd recovery backend is unavailable".to_owned(),
             );
         }
-        if state.journal.schema_version < JOURNAL_SCHEMA_VERSION && !state.journal.units.is_empty()
+        if state.journal.schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION
+            && !state.journal.units.is_empty()
         {
             return self.degrade_locked(
                 &mut state,
@@ -1195,18 +1215,20 @@ impl FrequencyActuator {
             );
         }
         if state.journal.schema_version < JOURNAL_SCHEMA_VERSION {
-            if let Err(error) = upgrade_legacy_journal(&mut state.journal, &self.registry) {
+            let mut upgraded = state.journal.clone();
+            if let Err(error) = upgrade_legacy_journal(&mut upgraded, &self.registry) {
                 return self.degrade_locked(
                     &mut state,
                     format!("cannot upgrade legacy recovery journal: {error}"),
                 );
             }
-            if let Err(error) = persist_journal(self.store.as_ref(), &state.journal) {
+            if let Err(error) = persist_journal(self.store.as_ref(), &upgraded) {
                 return self.degrade_locked(
                     &mut state,
                     format!("cannot persist upgraded recovery journal: {error}"),
                 );
             }
+            state.journal = upgraded;
         }
 
         let entries: Vec<JournalEntry> = state.journal.entries.values().cloned().collect();
@@ -1234,27 +1256,20 @@ impl FrequencyActuator {
                     format!("journal target identity changed for {}", entry.target),
                 );
             }
-            let current = match read_limits(self.io.as_ref(), target) {
-                Ok(current) => current,
-                Err(error) => {
-                    return self.degrade_locked(
-                        &mut state,
-                        format!("cannot read {} during recovery: {error}", entry.target),
-                    );
-                }
-            };
-            if current == entry.original {
-                continue;
-            }
-            if !pair_is_owned(current, entry) {
-                // An administrator changed the pair after the daemon stopped.
-                // Do not overwrite that state.
-                continue;
+            if entry.original != hardware_limits(target) {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "journal target {} was claimed from a constrained effective range; automatic recovery could make a transient cap permanent",
+                        entry.target
+                    ),
+                );
             }
             if let Some(journal_entry) = state.journal.entries.get_mut(&entry.target) {
-                journal_entry.applied = current;
+                journal_entry.applied = entry.desired;
                 journal_entry.desired = entry.original;
-                journal_entry.legal_pairs = Some(transaction_legal_pairs(current, entry.original));
+                journal_entry.legal_pairs =
+                    Some(transaction_legal_pairs(entry.desired, entry.original));
             }
             frequency_recovery.push((entry.clone(), target.clone()));
         }
@@ -1267,7 +1282,8 @@ impl FrequencyActuator {
             );
         }
         for (entry, target) in &frequency_recovery {
-            if let Err(error) = apply_pair(self.io.as_ref(), target, entry.original) {
+            if let Err(error) = restore_frequency_request(self.io.as_ref(), target, entry.original)
+            {
                 return self.degrade_locked(
                     &mut state,
                     format!("recovery failed for {}: {error}", entry.target),
@@ -1298,7 +1314,8 @@ impl FrequencyActuator {
     /// Atomically apply a batch from the caller's perspective.
     ///
     /// Hardware does not expose a true multi-target transaction, so failure
-    /// causes every target to be restored to its state at method entry.
+    /// causes every attempted target to be restored to the actuator request
+    /// recorded before this call.
     ///
     /// # Errors
     ///
@@ -1321,8 +1338,7 @@ impl FrequencyActuator {
         }
 
         let mut seen = BTreeSet::new();
-        let mut before = BTreeMap::new();
-        let mut snapped = Vec::with_capacity(requests.len());
+        let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
             if !seen.insert(request.target.clone()) {
                 return Err(ActuatorError::DuplicateRequest(request.target.to_string()));
@@ -1331,64 +1347,120 @@ impl FrequencyActuator {
                 .registry
                 .get(&request.target)
                 .ok_or_else(|| ActuatorError::UnknownTarget(request.target.to_string()))?;
-            let desired = target.snap_limits(request.limits)?;
-            before.insert(
-                request.target.clone(),
-                read_limits(self.io.as_ref(), target)?,
-            );
-            snapped.push((target, desired));
+            let desired_request = target.snap_limits(request.limits)?;
+            let before_effective = read_limits(self.io.as_ref(), target)?;
+            let existing_entry = state.journal.entries.get(&target.id);
+            let full_hardware_request = hardware_limits(target);
+            let previous_request =
+                existing_entry.map_or(full_hardware_request, |entry| entry.desired);
+            let unclaimed_noop = existing_entry.is_none() && before_effective == desired_request;
+            if existing_entry.is_none()
+                && !unclaimed_noop
+                && before_effective != full_hardware_request
+            {
+                return Err(ActuatorError::Transaction {
+                    target: target.id.to_string(),
+                    reason: format!(
+                        "cannot safely claim an unowned target while its effective range is {}..{} instead of the hardware default {}..{}",
+                        before_effective.min.get(),
+                        before_effective.max.get(),
+                        full_hardware_request.min.get(),
+                        full_hardware_request.max.get()
+                    ),
+                });
+            }
+            let needs_write = if existing_entry.is_some() {
+                previous_request != desired_request
+            } else {
+                !unclaimed_noop
+            };
+            prepared.push(PreparedFrequencyMutation {
+                target: target.clone(),
+                before_effective,
+                previous_request,
+                desired_request,
+                needs_write,
+            });
         }
 
+        if prepared.iter().all(|mutation| !mutation.needs_write) {
+            return Ok(BatchOutcome {
+                applied: prepared
+                    .into_iter()
+                    .map(|mutation| (mutation.target.id, mutation.before_effective))
+                    .collect(),
+            });
+        }
+        let journal_before = state.journal.clone();
         state.journal.generation = state.journal.generation.saturating_add(1);
-        for (target, desired) in &snapped {
-            let current = before[&target.id];
-            let entry = state
+        for mutation in prepared.iter().filter(|mutation| mutation.needs_write) {
+            let mut entry = state
                 .journal
                 .entries
-                .entry(target.id.clone())
-                .or_insert_with(|| JournalEntry {
-                    target: target.id.clone(),
-                    min_path: target.min_path.clone(),
-                    max_path: target.max_path.clone(),
-                    manifest: Some(target.recovery_manifest()),
-                    original: current,
-                    desired: current,
-                    applied: current,
-                    legal_pairs: Some(vec![current]),
+                .get(&mutation.target.id)
+                .cloned()
+                .unwrap_or_else(|| JournalEntry {
+                    target: mutation.target.id.clone(),
+                    min_path: mutation.target.min_path.clone(),
+                    max_path: mutation.target.max_path.clone(),
+                    manifest: Some(mutation.target.recovery_manifest()),
+                    original: hardware_limits(&mutation.target),
+                    desired: mutation.previous_request,
+                    applied: mutation.previous_request,
+                    legal_pairs: Some(vec![mutation.previous_request]),
                 });
-            entry.applied = current;
-            entry.desired = *desired;
-            entry.legal_pairs = Some(transaction_legal_pairs(current, *desired));
+            entry.applied = mutation.previous_request;
+            entry.desired = mutation.desired_request;
+            entry.legal_pairs = Some(transaction_legal_pairs(
+                mutation.previous_request,
+                mutation.desired_request,
+            ));
+            state
+                .journal
+                .entries
+                .insert(mutation.target.id.clone(), entry);
         }
         if let Err(error) = persist_journal(self.store.as_ref(), &state.journal) {
+            state.journal = journal_before;
             return self.degrade_locked(
                 &mut state,
                 format!("cannot persist pre-mutation journal: {error}"),
             );
         }
 
-        let mut applied_ids = Vec::new();
-        let mut attempted = BTreeSet::new();
+        let mut applied = BTreeMap::new();
+        let mut attempted = Vec::new();
         let mut failure = None;
-        for (target, desired) in &snapped {
-            attempted.insert(target.id.clone());
-            match apply_pair(self.io.as_ref(), target, *desired) {
+        for (index, mutation) in prepared.iter().enumerate() {
+            if !mutation.needs_write {
+                applied.insert(mutation.target.id.clone(), mutation.before_effective);
+                continue;
+            }
+            attempted.push(index);
+            match apply_requested_limits(
+                self.io.as_ref(),
+                &mutation.target,
+                mutation.previous_request,
+                mutation.desired_request,
+            ) {
                 Ok(actual) => {
-                    if let Some(entry) = state.journal.entries.get_mut(&target.id) {
+                    if let Some(entry) = state.journal.entries.get_mut(&mutation.target.id) {
                         entry.applied = actual;
                         entry.legal_pairs = Some(vec![actual]);
                     }
-                    applied_ids.push(target.id.clone());
+                    applied.insert(mutation.target.id.clone(), actual);
                 }
                 Err(error) => {
-                    failure = Some((target.id.clone(), error));
+                    failure = Some((mutation.target.id.clone(), error));
                     break;
                 }
             }
         }
 
         if let Some((failed_target, error)) = failure {
-            if let Err(rollback) = self.rollback_to(&before, &attempted) {
+            if let Err(rollback) =
+                rollback_frequency_requests(self.io.as_ref(), &prepared, &attempted)
+            {
                 return self.degrade_locked(
                     &mut state,
                     format!(
@@ -1396,13 +1468,7 @@ impl FrequencyActuator {
                     ),
                 );
             }
-            for (id, limits) in &before {
-                if let Some(entry) = state.journal.entries.get_mut(id) {
-                    entry.desired = *limits;
-                    entry.applied = *limits;
-                    entry.legal_pairs = Some(vec![*limits]);
-                }
-            }
+            state.journal = journal_before;
             if let Err(persist_error) =
                 self.persist_or_remove_locked(&mut state, "frequency rollback")
             {
@@ -1420,10 +1486,23 @@ impl FrequencyActuator {
         }
 
         if let Err(error) = persist_journal(self.store.as_ref(), &state.journal) {
-            if let Err(rollback) = self.rollback_to(&before, &attempted) {
+            if let Err(rollback) =
+                rollback_frequency_requests(self.io.as_ref(), &prepared, &attempted)
+            {
                 return self.degrade_locked(
                     &mut state,
                     format!("post-mutation journal failed: {error}; rollback failed: {rollback}"),
+                );
+            }
+            state.journal = journal_before;
+            if let Err(persist_error) =
+                self.persist_or_remove_locked(&mut state, "post-mutation frequency rollback")
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "post-mutation journal failed: {error}; rollback succeeded but journal update failed: {persist_error}"
+                    ),
                 );
             }
             return self.degrade_locked(
@@ -1432,13 +1511,6 @@ impl FrequencyActuator {
             );
         }
 
-        let applied = applied_ids
-            .into_iter()
-            .map(|id| {
-                let value = state.journal.entries[&id].applied;
-                (id, value)
-            })
-            .collect();
         Ok(BatchOutcome { applied })
     }
 
@@ -1897,22 +1969,20 @@ impl FrequencyActuator {
                     format!("restore target {} is not present", entry.target),
                 );
             };
-            let current = match read_limits(self.io.as_ref(), target) {
-                Ok(current) => current,
-                Err(error) => {
-                    return self.degrade_locked(
-                        &mut state,
-                        format!("cannot read {} during restore: {error}", entry.target),
-                    );
-                }
-            };
-            if current == entry.original || !pair_is_owned(current, entry) {
-                continue;
+            if entry.original != hardware_limits(target) {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "restore target {} was claimed from a constrained effective range; automatic restoration could make a transient cap permanent",
+                        entry.target
+                    ),
+                );
             }
             if let Some(journal_entry) = state.journal.entries.get_mut(&entry.target) {
-                journal_entry.applied = current;
+                journal_entry.applied = entry.desired;
                 journal_entry.desired = entry.original;
-                journal_entry.legal_pairs = Some(transaction_legal_pairs(current, entry.original));
+                journal_entry.legal_pairs =
+                    Some(transaction_legal_pairs(entry.desired, entry.original));
             }
             restoration.push((entry.clone(), target.clone()));
         }
@@ -1925,7 +1995,8 @@ impl FrequencyActuator {
             );
         }
         for (entry, target) in &restoration {
-            if let Err(error) = apply_pair(self.io.as_ref(), target, entry.original) {
+            if let Err(error) = restore_frequency_request(self.io.as_ref(), target, entry.original)
+            {
                 return self.degrade_locked(
                     &mut state,
                     format!("restore failed for {}: {error}", entry.target),
@@ -2254,31 +2325,6 @@ impl FrequencyActuator {
         Ok(())
     }
 
-    fn rollback_to(
-        &self,
-        before: &BTreeMap<TargetId, FrequencyLimits>,
-        attempted: &BTreeSet<TargetId>,
-    ) -> Result<(), ActuatorError> {
-        let mut failures = Vec::new();
-        for (id, limits) in before {
-            if !attempted.contains(id) {
-                continue;
-            }
-            let Some(target) = self.registry.get(id) else {
-                failures.push(format!("{id}: disappeared from registry"));
-                continue;
-            };
-            if let Err(error) = apply_pair(self.io.as_ref(), target, *limits) {
-                failures.push(format!("{id}: {error}"));
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(ActuatorError::Rollback(failures.join("; ")))
-        }
-    }
-
     fn lock_state(&self) -> Result<MutexGuard<'_, RuntimeState>, ActuatorError> {
         self.state.lock().map_err(|_| ActuatorError::LockPoisoned)
     }
@@ -2363,56 +2409,60 @@ fn read_limits(
     })
 }
 
-fn apply_pair(
+fn apply_requested_limits(
     io: &dyn SysfsIo,
     target: &FrequencyTarget,
-    desired: FrequencyLimits,
+    current_request: FrequencyLimits,
+    desired_request: FrequencyLimits,
 ) -> Result<FrequencyLimits, ActuatorError> {
-    target.validate_limits(desired)?;
-    let before = read_limits(io, target)?;
-    if before == desired {
-        return Ok(before);
-    }
-    let result = write_ordered(io, target, before, desired)
-        .and_then(|()| read_limits(io, target))
-        .and_then(|actual| {
-            if actual == desired {
-                Ok(actual)
-            } else {
-                Err(ActuatorError::Transaction {
-                    target: target.id.to_string(),
-                    reason: format!(
-                        "readback {}..{} differs from requested {}..{}",
-                        actual.min.get(),
-                        actual.max.get(),
-                        desired.min.get(),
-                        desired.max.get()
-                    ),
-                })
+    target.validate_limits(current_request)?;
+    target.validate_limits(desired_request)?;
+    write_ordered(io, target, current_request, desired_request)?;
+    wait_for_limits(io, target, desired_request)
+}
+
+fn restore_frequency_request(
+    io: &dyn SysfsIo,
+    target: &FrequencyTarget,
+    desired_request: FrequencyLimits,
+) -> Result<FrequencyLimits, ActuatorError> {
+    target.validate_limits(desired_request)?;
+    reset_frequency_request(io, target, desired_request)?;
+    wait_for_limits(io, target, desired_request)
+}
+
+fn wait_for_limits(
+    io: &dyn SysfsIo,
+    target: &FrequencyTarget,
+    requested: FrequencyLimits,
+) -> Result<FrequencyLimits, ActuatorError> {
+    let deadline = Instant::now() + FREQUENCY_SETTLE_TIMEOUT;
+    loop {
+        let observation = match read_limits(io, target) {
+            Ok(actual) if actual == requested => return Ok(actual),
+            Ok(actual) => format!("{}..{}", actual.min.get(), actual.max.get()),
+            Err(error @ ActuatorError::InvalidReadback { .. }) => {
+                // The two sysfs attributes are separate files. A policy worker
+                // can run between those reads and briefly produce a reversed
+                // or otherwise torn pair, so retry it within the same bound.
+                error.to_string()
             }
-        });
-    match result {
-        Ok(actual) => Ok(actual),
-        Err(error) => {
-            let current = read_limits(io, target).unwrap_or(before);
-            let rollback =
-                write_ordered(io, target, current, before).and_then(|()| read_limits(io, target));
-            match rollback {
-                Ok(actual) if actual == before => Err(error),
-                Ok(actual) => Err(ActuatorError::Rollback(format!(
-                    "{} read back {}..{} instead of {}..{}",
-                    target.id,
-                    actual.min.get(),
-                    actual.max.get(),
-                    before.min.get(),
-                    before.max.get()
-                ))),
-                Err(rollback_error) => Err(ActuatorError::Rollback(format!(
-                    "{}: {}; original failure: {}",
-                    target.id, rollback_error, error
-                ))),
-            }
+            Err(error) => return Err(error),
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ActuatorError::Transaction {
+                target: target.id.to_string(),
+                reason: format!(
+                    "readback did not settle at {}..{} within {} ms; last observation: {observation}",
+                    requested.min.get(),
+                    requested.max.get(),
+                    FREQUENCY_SETTLE_TIMEOUT.as_millis()
+                ),
+            });
         }
+        thread::sleep(FREQUENCY_SETTLE_POLL_INTERVAL.min(deadline.duration_since(now)));
     }
 }
 
@@ -2422,22 +2472,8 @@ fn write_ordered(
     current: FrequencyLimits,
     desired: FrequencyLimits,
 ) -> Result<(), ActuatorError> {
-    let minimum = desired
-        .min
-        .get()
-        .checked_div(target.hertz_per_unit)
-        .ok_or_else(|| {
-            ActuatorError::InvalidTarget(format!("{} has an invalid kernel unit", target.id))
-        })?
-        .to_string();
-    let maximum = desired
-        .max
-        .get()
-        .checked_div(target.hertz_per_unit)
-        .ok_or_else(|| {
-            ActuatorError::InvalidTarget(format!("{} has an invalid kernel unit", target.id))
-        })?
-        .to_string();
+    let minimum = encode_frequency(target, desired.min)?;
+    let maximum = encode_frequency(target, desired.max)?;
     if desired.max < current.min {
         if desired.min != current.min {
             io.write_string(&target.min_path, &minimum)?;
@@ -2454,6 +2490,62 @@ fn write_ordered(
         }
     }
     Ok(())
+}
+
+fn reset_frequency_request(
+    io: &dyn SysfsIo,
+    target: &FrequencyTarget,
+    desired: FrequencyLimits,
+) -> Result<(), ActuatorError> {
+    let hardware_minimum = encode_frequency(target, target.hardware_min)?;
+    let hardware_maximum = encode_frequency(target, target.hardware_max)?;
+    io.write_string(&target.min_path, &hardware_minimum)?;
+    io.write_string(&target.max_path, &hardware_maximum)?;
+    if desired.max != target.hardware_max {
+        io.write_string(&target.max_path, &encode_frequency(target, desired.max)?)?;
+    }
+    if desired.min != target.hardware_min {
+        io.write_string(&target.min_path, &encode_frequency(target, desired.min)?)?;
+    }
+    Ok(())
+}
+
+fn encode_frequency(target: &FrequencyTarget, frequency: Hertz) -> Result<String, ActuatorError> {
+    frequency
+        .get()
+        .checked_div(target.hertz_per_unit)
+        .map(|value| value.to_string())
+        .ok_or_else(|| {
+            ActuatorError::InvalidTarget(format!("{} has an invalid kernel unit", target.id))
+        })
+}
+
+fn rollback_frequency_requests(
+    io: &dyn SysfsIo,
+    prepared: &[PreparedFrequencyMutation],
+    attempted: &[usize],
+) -> Result<(), ActuatorError> {
+    let mut failures = Vec::new();
+    for index in attempted.iter().rev() {
+        let mutation = &prepared[*index];
+        let result =
+            restore_frequency_request(io, &mutation.target, mutation.previous_request).map(|_| ());
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", mutation.target.id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ActuatorError::Rollback(failures.join("; ")))
+    }
+}
+
+fn hardware_limits(target: &FrequencyTarget) -> FrequencyLimits {
+    FrequencyLimits {
+        min: target.hardware_min,
+        max: target.hardware_max,
+    }
 }
 
 fn ordered_write_states(
@@ -2501,14 +2593,6 @@ fn push_unique_pair(pairs: &mut Vec<FrequencyLimits>, pair: FrequencyLimits) {
     }
 }
 
-fn pair_is_owned(current: FrequencyLimits, entry: &JournalEntry) -> bool {
-    entry
-        .legal_pairs
-        .as_ref()
-        .map_or_else(|| legacy_frequency_pairs(entry), Clone::clone)
-        .contains(&current)
-}
-
 fn legacy_frequency_pairs(entry: &JournalEntry) -> Vec<FrequencyLimits> {
     if entry.desired == entry.applied {
         vec![entry.applied]
@@ -2524,7 +2608,8 @@ fn upgrade_legacy_journal(
     if journal.schema_version >= JOURNAL_SCHEMA_VERSION {
         return Ok(());
     }
-    if !journal.units.is_empty() {
+    let old_schema_version = journal.schema_version;
+    if old_schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION && !journal.units.is_empty() {
         return Err(ActuatorError::InvalidJournal(
             "legacy systemd entries have no stable instance identity".to_owned(),
         ));
@@ -2542,15 +2627,31 @@ fn upgrade_legacy_journal(
                 entry.target
             )));
         }
+        if entry
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| target.recovery_manifest() != *manifest)
+        {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "legacy recovery target identity changed for {}",
+                entry.target
+            )));
+        }
         entry.manifest = Some(target.recovery_manifest());
         entry.legal_pairs = Some(legacy_frequency_pairs(entry));
+        // Older schemas stored an effective aggregate here. Replaying that
+        // value could turn another kernel client's transient cap into a
+        // persistent userspace request, so migration releases our request.
+        entry.original = hardware_limits(target);
     }
-    for entry in journal.tasks.values_mut() {
-        entry.owned_fields = Some(legacy_task_owned_fields(entry));
-        entry.relinquished_fields = Some(TaskFieldMask::default());
+    if old_schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION {
+        for entry in journal.tasks.values_mut() {
+            entry.owned_fields = Some(legacy_task_owned_fields(entry));
+            entry.relinquished_fields = Some(TaskFieldMask::default());
+        }
     }
     journal.schema_version = JOURNAL_SCHEMA_VERSION;
-    Ok(())
+    validate_decoded_journal(journal)
 }
 
 fn legacy_task_owned_fields(entry: &TaskJournalEntry) -> TaskFieldMask {
@@ -2818,7 +2919,10 @@ fn decode_journal(bytes: &[u8]) -> Result<Journal, ActuatorError> {
 fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
     if !matches!(
         journal.schema_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION
+            | MANIFEST_JOURNAL_SCHEMA_VERSION
+            | OWNERSHIP_JOURNAL_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(ActuatorError::InvalidJournal(format!(
             "unsupported schema version {}",
@@ -2854,7 +2958,12 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             }
         }
         match (journal.schema_version, &entry.manifest) {
-            (MANIFEST_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, Some(manifest)) => {
+            (
+                MANIFEST_JOURNAL_SCHEMA_VERSION
+                | OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                Some(manifest),
+            ) => {
                 if manifest.id != entry.target
                     || manifest.min_path != entry.min_path
                     || manifest.max_path != entry.max_path
@@ -2872,8 +2981,21 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                         .validate_limits(limits)
                         .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
                 }
+                if journal.schema_version == JOURNAL_SCHEMA_VERSION
+                    && entry.original != hardware_limits(&target)
+                {
+                    return Err(ActuatorError::InvalidJournal(format!(
+                        "{} schema-v{} original request is not the full hardware range",
+                        entry.target, journal.schema_version
+                    )));
+                }
             }
-            (MANIFEST_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, None) => {
+            (
+                MANIFEST_JOURNAL_SCHEMA_VERSION
+                | OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                None,
+            ) => {
                 return Err(ActuatorError::InvalidJournal(format!(
                     "{} schema-v{} entry has no recovery manifest",
                     entry.target, journal.schema_version
@@ -2889,12 +3011,14 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             _ => unreachable!("schema version was checked above"),
         }
         match (journal.schema_version, &entry.legal_pairs) {
-            (JOURNAL_SCHEMA_VERSION, Some(pairs)) if !pairs.is_empty() => {
+            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, Some(pairs))
+                if !pairs.is_empty() =>
+            {
                 let mut unique = Vec::with_capacity(pairs.len());
                 let target = entry
                     .manifest
                     .as_ref()
-                    .expect("schema-v3 manifest checked above")
+                    .expect("schema-v3+ manifest checked above")
                     .to_frequency_target()
                     .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
                 for pair in pairs {
@@ -2921,10 +3045,10 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (JOURNAL_SCHEMA_VERSION, _) => {
+            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _) => {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v3 entry has no legal frequency pairs",
-                    entry.target
+                    "{} schema-v{} entry has no legal frequency pairs",
+                    entry.target, journal.schema_version
                 )));
             }
             (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None) => {}
@@ -2952,7 +3076,11 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             entry.owned_fields,
             entry.relinquished_fields,
         ) {
-            (JOURNAL_SCHEMA_VERSION, Some(owned), Some(relinquished)) => {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
+                Some(owned),
+                Some(relinquished),
+            ) => {
                 if owned.intersects(relinquished) {
                     return Err(ActuatorError::InvalidJournal(format!(
                         "task journal masks overlap for pid {}",
@@ -2960,10 +3088,11 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (JOURNAL_SCHEMA_VERSION, _, _) => {
+            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _, _) => {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "schema-v3 task entry for pid {} has no ownership masks",
-                    entry.identity.pid.get()
+                    "schema-v{} task entry for pid {} has no ownership masks",
+                    journal.schema_version,
+                    entry.identity.pid.get(),
                 )));
             }
             (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None, None) => {}
@@ -2991,7 +3120,12 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             entry.owned_fields,
             entry.relinquished_fields,
         ) {
-            (JOURNAL_SCHEMA_VERSION, Some(instance), Some(owned), Some(relinquished)) => {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
+                Some(instance),
+                Some(owned),
+                Some(relinquished),
+            ) => {
                 validate_unit_instance_identity(instance)?;
                 if instance.unit != entry.unit {
                     return Err(ActuatorError::InvalidJournal(format!(
@@ -3006,10 +3140,10 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (JOURNAL_SCHEMA_VERSION, _, _, _) => {
+            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _, _, _) => {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "schema-v3 systemd entry {} lacks identity or ownership masks",
-                    entry.unit
+                    "schema-v{} systemd entry {} lacks identity or ownership masks",
+                    journal.schema_version, entry.unit
                 )));
             }
             (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None, None, None) => {
@@ -3046,7 +3180,7 @@ fn persist_or_remove_journal(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -3066,8 +3200,9 @@ mod tests {
     use super::{
         ActuatorError, ActuatorMode, FrequencyActuator, FrequencyRequest, FrequencyTarget,
         JOURNAL_SCHEMA_VERSION, LEGACY_JOURNAL_SCHEMA_VERSION, MANIFEST_JOURNAL_SCHEMA_VERSION,
-        RecoveryFrequencyTarget, TargetRegistry, TaskRequest, UnitRequest, decode_journal,
-        encode_journal, inspect_recovery_journal, transaction_legal_pairs,
+        OWNERSHIP_JOURNAL_SCHEMA_VERSION, RecoveryFrequencyTarget, TargetRegistry, TaskRequest,
+        UnitRequest, decode_journal, encode_journal, inspect_recovery_journal,
+        transaction_legal_pairs,
     };
 
     #[derive(Default)]
@@ -3076,6 +3211,7 @@ mod tests {
         writes: Mutex<Vec<(PathBuf, String)>>,
         fail_on_write: Mutex<Option<usize>>,
         mutate_on_failure: Mutex<BTreeMap<PathBuf, String>>,
+        scripted_reads: Mutex<BTreeMap<PathBuf, VecDeque<String>>>,
     }
 
     impl MemorySysfs {
@@ -3100,6 +3236,20 @@ mod tests {
                 .extend(values);
         }
 
+        fn script_reads(
+            &self,
+            path: impl Into<PathBuf>,
+            values: impl IntoIterator<Item = impl Into<String>>,
+        ) {
+            self.scripted_reads
+                .lock()
+                .expect("scripted reads lock")
+                .insert(
+                    path.into(),
+                    values.into_iter().map(Into::into).collect::<VecDeque<_>>(),
+                );
+        }
+
         fn writes(&self) -> Vec<(PathBuf, String)> {
             self.writes.lock().expect("writes lock").clone()
         }
@@ -3114,6 +3264,15 @@ mod tests {
 
     impl SysfsIo for MemorySysfs {
         fn read_string(&self, path: &Path) -> PlatformResult<String> {
+            if let Some(value) = self
+                .scripted_reads
+                .lock()
+                .expect("scripted reads lock")
+                .get_mut(path)
+                .and_then(VecDeque::pop_front)
+            {
+                return Ok(value);
+            }
             self.values
                 .lock()
                 .expect("values lock")
@@ -3628,6 +3787,178 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_owned_request_does_not_rewrite_after_effective_limits_change() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let actuator = actuator(
+            io.clone(),
+            Arc::new(MemoryStore::default()),
+            "boot-a",
+            "device-a",
+        );
+        let request = FrequencyRequest {
+            target: id(),
+            limits: limits(2_000, 3_000),
+        };
+        actuator
+            .apply_batch(std::slice::from_ref(&request))
+            .expect("claim request");
+
+        io.set_admin_pair("1000", "2000");
+        let writes_before = io.writes().len();
+        let outcome = actuator
+            .apply_batch(&[request])
+            .expect("unchanged request intent");
+
+        assert_eq!(outcome.applied[&id()], limits(1_000, 2_000));
+        assert_eq!(
+            io.writes().len(),
+            writes_before,
+            "a changed effective aggregate must not cause request rewrites"
+        );
+    }
+
+    #[test]
+    fn delayed_cpufreq_readback_accepts_a_min_equals_max_request() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        // The initial observation and first two post-write observations still
+        // expose the old policy before the asynchronous worker catches up.
+        io.script_reads("/sys/test/min", ["1000", "1000", "1000"]);
+        let actuator = actuator(
+            io.clone(),
+            Arc::new(MemoryStore::default()),
+            "boot-a",
+            "device-a",
+        );
+
+        let outcome = actuator
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }])
+            .expect("async cpufreq policy update must settle");
+
+        assert_eq!(outcome.applied[&id()], limits(3_000, 3_000));
+        assert_eq!(
+            actuator.read_limits(&id()).expect("settled limits"),
+            limits(3_000, 3_000)
+        );
+        assert_eq!(
+            io.writes(),
+            vec![(PathBuf::from("/sys/test/min"), "3000".to_owned())]
+        );
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadWrite
+        ));
+    }
+
+    #[test]
+    fn constrained_effective_range_is_not_claimed_as_the_restore_target() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "1000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+
+        assert!(matches!(
+            actuator.apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 2_000),
+            }]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert!(io.writes().is_empty());
+        assert!(store.load().expect("journal read").is_none());
+    }
+
+    #[test]
+    fn failed_pre_journal_never_enables_a_frequency_write_or_restore() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        store.fail_on_store(1);
+        let actuator = actuator(io.clone(), store, "boot-a", "device-a");
+
+        assert!(matches!(
+            actuator.apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }]),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert!(io.writes().is_empty());
+        assert!(matches!(
+            actuator.restore_all(),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert!(io.writes().is_empty());
+    }
+
+    #[test]
+    fn frequency_settle_timeout_rewrites_the_original_requests() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        io.script_reads("/sys/test/min", std::iter::repeat_n("1000", 128));
+        let actuator = actuator(
+            io.clone(),
+            Arc::new(MemoryStore::default()),
+            "boot-a",
+            "device-a",
+        );
+
+        assert!(matches!(
+            actuator.apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert_eq!(
+            actuator.read_limits(&id()).expect("rolled-back limits"),
+            limits(1_000, 3_000)
+        );
+        assert_eq!(
+            io.writes(),
+            vec![
+                (PathBuf::from("/sys/test/min"), "3000".to_owned()),
+                (PathBuf::from("/sys/test/min"), "1000".to_owned()),
+                (PathBuf::from("/sys/test/max"), "3000".to_owned()),
+            ],
+            "rollback must rewrite both request endpoints even while effective readback is stale"
+        );
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadWrite
+        ));
+    }
+
+    #[test]
+    fn failed_update_rolls_back_to_the_previous_request_not_stale_readback() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        actuator
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed owned request");
+
+        io.script_reads("/sys/test/min", ["1000"]);
+        io.fail_on(2);
+        assert!(matches!(
+            actuator.apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert_eq!(
+            actuator.read_limits(&id()).expect("rolled-back request"),
+            limits(2_000, 3_000)
+        );
+        let journal = decode_journal(&store.load().expect("journal read").expect("owned journal"))
+            .expect("journal decode");
+        assert_eq!(journal.entries[&id()].desired, limits(2_000, 3_000));
+    }
+
+    #[test]
     fn partial_pair_failure_rolls_back_to_call_entry_state() {
         let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
         io.fail_on(2);
@@ -3731,6 +4062,10 @@ mod tests {
             actuator.apply_batch(&[]),
             Err(ActuatorError::Degraded(_))
         ));
+        assert!(matches!(
+            actuator.restore_all(),
+            Err(ActuatorError::Degraded(_))
+        ));
         assert!(
             actuator
                 .startup_recovery_failed()
@@ -3779,7 +4114,17 @@ mod tests {
             }])
             .expect("apply");
 
-        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
+        let restarted = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        let writes_before_restore = io.writes().len();
+        assert!(matches!(
+            restarted.restore_all(),
+            Err(ActuatorError::RecoveryRequired)
+        ));
+        assert_eq!(
+            io.writes().len(),
+            writes_before_restore,
+            "startup recovery validation cannot be bypassed through restore_all"
+        );
         restarted.recover_pending().expect("recover");
         assert_eq!(
             restarted.read_limits(&id()).expect("read"),
@@ -3789,7 +4134,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_frequency_transaction_rejects_an_administrator_mixed_pair() {
+    fn recovery_releases_an_owned_frequency_request_after_effective_limits_change() {
         let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
         let store = Arc::new(MemoryStore::default());
         actuator(io.clone(), store.clone(), "boot-a", "device-a")
@@ -3800,20 +4145,21 @@ mod tests {
             .expect("apply");
         let writes_before_admin = io.writes().len();
 
-        // This was a legitimate intermediate during the completed forward
-        // transition, but it is not the daemon's last write.  The schema-v3
-        // journal has already narrowed ownership to exactly 2000..2000.
+        // Effective sysfs limits cannot distinguish a direct write from a
+        // separate kernel QoS constraint. While journaled, this target is
+        // therefore exclusive to the actuator so recovery cannot leave a
+        // hidden 2000..2000 request behind.
         io.set_admin_pair("1000", "2000");
         let restarted = actuator(io.clone(), store.clone(), "boot-a", "device-a");
         restarted
             .recover_pending()
-            .expect("skip administrator-owned mixed pair");
+            .expect("release the owned request");
 
         assert_eq!(
-            restarted.read_limits(&id()).expect("administrator pair"),
-            limits(1_000, 2_000)
+            restarted.read_limits(&id()).expect("restored full range"),
+            limits(1_000, 3_000)
         );
-        assert_eq!(io.writes().len(), writes_before_admin);
+        assert_eq!(io.writes().len(), writes_before_admin + 2);
         assert!(store.load().expect("cleared journal").is_none());
     }
 
@@ -3934,6 +4280,76 @@ mod tests {
         restarted.recover_pending().expect("legacy recovery");
         assert_eq!(
             restarted.read_limits(&id()).expect("restored limits"),
+            limits(1_000, 3_000)
+        );
+        assert!(store.load().expect("cleared journal").is_none());
+    }
+
+    #[test]
+    fn invalid_schema_v1_limits_are_never_persisted_as_v4() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        actuator(io.clone(), store.clone(), "boot-a", "device-a")
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("apply");
+
+        let bytes = store.load().expect("load journal").expect("journal bytes");
+        let mut legacy = decode_journal(&bytes).expect("decode current journal");
+        legacy.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
+        for entry in legacy.entries.values_mut() {
+            entry.manifest = None;
+            entry.legal_pairs = None;
+            entry.desired = limits(4_000, 4_000);
+            entry.applied = limits(4_000, 4_000);
+        }
+        let legacy_bytes = encode_journal(&legacy).expect("encode legacy journal");
+        store
+            .store_durable(&legacy_bytes)
+            .expect("store legacy journal");
+        let writes_before_recovery = io.writes().len();
+
+        let restarted = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        assert!(matches!(
+            restarted.recover_pending(),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert_eq!(io.writes().len(), writes_before_recovery);
+        assert_eq!(
+            store.load().expect("journal remains").as_deref(),
+            Some(legacy_bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn schema_v3_constrained_original_migrates_to_a_released_request() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        actuator(io.clone(), store.clone(), "boot-a", "device-a")
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("apply");
+
+        let bytes = store.load().expect("load journal").expect("journal bytes");
+        let mut legacy = decode_journal(&bytes).expect("decode current journal");
+        legacy.schema_version = OWNERSHIP_JOURNAL_SCHEMA_VERSION;
+        legacy
+            .entries
+            .get_mut(&id())
+            .expect("frequency entry")
+            .original = limits(1_000, 2_000);
+        store
+            .store_durable(&encode_journal(&legacy).expect("encode schema-v3 journal"))
+            .expect("store schema-v3 journal");
+
+        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
+        restarted.recover_pending().expect("migrate and recover");
+        assert_eq!(
+            restarted.read_limits(&id()).expect("released limits"),
             limits(1_000, 3_000)
         );
         assert!(store.load().expect("cleared journal").is_none());
@@ -4591,7 +5007,7 @@ mod tests {
     }
 
     #[test]
-    fn same_boot_recovery_restores_tasks_and_units() {
+    fn schema_v3_recovery_restores_tasks_and_units() {
         let store = Arc::new(MemoryStore::default());
         let proc_reader = Arc::new(FakeProc::default());
         let controller = Arc::new(FaultingProcessController::default());
@@ -4625,6 +5041,12 @@ mod tests {
                 desired: desired_unit,
             }])
             .expect("apply unit");
+        let bytes = store.load().expect("load journal").expect("journal");
+        let mut legacy = decode_journal(&bytes).expect("decode journal");
+        legacy.schema_version = OWNERSHIP_JOURNAL_SCHEMA_VERSION;
+        store
+            .store_durable(&encode_journal(&legacy).expect("encode schema-v3 journal"))
+            .expect("store schema-v3 journal");
 
         let restarted = control_actuator(
             store.clone(),
