@@ -18,8 +18,9 @@ use i18n::{
     save_language_choice, tr, translate_known,
 };
 use uperf_api::{
-    AppRule, Capabilities, ClientError, DaemonClient, DaemonStatus, FrequencyOverride,
-    FrequencyStatus, RunningWorkload, SchedulerStatus, TelemetrySnapshot, WorkloadRequest, feature,
+    ActiveWorkload, AppRule, Capabilities, ClientError, DaemonClient, DaemonStatus,
+    FrequencyOverride, FrequencyStatus, RunningWorkload, SchedulerStatus, TelemetrySnapshot,
+    WorkloadRequest, feature,
 };
 use view_model::{TargetView, ViewModel, cpu_load_percent, frequency_override};
 
@@ -35,11 +36,17 @@ enum ClientCommand {
     ClearFrequency(String),
     ClearAllFrequency(Vec<String>),
     SetWorkload(WorkloadRequest),
-    ClearWorkload,
+    ClearWorkload(WorkloadClearTarget),
     SetAppRule(AppRule),
     RemoveAppRule(String),
     ReloadConfig,
     EnableAndStartService,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadClearTarget {
+    Explicit,
+    Focus,
 }
 
 #[derive(Debug)]
@@ -131,6 +138,8 @@ struct Ui {
     service_action_running: Cell<bool>,
     state_row: adw::ActionRow,
     health_row: adw::ActionRow,
+    health_issues_group: adw::PreferencesGroup,
+    health_issue_rows: RefCell<Vec<adw::ActionRow>>,
     profile_row: adw::ActionRow,
     scene_row: adw::ActionRow,
 
@@ -150,6 +159,7 @@ struct Ui {
     scheduler_row: adw::ActionRow,
     cgroup_row: adw::ActionRow,
     pid_entry: adw::EntryRow,
+    clear_workload_button: gtk::Button,
 
     // Dashboard: per-CPU utilization (rebuilt as CPU IDs are discovered)
     load_group: adw::PreferencesGroup,
@@ -233,6 +243,13 @@ impl Ui {
         connection_row.add_suffix(&service_button);
         let state_row = status_row(tr("Lifecycle"));
         let health_row = status_row(tr("Health"));
+        let health_issues_group = adw::PreferencesGroup::builder()
+            .title(tr("Health issues"))
+            .description(tr(
+                "Detailed daemon findings, including informational reports",
+            ))
+            .build();
+        health_issues_group.set_visible(false);
         let profile_row = status_row(tr("Effective profile"));
         let scene_row = status_row(tr("Dominant scene"));
         let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -257,6 +274,8 @@ impl Ui {
         let scheduler_row = status_row(tr("Task scheduler"));
         let cgroup_row = status_row(tr("Systemd cgroup"));
         let pid_entry = adw::EntryRow::builder().title(tr("Workload PID")).build();
+        let clear_workload_button = gtk::Button::with_label(tr("Clear active workload"));
+        clear_workload_button.set_sensitive(false);
         let load_group = adw::PreferencesGroup::builder()
             .title(tr("CPU utilization"))
             .description(tr("Per-CPU load reported by daemon telemetry"))
@@ -321,6 +340,8 @@ impl Ui {
             service_action_running: Cell::new(false),
             state_row,
             health_row,
+            health_issues_group,
+            health_issue_rows: RefCell::new(Vec::new()),
             profile_row,
             scene_row,
             mode_box,
@@ -334,6 +355,7 @@ impl Ui {
             scheduler_row,
             cgroup_row,
             pid_entry,
+            clear_workload_button,
             load_group,
             load_rows: RefCell::new(BTreeMap::new()),
             freq_group,
@@ -455,6 +477,7 @@ impl Ui {
         overview.add(&self.profile_row);
         overview.add(&self.scene_row);
         page.add(&overview);
+        page.add(&self.health_issues_group);
 
         // Active workload / scheduler card.
         self.workload_group.add(&self.workload_row);
@@ -464,10 +487,9 @@ impl Ui {
         let workload_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         workload_buttons.set_halign(gtk::Align::End);
         workload_buttons.set_margin_top(8);
-        let clear_workload = gtk::Button::with_label(tr("Clear active workload"));
         let set_workload = gtk::Button::with_label(tr("Set active workload"));
         set_workload.add_css_class("suggested-action");
-        workload_buttons.append(&clear_workload);
+        workload_buttons.append(&self.clear_workload_button);
         workload_buttons.append(&set_workload);
         self.workload_group.add(&workload_buttons);
         self.add_daemon_control(&self.workload_group);
@@ -484,7 +506,12 @@ impl Ui {
         }
         {
             let ui = self.clone();
-            clear_workload.connect_clicked(move |_| ui.send(ClientCommand::ClearWorkload));
+            self.clear_workload_button.connect_clicked(move |_| {
+                let target = clear_target_for_workload(&ui.status.borrow().active_workload);
+                if let Some(target) = target {
+                    ui.send(ClientCommand::ClearWorkload(target));
+                }
+            });
         }
 
         page.add(&self.freq_group);
@@ -1009,7 +1036,8 @@ impl Ui {
         let view = ViewModel::from_api(&capabilities, &status);
 
         self.state_row.set_subtitle(&view.daemon_state);
-        self.health_row.set_subtitle(&view.health);
+        self.health_row.set_subtitle(&view.health.summary);
+        self.rebuild_health_issues(&view.health.issues);
         self.profile_row.set_subtitle(&view.profile);
         self.scene_row.set_subtitle(&view.scene);
 
@@ -1045,19 +1073,53 @@ impl Ui {
         if let Some(workload) = view.workload {
             self.workload_group.set_visible(true);
             let active = workload.active;
+            self.update_clear_workload_button(&active);
             if active.present {
-                self.workload_row.set_subtitle(&format!(
-                    "{} · PID {} · {}",
+                let mut details = vec![
                     active.name,
-                    active.identity.pid,
-                    localized_protocol_value(&active.effective_mode)
-                ));
+                    format!("PID {}", active.identity.pid),
+                    localized_protocol_value(&active.effective_mode),
+                ];
+                if !active.source.is_empty() {
+                    details.push(format!(
+                        "{}: {}",
+                        tr("Source"),
+                        localized_protocol_value(&active.source)
+                    ));
+                }
+                self.workload_row.set_subtitle(&details.join(" · "));
                 self.pid_entry.set_text(&active.identity.pid.to_string());
             } else {
                 self.workload_row.set_subtitle(tr("None"));
             }
         } else {
             self.workload_group.set_visible(false);
+            self.clear_workload_button.set_sensitive(false);
+        }
+    }
+
+    fn update_clear_workload_button(&self, active: &ActiveWorkload) {
+        let target = clear_target_for_workload(active);
+        self.clear_workload_button.set_sensitive(target.is_some());
+        self.clear_workload_button.set_label(match target {
+            Some(WorkloadClearTarget::Explicit) => tr("Clear explicit workload"),
+            Some(WorkloadClearTarget::Focus) => tr("Clear focused workload"),
+            None => tr("Clear active workload"),
+        });
+    }
+
+    fn rebuild_health_issues(&self, issues: &[view_model::HealthIssueView]) {
+        for row in self.health_issue_rows.borrow_mut().drain(..) {
+            self.health_issues_group.remove(&row);
+        }
+        self.health_issues_group.set_visible(!issues.is_empty());
+        for issue in issues {
+            let row = adw::ActionRow::builder()
+                .title(&issue.message)
+                .subtitle(&issue.detail)
+                .build();
+            self.health_issues_group.add(&row);
+            self.health_issue_rows.borrow_mut().push(row);
         }
     }
 
@@ -1340,6 +1402,17 @@ fn workload_request(pid: u32) -> WorkloadRequest {
         pid,
         mode: String::new(),
         reason: "selected in uperf-gui".into(),
+    }
+}
+
+fn clear_target_for_workload(active: &ActiveWorkload) -> Option<WorkloadClearTarget> {
+    if !active.present {
+        return None;
+    }
+    match active.source.as_str() {
+        "explicit" => Some(WorkloadClearTarget::Explicit),
+        "focus" => Some(WorkloadClearTarget::Focus),
+        _ => None,
     }
 }
 
@@ -1710,12 +1783,13 @@ async fn handle_command(
                 .await
                 .map(|receipt| receipt.message)
         }
-        ClientCommand::ClearWorkload => {
+        ClientCommand::ClearWorkload(target) => {
             refresh_workloads = true;
-            client
-                .clear_active_workload()
-                .await
-                .map(|receipt| receipt.message)
+            match target {
+                WorkloadClearTarget::Explicit => client.clear_active_workload().await,
+                WorkloadClearTarget::Focus => client.clear_foreground_process().await,
+            }
+            .map(|receipt| receipt.message)
         }
         ClientCommand::SetAppRule(rule) => {
             refresh_rules = true;
@@ -2043,12 +2117,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ErrorDisposition, ReconnectBackoff, RequestErrorKind, cgroup_status_text,
-        classify_client_error, format_frequency, generate_rule_id, parse_workload,
-        running_workload_subtitle, scheduler_status_text, thermal_fraction,
+        ErrorDisposition, ReconnectBackoff, RequestErrorKind, WorkloadClearTarget,
+        cgroup_status_text, classify_client_error, clear_target_for_workload, format_frequency,
+        generate_rule_id, parse_workload, running_workload_subtitle, scheduler_status_text,
+        thermal_fraction,
     };
     use uperf_api::{
-        ApiVersion, AppRule, ClientError, RunningWorkload, SchedulerStatus, WorkloadIdentity,
+        ActiveWorkload, ApiVersion, AppRule, ClientError, RunningWorkload, SchedulerStatus,
+        WorkloadIdentity,
     };
 
     #[test]
@@ -2056,6 +2132,43 @@ mod tests {
         let request = parse_workload("42").expect("valid workload");
         assert_eq!(request.pid, 42);
         assert!(parse_workload("0").is_err());
+    }
+
+    #[test]
+    fn clearing_the_visible_workload_uses_its_published_source() {
+        assert_eq!(
+            clear_target_for_workload(&ActiveWorkload {
+                present: true,
+                source: "explicit".into(),
+                ..ActiveWorkload::default()
+            }),
+            Some(WorkloadClearTarget::Explicit)
+        );
+        assert_eq!(
+            clear_target_for_workload(&ActiveWorkload {
+                present: true,
+                source: "focus".into(),
+                ..ActiveWorkload::default()
+            }),
+            Some(WorkloadClearTarget::Focus)
+        );
+        assert_eq!(
+            clear_target_for_workload(&ActiveWorkload {
+                present: true,
+                source: "future-source".into(),
+                ..ActiveWorkload::default()
+            }),
+            None,
+            "unknown sources must not be guessed"
+        );
+        assert_eq!(
+            clear_target_for_workload(&ActiveWorkload {
+                source: "focus".into(),
+                ..ActiveWorkload::default()
+            }),
+            None,
+            "an absent workload has nothing to clear"
+        );
     }
 
     #[test]

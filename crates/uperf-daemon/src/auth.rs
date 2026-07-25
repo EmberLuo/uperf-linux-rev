@@ -8,7 +8,7 @@ use zbus::{
     fdo::DBusProxy,
     message::Header,
     names::BusName,
-    zvariant::{Str, Value},
+    zvariant::{OwnedObjectPath, Str, Value},
 };
 
 pub const CONTROL_ACTION: &str = "org.uperflinux.control";
@@ -54,6 +54,75 @@ impl Authorizer {
             .get_connection_unix_user(BusName::from(sender.clone()))
             .await
             .map_err(|error| ServiceError::NotAuthorized(error.to_string()))
+    }
+
+    /// Require the caller to sit in a local, currently active logind session.
+    ///
+    /// Focus reporting is not gated by `PolicyKit` because it changes no global
+    /// state, so this is what keeps a background or remote session from
+    /// steering the boost of whoever is physically at the machine. Root and
+    /// development-session peers bypass it so headless verification works.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller cannot be resolved, logind is
+    /// unavailable, or the session is not local and active.
+    pub async fn require_active_local_session(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+    ) -> Result<u32, ServiceError> {
+        let uid = self.caller_uid(connection, header).await?;
+        if uid == 0 || self.mode == AuthorizationMode::DevelopmentSession {
+            return Ok(uid);
+        }
+        let sender = header
+            .sender()
+            .ok_or_else(|| ServiceError::NotAuthorized("D-Bus sender is missing".to_owned()))?;
+        let bus = DBusProxy::new(connection)
+            .await
+            .map_err(|error| ServiceError::Internal(error.to_string()))?;
+        let caller_pid = bus
+            .get_connection_unix_process_id(BusName::from(sender.clone()))
+            .await
+            .map_err(|error| ServiceError::NotAuthorized(error.to_string()))?;
+        let manager = Proxy::new(
+            connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let session: OwnedObjectPath = manager
+            .call("GetSessionByPID", &(caller_pid,))
+            .await
+            .map_err(|_| {
+                ServiceError::NotAuthorized("caller does not belong to a logind session".to_owned())
+            })?;
+        let session = Proxy::new(
+            connection,
+            "org.freedesktop.login1",
+            session.into_inner(),
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let active: bool = session
+            .get_property("Active")
+            .await
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let remote: bool = session
+            .get_property("Remote")
+            .await
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        if active && !remote {
+            Ok(uid)
+        } else {
+            Err(ServiceError::NotAuthorized(
+                "only a local, currently active session may report focus".to_owned(),
+            ))
+        }
     }
 
     /// Require the caller to hold a `PolicyKit` action.

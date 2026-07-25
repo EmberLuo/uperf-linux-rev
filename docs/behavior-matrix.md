@@ -13,6 +13,7 @@
 | GPU | Manual override only | Manual override only in v1 |
 | Workload identity | PID/start-time in some subsystems | Client submits PID only; daemon captures and retains PID, start-time and UID |
 | Game detection | Broad substring scan may change global mode | Discovery only; trusted active workload controls mode |
+| Foreground application | No concept; the workload was always explicit | Compositor-reported focus is a workload source under an expiring authorized lease; it never selects a profile tier |
 | Scheduler | Affinity, nice, uclamp and optional FIFO | Affinity, nice, uclamp, OTHER/BATCH/IDLE; no RT in v1 |
 | Cgroups | Modify existing dedicated systemd units | Preserve with ownership-aware restore |
 | D-Bus | Fixed tuple shapes and cluster indexes | Versioned capabilities and stable target IDs |

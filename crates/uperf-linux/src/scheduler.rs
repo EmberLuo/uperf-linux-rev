@@ -399,17 +399,23 @@ impl SchedulingApi for RealSchedulingApi {
         };
         run_util_linux(
             tool,
-            &[
-                "--pid".to_owned(),
-                process.0.to_string(),
-                "--util-min".to_owned(),
-                minimum.to_string(),
-                "--util-max".to_owned(),
-                maximum.to_string(),
-            ],
+            &uclampset_arguments(process, minimum, maximum),
             &scheduling_path(&self.proc_root, process),
         )
     }
+}
+
+fn uclampset_arguments(process: ProcessId, minimum: u16, maximum: u16) -> [String; 6] {
+    // The short forms are the stable util-linux interface. Some released
+    // versions, including Ubuntu's, do not recognize --util-min/--util-max.
+    [
+        "-m".to_owned(),
+        minimum.to_string(),
+        "-M".to_owned(),
+        maximum.to_string(),
+        "-p".to_owned(),
+        process.0.to_string(),
+    ]
 }
 
 fn run_util_linux(tool: &Path, arguments: &[String], resource: &Path) -> PlatformResult<()> {
@@ -773,6 +779,14 @@ mod tests {
         assert_eq!(parsed.policy, SchedulingClass::Batch);
         assert_eq!(parsed.uclamp_min, Some(128));
         assert_eq!(parsed.uclamp_max, Some(900));
+    }
+
+    #[test]
+    fn uclampset_uses_the_portable_util_linux_cli() {
+        assert_eq!(
+            uclampset_arguments(ProcessId(42), 205, 512),
+            ["-m", "205", "-M", "512", "-p", "42"].map(str::to_owned)
+        );
     }
 
     #[test]

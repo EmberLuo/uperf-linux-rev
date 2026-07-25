@@ -48,6 +48,28 @@ Stop any installed daemon first and capture every original value independently.
 - Active workload exit and PID/TID reuse restore only the verified original
   scheduling state.
 
+## Focus reporting gate
+
+Requires `scheduler.focus.enabled` and a reporter, either the GNOME extension or
+`uperfctl foreground`. Every item must read back the focused thread group's
+`uclamp.min` and `uclamp.max` from `/proc/<tid>/sched` before and after, and the
+defocused process must return to its captured values, not to a default.
+
+- Switching focus between two applications boosts only the newly focused thread
+  group and restores the previous one first, in that order.
+- Focusing a window with no PID, or losing focus entirely, releases the lease.
+- Locking the screen disables the extension, which releases the lease.
+- Stopping the reporter without a clear expires the lease within
+  `lease_ttl_ms`; killing its bus peer releases it immediately.
+- The focused process exiting, including PID reuse by a new process, releases
+  the lease without touching the reusing process.
+- An explicit `uperfctl workload set` outranks the focus lease and is not
+  displaced by later focus changes; clearing it falls back to the live lease.
+- A report for another UID, a protected process, or a caller outside an active
+  local session is refused, appears in `uperfctl health`, and performs zero
+  scheduling writes.
+- Restarting the daemon leaves no boost behind and the extension re-reports.
+
 ## Release gate
 
 - Touch-to-verified-CPU-apply p95 is at most 50 ms under the documented test

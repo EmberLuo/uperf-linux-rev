@@ -154,6 +154,8 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Class" => "类别",
         "Clear" => "清除",
         "Clear active workload" => "清除活动工作负载",
+        "Clear explicit workload" => "清除显式工作负载",
+        "Clear focused workload" => "清除焦点工作负载",
         "Cluster frequency" => "集群频率",
         "Configuration reload" => "重新加载配置",
         "Connected" => "已连接",
@@ -181,6 +183,10 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Follow system language" => "跟随系统语言",
         "Frequency" => "频率",
         "Health" => "健康状态",
+        "Health issues" => "健康状态详情",
+        "Detailed daemon findings, including informational reports" => {
+            "守护进程报告的完整详情，包括提示信息"
+        }
         "Incompatible API" => "API 不兼容",
         "Invalid request" => "无效请求",
         "Language" => "语言",
@@ -249,6 +255,7 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         }
         "State unavailable · not managed" => "状态不可用 · 未托管",
         "Status" => "状态",
+        "Source" => "来源",
         "System service" => "系统服务",
         "Systemd cgroup" => "Systemd cgroup",
         "Task scheduler" => "任务调度",
@@ -350,8 +357,12 @@ pub fn localized_protocol_value(value: &str) -> String {
         "connected" => "已连接".to_owned(),
         "critical" => "严重".to_owned(),
         "degraded" => "降级".to_owned(),
+        "error" => "错误".to_owned(),
+        "explicit" => "显式指定".to_owned(),
+        "focus" => "窗口焦点".to_owned(),
         "gesture" | "Gesture" => "手势".to_owned(),
         "healthy" => "健康".to_owned(),
+        "info" => "提示".to_owned(),
         "idle" | "Idle" => "空闲".to_owned(),
         "normal" => "正常".to_owned(),
         "performance" => "性能".to_owned(),
@@ -366,6 +377,11 @@ pub fn localized_protocol_value(value: &str) -> String {
         "unavailable" => "不可用".to_owned(),
         "wake" | "Wake" => "唤醒".to_owned(),
         "warning" => "警告".to_owned(),
+        "all mandatory components are healthy" => "所有必要组件均正常".to_owned(),
+        "one or more mandatory components failed" => "一个或多个必要组件发生故障".to_owned(),
+        "running with one or more safety or capability restrictions" => {
+            "正在受一个或多个安全或功能限制运行".to_owned()
+        }
         _ => value.to_owned(),
     }
 }

@@ -65,6 +65,12 @@ pub trait Daemon1 {
     /// Clear the daemon's currently selected stable workload identity.
     fn clear_active_workload(&self) -> zbus::Result<MutationReceipt>;
 
+    /// Report the compositor's focused PID as an implicit workload source.
+    fn set_foreground_process(&self, pid: u32, reason: &str) -> zbus::Result<MutationReceipt>;
+
+    /// Release the focus lease held for the caller.
+    fn clear_foreground_process(&self) -> zbus::Result<MutationReceipt>;
+
     /// Atomically replace overrides for the listed stable targets.
     fn set_frequency_overrides(
         &self,
@@ -248,6 +254,46 @@ impl DaemonClient {
         self.proxy()
             .await?
             .clear_active_workload()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Report the currently focused PID.
+    ///
+    /// The receipt confirms only that the report was accepted for resolution.
+    /// A PID the daemon later refuses surfaces as a `focus.rejected` health
+    /// issue, which keeps rapid window switching off the control lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid PID or a rejected D-Bus call.
+    pub async fn set_foreground_process(
+        &self,
+        pid: u32,
+        reason: &str,
+    ) -> Result<MutationReceipt, ClientError> {
+        validate_workload_pid(pid)?;
+        if reason.len() > 256 {
+            return Err(ClientError::InvalidRequest(
+                "focus reason exceeds 256 bytes".into(),
+            ));
+        }
+        self.proxy()
+            .await?
+            .set_foreground_process(pid, reason)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Release the focus lease held for this caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the D-Bus call is rejected.
+    pub async fn clear_foreground_process(&self) -> Result<MutationReceipt, ClientError> {
+        self.proxy()
+            .await?
+            .clear_foreground_process()
             .await
             .map_err(ClientError::from)
     }

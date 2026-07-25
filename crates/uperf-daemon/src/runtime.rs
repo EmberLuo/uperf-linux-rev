@@ -27,7 +27,7 @@ use uperf_core::{
     Hertz, Hint, HintSet, InputConfig, MilliCelsius, ModeSelection, MonotonicMillis,
     ObservedFrequency, ObservedState, ProcessId, ProcessIdentity, ProcessInfo, ProfileId, Scene,
     SensorHealth, TargetId, TaskPlan, ThermalGuard, ThermalReading, ThermalState,
-    ThermalThresholds, worst_thermal_state,
+    ThermalThresholds, WorkloadSource, worst_thermal_state,
 };
 use uperf_linux::{LinuxDiscovery, LinuxEnvironment};
 use uperf_platform::{
@@ -52,6 +52,8 @@ const PROCESS_IDENTITY_THREAD_STACK_SIZE: usize = 256 * 1024;
 const APP_PERSISTENCE_IN_FLIGHT: &str = "an application-rule update is still being persisted";
 const RELOAD_IN_FLIGHT: &str = "configuration reload is still being prepared";
 const PROCESS_IDENTITY_IN_FLIGHT: &str = "a workload identity lookup is still in progress";
+const FOCUS_REJECTED_ISSUE: &str = "focus.rejected";
+const FOCUS_REASON_LIMIT: usize = 256;
 
 /// Errors produced by the state owner before D-Bus translation.
 #[derive(Debug, Error)]
@@ -146,6 +148,18 @@ enum Command {
         caller_uid: u32,
         reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
     },
+    SetForegroundProcess {
+        pid: u32,
+        reason: String,
+        caller_uid: u32,
+        peer: Option<String>,
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    },
+    ClearForegroundProcess {
+        caller_uid: u32,
+        reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
+    },
+    ForgetForegroundPeer(String),
     SetFrequencyOverrides {
         overrides: Vec<FrequencyOverride>,
         reply: oneshot::Sender<Result<MutationReceipt, RuntimeError>>,
@@ -264,6 +278,58 @@ impl RuntimeHandle {
     ) -> Result<MutationReceipt, RuntimeError> {
         self.request(|reply| Command::ClearActiveWorkload { caller_uid, reply })
             .await
+    }
+
+    /// Report the compositor's currently focused process.
+    ///
+    /// The receipt is returned before identity resolution finishes: a rejected
+    /// PID surfaces as a `focus.rejected` health issue instead of an error, so
+    /// rapid window switching can never block the control lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime error for an invalid PID or when the task stops.
+    pub async fn set_foreground_process(
+        &self,
+        pid: u32,
+        reason: String,
+        caller_uid: u32,
+        peer: Option<String>,
+    ) -> Result<MutationReceipt, RuntimeError> {
+        self.request(|reply| Command::SetForegroundProcess {
+            pid,
+            reason,
+            caller_uid,
+            peer,
+            reply,
+        })
+        .await
+    }
+
+    /// Release the focus lease held for the caller's session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime error when the caller does not own the lease or the
+    /// task stops.
+    pub async fn clear_foreground_process(
+        &self,
+        caller_uid: u32,
+    ) -> Result<MutationReceipt, RuntimeError> {
+        self.request(|reply| Command::ClearForegroundProcess { caller_uid, reply })
+            .await
+    }
+
+    /// Drop the focus lease owned by a D-Bus peer that disappeared.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state task has stopped.
+    pub async fn forget_foreground_peer(&self, peer: String) -> Result<(), RuntimeError> {
+        self.commands
+            .send(Command::ForgetForegroundPeer(peer))
+            .await
+            .map_err(|_| RuntimeError::Internal("state task has stopped".to_owned()))
     }
 
     /// Submit one atomic batch of logical frequency overrides.
@@ -443,12 +509,44 @@ enum ProcessIdentityPurpose {
     Refresh {
         expected: ProcessIdentity,
     },
+    /// Resolve a compositor focus report. Carries no reply channel: the caller
+    /// was already acknowledged, so this must not occupy the control slot.
+    Focus {
+        pid: ProcessId,
+        caller_uid: u32,
+        peer: Option<String>,
+        revision: u64,
+    },
+    RefreshFocus {
+        expected: ProcessIdentity,
+    },
 }
 
 impl ProcessIdentityPurpose {
     const fn is_control_request(&self) -> bool {
-        !matches!(self, Self::Refresh { .. })
+        matches!(self, Self::Set { .. } | Self::Clear { .. })
     }
+}
+
+/// A compositor-granted focus lease.
+///
+/// Invalidated three independent ways: TTL expiry on the reducer tick, D-Bus
+/// peer disconnect, and process exit detected through `start_time_ticks`.
+#[derive(Clone, Debug)]
+struct FocusLease {
+    info: ProcessInfo,
+    peer: Option<String>,
+    expires_at: MonotonicMillis,
+}
+
+/// Latest-wins slot for a focus report awaiting identity resolution.
+#[derive(Clone, Debug)]
+struct PendingFocusReport {
+    pid: ProcessId,
+    caller_uid: u32,
+    peer: Option<String>,
+    not_before: MonotonicMillis,
+    revision: u64,
 }
 
 struct ProcessIdentityOutcome {
@@ -747,6 +845,9 @@ struct RuntimeActor {
     mode: ModeSelection,
     active_workload: Option<ProcessInfo>,
     requested_workload_profile: Option<ProfileId>,
+    focus_lease: Option<FocusLease>,
+    pending_focus: Option<PendingFocusReport>,
+    focus_report_revision: u64,
     observed: ObservedState,
     desired: Option<DesiredPlan>,
     applied: AppliedState,
@@ -812,6 +913,7 @@ struct RuntimeStateSignature {
     config_generation: u64,
     mode: ModeSelection,
     active_workload: Option<ProcessIdentity>,
+    focused_workload: Option<ProcessIdentity>,
     effective_profile: ProfileId,
     dominant_scene: Scene,
     thermal_state: ThermalState,
@@ -861,6 +963,9 @@ impl RuntimeActor {
             mode: ModeSelection::Auto,
             active_workload: None,
             requested_workload_profile: None,
+            focus_lease: None,
+            pending_focus: None,
+            focus_report_revision: 0,
             observed: ObservedState {
                 timestamp: MonotonicMillis::new(0),
                 cpu_loads: BTreeMap::new(),
@@ -1015,6 +1120,7 @@ impl RuntimeActor {
             config_generation: self.config_generation,
             mode: self.mode,
             active_workload: self.active_workload.as_ref().map(|info| info.identity),
+            focused_workload: self.focus_lease.as_ref().map(|lease| lease.info.identity),
             effective_profile,
             dominant_scene,
             thermal_state: self.thermal_state,
@@ -1229,6 +1335,7 @@ impl RuntimeActor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::SetMode { mode, reply } => {
@@ -1254,6 +1361,27 @@ impl RuntimeActor {
                 } else {
                     self.start_clear_workload(caller_uid, reply);
                 }
+            }
+            Command::SetForegroundProcess {
+                pid,
+                reason,
+                caller_uid,
+                peer,
+                reply,
+            } => {
+                let result = self
+                    .require_accepting_control()
+                    .and_then(|()| self.accept_focus_report(pid, &reason, caller_uid, peer));
+                let _ = reply.send(result);
+            }
+            Command::ClearForegroundProcess { caller_uid, reply } => {
+                let result = self
+                    .require_accepting_control()
+                    .and_then(|()| self.command_clear_foreground(caller_uid));
+                let _ = reply.send(result);
+            }
+            Command::ForgetForegroundPeer(peer) => {
+                self.forget_focus_peer(&peer);
             }
             Command::SetFrequencyOverrides { overrides, reply } => {
                 let result = self
@@ -1886,18 +2014,21 @@ impl RuntimeActor {
         if had_expired_overrides {
             self.generation = self.generation.saturating_add(1);
         }
+        let focus_expired = self.expire_focus_lease(now);
+        self.drive_pending_focus(now);
         if now.saturating_duration_since(self.last_workload_check) >= WORKLOAD_CHECK_INTERVAL_MS {
             self.last_workload_check = now;
             self.check_workload_identity();
         }
-        if self.active_workload.is_some()
+        if self.effective_workload().is_some()
             && self.configuration.policy.scheduler.enabled
             && now.saturating_duration_since(self.last_scheduler_scan) >= WORKLOAD_CHECK_INTERVAL_MS
         {
             self.last_scheduler_scan = now;
             self.scheduler_dirty = true;
         }
-        if hints_expired
+        if focus_expired
+            || hints_expired
             || thermal_changed
             || load_changed
             || had_expired_overrides
@@ -2322,7 +2453,21 @@ impl RuntimeActor {
             ProcessIdentityPurpose::Refresh { expected } => {
                 self.complete_workload_refresh(expected, outcome.result);
             }
+            ProcessIdentityPurpose::Focus {
+                pid,
+                caller_uid,
+                peer,
+                revision,
+            } => {
+                self.complete_focus_report(pid, caller_uid, peer, revision, outcome.result);
+            }
+            ProcessIdentityPurpose::RefreshFocus { expected } => {
+                self.complete_focus_refresh(expected, outcome.result);
+            }
         }
+        // A superseded focus report waits behind whichever read just finished.
+        let now = self.environment.monotonic_millis();
+        self.drive_pending_focus(now);
     }
 
     fn complete_workload_refresh(
@@ -2365,6 +2510,299 @@ impl RuntimeActor {
             ),
         );
         self.evaluate_and_reconcile();
+    }
+
+    /// The workload every scheduling decision applies to.
+    ///
+    /// An explicit selection always wins; focus only fills the gap. Focus is a
+    /// workload *source*, never a profile tier.
+    fn effective_workload(&self) -> Option<&ProcessInfo> {
+        self.active_workload
+            .as_ref()
+            .or_else(|| self.focus_lease.as_ref().map(|lease| &lease.info))
+    }
+
+    const fn effective_workload_source(&self) -> WorkloadSource {
+        if self.active_workload.is_some() {
+            WorkloadSource::Explicit
+        } else {
+            WorkloadSource::Focus
+        }
+    }
+
+    /// Acknowledge a focus report immediately and resolve its identity later.
+    ///
+    /// Focus reports must not travel the control-request lane: a compositor
+    /// that alt-tabs quickly would otherwise receive a stream of conflicts and
+    /// would block `uperfctl workload set` while doing so.
+    fn accept_focus_report(
+        &mut self,
+        pid: u32,
+        reason: &str,
+        caller_uid: u32,
+        peer: Option<String>,
+    ) -> Result<MutationReceipt, RuntimeError> {
+        if pid == 0 || pid == 1 {
+            return Err(RuntimeError::InvalidArgument(
+                "focused PID must be a real userspace process".to_owned(),
+            ));
+        }
+        if reason.len() > FOCUS_REASON_LIMIT {
+            return Err(RuntimeError::InvalidArgument(
+                "focus audit reason exceeds 256 bytes".to_owned(),
+            ));
+        }
+        let focus = &self.configuration.policy.scheduler.focus;
+        if !focus.enabled {
+            return Err(RuntimeError::Degraded(
+                "focus-driven scheduling is disabled by configuration".to_owned(),
+            ));
+        }
+        let now = self.environment.monotonic_millis();
+        let ttl = focus.lease_ttl_ms;
+        let debounce = focus.debounce_ms;
+        let pid = ProcessId::new(pid);
+        let revision = self.advance_focus_report_revision();
+        if let Some(lease) = &mut self.focus_lease
+            && lease.info.identity.pid == pid
+            && lease.peer == peer
+        {
+            lease.expires_at = now.saturating_add(ttl);
+            self.pending_focus = None;
+            return Ok(receipt(self.generation, Vec::new(), "focus lease renewed"));
+        }
+        // Latest-wins: a single slot collapses a burst of window switches into
+        // one identity read.
+        self.pending_focus = Some(PendingFocusReport {
+            pid,
+            caller_uid,
+            peer,
+            not_before: now.saturating_add(debounce),
+            revision,
+        });
+        self.drive_pending_focus(now);
+        Ok(receipt(
+            self.generation,
+            vec![format!("focus:{}", pid.get())],
+            "focus report accepted",
+        ))
+    }
+
+    fn drive_pending_focus(&mut self, now: MonotonicMillis) {
+        if self.process_identity_in_flight.is_some() {
+            return;
+        }
+        let Some(pending) = &self.pending_focus else {
+            return;
+        };
+        if now < pending.not_before {
+            return;
+        }
+        let pending = self.pending_focus.take().expect("pending focus present");
+        self.start_process_identity_read(
+            pending.pid,
+            ProcessIdentityPurpose::Focus {
+                pid: pending.pid,
+                caller_uid: pending.caller_uid,
+                peer: pending.peer,
+                revision: pending.revision,
+            },
+        );
+    }
+
+    fn complete_focus_report(
+        &mut self,
+        pid: ProcessId,
+        caller_uid: u32,
+        peer: Option<String>,
+        revision: u64,
+        result: Result<ProcessInfo, String>,
+    ) {
+        if revision != self.focus_report_revision
+            || !self.configuration.policy.scheduler.focus.enabled
+        {
+            return;
+        }
+        let observed = match result {
+            Ok(observed) => observed,
+            Err(error) => {
+                self.reject_focus(peer.as_deref(), error);
+                return;
+            }
+        };
+        if observed.identity.pid != pid {
+            self.reject_focus(
+                peer.as_deref(),
+                "focused PID changed while its identity was resolved",
+            );
+            return;
+        }
+        if caller_uid != 0
+            && (!observed.owner_control_safe || observed.identity.uid.get() != caller_uid)
+        {
+            self.reject_focus(
+                peer.as_deref(),
+                "non-root reporters may only focus a process whose real/effective/saved/fs UIDs all equal their UID",
+            );
+            return;
+        }
+        if self.configuration.policy_engine.focus_protects(&observed) {
+            self.reject_focus(
+                peer.as_deref(),
+                format!("process {} is protected from focus leasing", observed.comm),
+            );
+            return;
+        }
+        self.health_issues.remove(FOCUS_REJECTED_ISSUE);
+        let now = self.environment.monotonic_millis();
+        let expires_at = now.saturating_add(self.configuration.policy.scheduler.focus.lease_ttl_ms);
+        let unchanged = self
+            .focus_lease
+            .as_ref()
+            .is_some_and(|lease| lease.info == observed && lease.peer == peer);
+        self.focus_lease = Some(FocusLease {
+            info: observed,
+            peer,
+            expires_at,
+        });
+        if unchanged {
+            return;
+        }
+        // Task plans live only in the blocking reconciler and are copied
+        // forward otherwise, so a focus transition must mark them dirty.
+        self.scheduler_dirty = true;
+        self.generation = self.generation.saturating_add(1);
+        self.evaluate_and_reconcile();
+    }
+
+    fn advance_focus_report_revision(&mut self) -> u64 {
+        self.focus_report_revision = self.focus_report_revision.saturating_add(1);
+        self.focus_report_revision
+    }
+
+    fn invalidate_focus_reports(&mut self) {
+        self.advance_focus_report_revision();
+        self.pending_focus = None;
+    }
+
+    fn reject_focus(&mut self, peer: Option<&str>, message: impl Into<String>) {
+        self.health_issues.insert(
+            FOCUS_REJECTED_ISSUE.to_owned(),
+            issue(FOCUS_REJECTED_ISSUE, "info", "focus", message),
+        );
+        let replaces_lease = self
+            .focus_lease
+            .as_ref()
+            .is_some_and(|lease| lease.peer.as_deref() == peer);
+        if replaces_lease {
+            self.release_focus_lease();
+        }
+    }
+
+    fn command_clear_foreground(
+        &mut self,
+        caller_uid: u32,
+    ) -> Result<MutationReceipt, RuntimeError> {
+        let owner_uid = self
+            .pending_focus
+            .as_ref()
+            .map(|pending| pending.caller_uid);
+        if let Some(lease) = &self.focus_lease {
+            if caller_uid != 0 && lease.info.identity.uid.get() != caller_uid {
+                return Err(RuntimeError::NotAuthorized(
+                    "non-root callers may only clear a focus lease owned by their UID".to_owned(),
+                ));
+            }
+        } else if let Some(uid) = owner_uid {
+            if caller_uid != 0 && uid != caller_uid {
+                return Err(RuntimeError::NotAuthorized(
+                    "non-root callers may only clear their own focus report".to_owned(),
+                ));
+            }
+        } else {
+            return Ok(receipt(
+                self.generation,
+                Vec::new(),
+                "no focused process was reported",
+            ));
+        }
+        self.invalidate_focus_reports();
+        let pid = self
+            .focus_lease
+            .as_ref()
+            .map(|lease| lease.info.identity.pid);
+        if !self.release_focus_lease() {
+            return Ok(receipt(
+                self.generation,
+                Vec::new(),
+                "pending focus report discarded",
+            ));
+        }
+        Ok(receipt(
+            self.generation,
+            pid.map(|pid| format!("focus:{}", pid.get()))
+                .into_iter()
+                .collect(),
+            "focused process cleared",
+        ))
+    }
+
+    fn forget_focus_peer(&mut self, peer: &str) {
+        let pending_matches = self
+            .pending_focus
+            .as_ref()
+            .is_some_and(|pending| pending.peer.as_deref() == Some(peer));
+        if pending_matches {
+            self.invalidate_focus_reports();
+        }
+        let lease_matches = self
+            .focus_lease
+            .as_ref()
+            .is_some_and(|lease| lease.peer.as_deref() == Some(peer));
+        if lease_matches {
+            self.release_focus_lease();
+        }
+    }
+
+    /// Drop the lease and schedule restoration of its task plans.
+    ///
+    /// Returns whether a lease was actually held.
+    fn release_focus_lease(&mut self) -> bool {
+        if self.focus_lease.take().is_none() {
+            return false;
+        }
+        self.scheduler_dirty = true;
+        self.generation = self.generation.saturating_add(1);
+        self.evaluate_and_reconcile();
+        true
+    }
+
+    fn complete_focus_refresh(
+        &mut self,
+        expected: ProcessIdentity,
+        result: Result<ProcessInfo, String>,
+    ) {
+        let Some(lease) = self.focus_lease.clone() else {
+            return;
+        };
+        if lease.info.identity != expected {
+            return;
+        }
+        if let Ok(current) = result
+            && current.identity == expected
+        {
+            if current != lease.info {
+                self.focus_lease = Some(FocusLease {
+                    info: current,
+                    ..lease
+                });
+                self.scheduler_dirty = true;
+                self.generation = self.generation.saturating_add(1);
+                self.evaluate_and_reconcile();
+            }
+            return;
+        }
+        self.release_focus_lease();
     }
 
     fn command_set_overrides(
@@ -2553,6 +2991,15 @@ impl RuntimeActor {
         let next_observer_generation = self.observer_generation.saturating_add(1);
         let observer_settings =
             ObserverSettings::from_configuration(&candidate, next_observer_generation);
+        let focus_will_be_enabled = candidate.policy.scheduler.focus.enabled;
+        // A report accepted under an older configuration must never install a
+        // lease after the atomic swap. The worker may already be inside
+        // procfs, so invalidate its revision instead of trying to cancel it.
+        self.invalidate_focus_reports();
+        if !focus_will_be_enabled {
+            self.focus_lease = None;
+            self.health_issues.remove(FOCUS_REJECTED_ISSUE);
+        }
         self.configuration = candidate;
         self.config_generation = next_config_generation;
         self.observer_generation = next_observer_generation;
@@ -2713,8 +3160,7 @@ impl RuntimeActor {
             .map(|(id, request)| (id.clone(), request.limits))
             .collect::<BTreeMap<_, _>>();
         let app_profile = self.requested_workload_profile.or_else(|| {
-            self.active_workload
-                .as_ref()
+            self.effective_workload()
                 .and_then(|info| self.match_app_profile(info))
         });
         let cpu_targets = self.configuration.cpu_target_policies();
@@ -2785,7 +3231,8 @@ impl RuntimeActor {
             actuator,
             environment: self.environment.clone(),
             policy_engine: self.configuration.policy_engine.clone(),
-            active_workload: self.active_workload.clone(),
+            workload: self.effective_workload().cloned(),
+            workload_source: self.effective_workload_source(),
             desired,
             applied: self.applied.clone(),
             applied_units: self.applied_units.clone(),
@@ -3034,16 +3481,42 @@ impl RuntimeActor {
     }
 
     fn check_workload_identity(&mut self) {
-        if self.process_identity_in_flight.is_some() {
+        if self.process_identity_in_flight.is_some() || self.pending_focus.is_some() {
             return;
         }
-        let Some(expected) = self.active_workload.as_ref().map(|active| active.identity) else {
+        // One liveness slot, explicit first. A focus lease additionally has its
+        // TTL as a backstop, so losing a turn here is harmless.
+        if let Some(expected) = self.active_workload.as_ref().map(|active| active.identity) {
+            self.start_process_identity_read(
+                expected.pid,
+                ProcessIdentityPurpose::Refresh { expected },
+            );
             return;
-        };
-        self.start_process_identity_read(
-            expected.pid,
-            ProcessIdentityPurpose::Refresh { expected },
-        );
+        }
+        if let Some(expected) = self.focus_lease.as_ref().map(|lease| lease.info.identity) {
+            self.start_process_identity_read(
+                expected.pid,
+                ProcessIdentityPurpose::RefreshFocus { expected },
+            );
+        }
+    }
+
+    /// Expire a focus lease whose reporter stopped renewing it.
+    ///
+    /// Returns whether the lease was dropped, letting the caller fold this into
+    /// its existing reconcile decision instead of evaluating twice.
+    fn expire_focus_lease(&mut self, now: MonotonicMillis) -> bool {
+        let expired = self
+            .focus_lease
+            .as_ref()
+            .is_some_and(|lease| now >= lease.expires_at);
+        if !expired {
+            return false;
+        }
+        self.focus_lease = None;
+        self.scheduler_dirty = true;
+        self.generation = self.generation.saturating_add(1);
+        true
     }
 
     fn match_app_profile(&self, process: &ProcessInfo) -> Option<ProfileId> {
@@ -3277,6 +3750,11 @@ impl RuntimeActor {
         capabilities
             .features
             .push(feature::RUNNING_WORKLOADS.to_owned());
+        if self.configuration.policy.scheduler.focus.enabled {
+            capabilities
+                .features
+                .push(feature::FOREGROUND_FOCUS.to_owned());
+        }
         let writable = self.actuator.is_some() && !self.actuator_read_only;
         for target in &mut capabilities.targets {
             target.can_override = writable;
@@ -3376,8 +3854,12 @@ impl RuntimeActor {
     }
 
     fn api_active_workload(&self, effective_profile: &str) -> ActiveWorkload {
-        let Some(process) = &self.active_workload else {
+        let Some(process) = self.effective_workload() else {
             return ActiveWorkload::default();
+        };
+        let source = match self.effective_workload_source() {
+            WorkloadSource::Explicit => "explicit",
+            WorkloadSource::Focus => "focus",
         };
         ActiveWorkload {
             present: true,
@@ -3387,15 +3869,12 @@ impl RuntimeActor {
                 .requested_workload_profile
                 .map_or_else(String::new, |profile| profile.to_string()),
             effective_mode: effective_profile.to_owned(),
-            source: "explicit".to_owned(),
+            source: source.to_owned(),
         }
     }
 
     fn api_scheduler_status(&self) -> SchedulerStatus {
-        let report_matches_active = self
-            .active_workload
-            .as_ref()
-            .map(|process| process.identity)
+        let report_matches_active = self.effective_workload().map(|process| process.identity)
             == self.scheduler_report.workload;
         if !report_matches_active {
             return SchedulerStatus {
@@ -4624,6 +5103,470 @@ mod tests {
         assert_eq!(
             actor.process_identity_in_flight.map(|request| request.id),
             Some(2)
+        );
+    }
+
+    fn held_focus_lease(process: ProcessInfo, peer: &str, expires_at: u64) -> FocusLease {
+        FocusLease {
+            info: process,
+            peer: Some(peer.to_owned()),
+            expires_at: MonotonicMillis::new(expires_at),
+        }
+    }
+
+    fn focus_reload_candidate(root: &std::path::Path, enabled: bool) -> ResolvedConfiguration {
+        let mut configuration =
+            actor_parts(root, FakeClock::new(MonotonicMillis::new(10))).configuration;
+        configuration.policy.scheduler.focus.enabled = enabled;
+        configuration.policy_engine =
+            PolicyEngine::new(configuration.policy.clone()).expect("rebuild policy engine");
+        configuration
+    }
+
+    /// `actuator: None` makes `evaluate_and_reconcile` clear `scheduler_dirty`,
+    /// but only after the `mutations_activated` gate, which defaults to false in
+    /// these tests. So `scheduler_dirty` survives and can be asserted directly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_workload_outranks_a_focus_lease() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let focused = test_process(42, 1_000);
+        actor.focus_lease = Some(held_focus_lease(focused.clone(), ":1.7", 10_000));
+
+        assert_eq!(actor.effective_workload(), Some(&focused));
+        assert_eq!(actor.effective_workload_source(), WorkloadSource::Focus);
+        assert_eq!(actor.api_active_workload("balanced").source, "focus");
+
+        let explicit = test_process(43, 1_000);
+        actor.active_workload = Some(explicit.clone());
+
+        assert_eq!(actor.effective_workload(), Some(&explicit));
+        assert_eq!(actor.effective_workload_source(), WorkloadSource::Explicit);
+        assert_eq!(actor.api_active_workload("balanced").source, "explicit");
+        // The lease is still held; explicit selection shadows it rather than
+        // destroying it, so releasing the explicit workload restores focus.
+        assert!(actor.focus_lease.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_focus_lease_expires_when_its_reporter_stops_renewing() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let clock = FakeClock::new(MonotonicMillis::new(10));
+        let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
+        actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 200));
+
+        actor.on_tick();
+        assert!(actor.focus_lease.is_some(), "lease is still within its TTL");
+
+        let _ = clock.advance(300);
+        actor.on_tick();
+
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.scheduler_dirty, "expiry must replan the task set");
+        assert!(actor.effective_workload().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_vanished_peer_drops_both_its_pending_report_and_its_lease() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.pending_focus = Some(PendingFocusReport {
+            pid: ProcessId::new(43),
+            caller_uid: 1_000,
+            peer: Some(":1.7".to_owned()),
+            not_before: MonotonicMillis::new(160),
+            revision: actor.focus_report_revision,
+        });
+
+        actor.forget_focus_peer(":1.9");
+        assert!(actor.focus_lease.is_some());
+        assert!(actor.pending_focus.is_some());
+
+        actor.forget_focus_peer(":1.7");
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.pending_focus.is_none());
+        assert!(actor.scheduler_dirty);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_focus_lease_is_released_when_its_process_exits() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let focused = test_process(42, 1_000);
+        let expected = focused.identity;
+        actor.focus_lease = Some(held_focus_lease(focused.clone(), ":1.7", 10_000));
+
+        // PID reuse: same PID, different start time.
+        let mut reused = focused;
+        reused.identity.start_time_ticks = 999;
+        actor.complete_focus_refresh(expected, Ok(reused));
+
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.scheduler_dirty);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cross_uid_focus_report_is_rejected_without_failing_the_caller() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let foreign = test_process(42, 1_000);
+
+        actor.complete_focus_report(
+            ProcessId::new(42),
+            1_001,
+            Some(":1.7".to_owned()),
+            0,
+            Ok(foreign),
+        );
+
+        assert!(actor.focus_lease.is_none());
+        assert!(!actor.scheduler_dirty);
+        assert_eq!(
+            actor
+                .health_issues
+                .get(FOCUS_REJECTED_ISSUE)
+                .map(|issue| issue.severity.as_str()),
+            Some("info"),
+            "a rejected PID is observable but is never a caller-visible error"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_replacement_releases_the_reporting_peers_old_lease() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut protected = test_process(43, 1_000);
+        protected.comm = "gnome-shell".to_owned();
+        let cases = [
+            (
+                "identity resolution",
+                Err("focused process vanished".to_owned()),
+            ),
+            ("UID authorization", Ok(test_process(43, 1_001))),
+            ("protected process", Ok(protected)),
+        ];
+
+        for (case, result) in cases {
+            let mut actor = actor_for_test(actor_parts(
+                temporary.path(),
+                FakeClock::new(MonotonicMillis::new(10)),
+            ));
+            actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+            actor.focus_report_revision = 1;
+            let generation = actor.generation;
+
+            actor.complete_focus_report(
+                ProcessId::new(43),
+                1_000,
+                Some(":1.7".to_owned()),
+                1,
+                result,
+            );
+
+            assert!(
+                actor.focus_lease.is_none(),
+                "{case} rejection must not leave the previous process focused"
+            );
+            assert!(
+                actor.scheduler_dirty,
+                "{case} rejection must schedule restoration"
+            );
+            assert_eq!(actor.generation, generation.saturating_add(1), "{case}");
+            assert!(
+                actor.health_issues.contains_key(FOCUS_REJECTED_ISSUE),
+                "{case} rejection remains observable"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_rejection_cannot_release_a_newer_focus_lease() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let current = test_process(44, 1_000);
+        actor.focus_lease = Some(held_focus_lease(current.clone(), ":1.7", 10_000));
+        actor.focus_report_revision = 2;
+
+        actor.complete_focus_report(
+            ProcessId::new(43),
+            1_000,
+            Some(":1.7".to_owned()),
+            1,
+            Err("superseded identity read failed".to_owned()),
+        );
+
+        assert_eq!(
+            actor.focus_lease.as_ref().map(|lease| &lease.info),
+            Some(&current)
+        );
+        assert!(!actor.health_issues.contains_key(FOCUS_REJECTED_ISSUE));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_protected_process_never_receives_a_focus_lease() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let mut compositor = test_process(42, 1_000);
+        compositor.comm = "gnome-shell".to_owned();
+
+        actor.complete_focus_report(
+            ProcessId::new(42),
+            1_000,
+            Some(":1.7".to_owned()),
+            0,
+            Ok(compositor),
+        );
+
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.health_issues.contains_key(FOCUS_REJECTED_ISSUE));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_accepted_focus_report_without_executable_enters_the_signature() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        let mut focused = test_process(42, 1_000);
+        // The hardened service intentionally lacks CAP_SYS_PTRACE, so Linux
+        // may deny /proc/PID/exe for an otherwise valid same-session process.
+        // Executable is matching metadata, not part of the stable identity.
+        focused.executable = None;
+        let before = actor.state_signature();
+
+        actor.complete_focus_report(
+            ProcessId::new(42),
+            1_000,
+            Some(":1.7".to_owned()),
+            0,
+            Ok(focused.clone()),
+        );
+
+        assert_eq!(
+            actor.focus_lease.as_ref().map(|lease| lease.info.clone()),
+            Some(focused.clone())
+        );
+        assert!(
+            actor.scheduler_dirty,
+            "task plans are computed only in the blocking reconciler"
+        );
+        let after = actor.state_signature();
+        assert_eq!(after.focused_workload, Some(focused.identity));
+        assert_ne!(
+            before, after,
+            "StateChanged must fire on a focus transition"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_focus_reports_collapses_into_one_latest_wins_slot() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+
+        for pid in [42_u32, 43, 44] {
+            actor
+                .accept_focus_report(pid, "alt-tab burst", 1_000, Some(":1.7".to_owned()))
+                .expect("focus reports are accepted immediately");
+        }
+
+        let pending = actor.pending_focus.as_ref().expect("pending focus report");
+        assert_eq!(pending.pid, ProcessId::new(44));
+        assert!(
+            actor.process_identity_in_flight.is_none(),
+            "the debounce window must not have started an identity read yet"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_newer_focus_report_invalidates_an_older_identity_result() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        actor
+            .accept_focus_report(42, "first", 1_000, Some(":1.7".to_owned()))
+            .expect("first report");
+        let stale_revision = actor
+            .pending_focus
+            .as_ref()
+            .expect("first pending report")
+            .revision;
+        actor
+            .accept_focus_report(43, "second", 1_000, Some(":1.7".to_owned()))
+            .expect("second report");
+        let current_revision = actor
+            .pending_focus
+            .as_ref()
+            .expect("latest pending report")
+            .revision;
+
+        actor.complete_focus_report(
+            ProcessId::new(42),
+            1_000,
+            Some(":1.7".to_owned()),
+            stale_revision,
+            Ok(test_process(42, 1_000)),
+        );
+
+        assert!(actor.focus_lease.is_none());
+        assert_eq!(
+            actor.pending_focus.as_ref().map(|pending| pending.pid),
+            Some(ProcessId::new(43))
+        );
+
+        actor.pending_focus = None;
+        actor.complete_focus_report(
+            ProcessId::new(43),
+            1_000,
+            Some(":1.7".to_owned()),
+            current_revision,
+            Ok(test_process(43, 1_000)),
+        );
+        assert_eq!(
+            actor
+                .focus_lease
+                .as_ref()
+                .map(|lease| lease.info.identity.pid),
+            Some(ProcessId::new(43))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabling_focus_on_reload_clears_pending_and_held_state() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.focus_report_revision = 7;
+        actor.pending_focus = Some(PendingFocusReport {
+            pid: ProcessId::new(43),
+            caller_uid: 1_000,
+            peer: Some(":1.7".to_owned()),
+            not_before: MonotonicMillis::new(160),
+            revision: 7,
+        });
+        let candidate = focus_reload_candidate(temporary.path(), false);
+
+        actor.apply_reload_candidate(candidate);
+
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.pending_focus.is_none());
+        assert!(actor.scheduler_dirty, "reload must schedule restoration");
+        assert!(actor.effective_workload().is_none());
+
+        actor.complete_focus_report(
+            ProcessId::new(43),
+            1_000,
+            Some(":1.7".to_owned()),
+            7,
+            Ok(test_process(43, 1_000)),
+        );
+        assert!(
+            actor.focus_lease.is_none(),
+            "a pre-reload identity result cannot reinstall the lease"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_invalidates_pending_results_even_when_focus_stays_enabled() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        actor.focus_report_revision = 3;
+        actor.pending_focus = Some(PendingFocusReport {
+            pid: ProcessId::new(43),
+            caller_uid: 1_000,
+            peer: Some(":1.7".to_owned()),
+            not_before: MonotonicMillis::new(160),
+            revision: 3,
+        });
+
+        actor.apply_reload_candidate(focus_reload_candidate(temporary.path(), true));
+        actor.complete_focus_report(
+            ProcessId::new(43),
+            1_000,
+            Some(":1.7".to_owned()),
+            3,
+            Ok(test_process(43, 1_000)),
+        );
+
+        assert!(actor.pending_focus.is_none());
+        assert!(actor.focus_lease.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clearing_focus_releases_the_lease_and_rejects_other_owners() {
+        let temporary = tempfile::tempdir().expect("temporary configuration roots");
+        let mut actor = actor_for_test(actor_parts(
+            temporary.path(),
+            FakeClock::new(MonotonicMillis::new(10)),
+        ));
+        assert!(
+            actor
+                .command_clear_foreground(1_000)
+                .expect("clearing nothing succeeds")
+                .changed_ids
+                .is_empty()
+        );
+        actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+
+        assert!(matches!(
+            actor.command_clear_foreground(1_001),
+            Err(RuntimeError::NotAuthorized(_))
+        ));
+        assert!(actor.focus_lease.is_some());
+
+        actor
+            .command_clear_foreground(1_000)
+            .expect("the lease owner may clear it");
+        assert!(actor.focus_lease.is_none());
+        assert!(actor.scheduler_dirty);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_focus_report_never_occupies_the_control_request_lane() {
+        assert!(
+            !ProcessIdentityPurpose::Focus {
+                pid: ProcessId::new(42),
+                caller_uid: 1_000,
+                peer: None,
+                revision: 1,
+            }
+            .is_control_request(),
+            "otherwise alt-tab bursts would conflict with 'workload set'"
+        );
+        assert!(
+            !ProcessIdentityPurpose::RefreshFocus {
+                expected: test_process(42, 1_000).identity,
+            }
+            .is_control_request()
         );
     }
 

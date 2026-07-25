@@ -4,7 +4,9 @@ mod config;
 use std::{process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use args::{Bus, Cli, Command, ConfigAction, FrequencyAction, ModeAction, WorkloadAction};
+use args::{
+    Bus, Cli, Command, ConfigAction, ForegroundAction, FrequencyAction, ModeAction, WorkloadAction,
+};
 use serde_json::json;
 use tokio::time::timeout;
 use uperf_api::{
@@ -82,6 +84,7 @@ async fn run_remote(client: &DaemonClient, command: &Command, json_output: bool)
         }
         Command::Mode(action) => run_mode(client, action, json_output).await,
         Command::Workload(action) => run_workload(client, action, json_output).await,
+        Command::Foreground(action) => run_foreground(client, action, json_output).await,
         Command::Targets(target_id) => {
             let capabilities = client.capabilities().await?;
             print_targets(&capabilities, target_id.as_deref(), json_output)?;
@@ -188,6 +191,21 @@ async fn run_workload(
             print_receipt(&receipt, json_output)?;
         }
     }
+    Ok(true)
+}
+
+async fn run_foreground(
+    client: &DaemonClient,
+    action: &ForegroundAction,
+    json_output: bool,
+) -> Result<bool> {
+    let receipt = match action {
+        ForegroundAction::Set { pid, reason } => {
+            client.set_foreground_process(*pid, reason).await?
+        }
+        ForegroundAction::Clear => client.clear_foreground_process().await?,
+    };
+    print_receipt(&receipt, json_output)?;
     Ok(true)
 }
 
@@ -358,10 +376,11 @@ fn print_status(status: &DaemonStatus, json_output: bool) -> Result<()> {
     );
     if status.active_workload.present {
         println!(
-            "workload: {} (pid {}, start {})",
+            "workload: {} (pid {}, start {}, source {})",
             status.active_workload.name,
             status.active_workload.identity.pid,
-            status.active_workload.identity.start_time_ticks
+            status.active_workload.identity.start_time_ticks,
+            display_or_dash(&status.active_workload.source)
         );
     } else {
         println!("workload: none");

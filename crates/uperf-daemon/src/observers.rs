@@ -12,9 +12,9 @@ use std::{
 use futures_util::StreamExt;
 use tokio::{sync::watch, task::JoinHandle};
 use uperf_linux::{EvdevInputSource, GestureConfig};
-use zbus::{Connection, zvariant::OwnedFd};
+use zbus::{Connection, fdo::DBusProxy, zvariant::OwnedFd};
 
-use crate::runtime::ObserverIngress;
+use crate::runtime::{ObserverIngress, RuntimeHandle};
 
 const INHIBITOR_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,6 +54,56 @@ pub fn spawn_logind_observer(
         }
         result
     })
+}
+
+/// Watch for the disappearance of D-Bus peers holding a focus lease.
+///
+/// A compositor extension that crashes never sends `ClearForegroundProcess`,
+/// so without this the lease would linger until its TTU expires. Reference
+/// implementations poll `kill(pid, 0)` instead, which is both slower and
+/// vulnerable to PID reuse.
+#[must_use]
+pub fn spawn_focus_peer_watcher(
+    connection: Connection,
+    runtime: RuntimeHandle,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<Result<(), String>> {
+    tokio::spawn(async move { run_focus_peer_watcher(connection, runtime, &mut shutdown).await })
+}
+
+async fn run_focus_peer_watcher(
+    connection: Connection,
+    runtime: RuntimeHandle,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let proxy = DBusProxy::new(&connection)
+        .await
+        .map_err(|error| format!("connect to the bus driver: {error}"))?;
+    let mut owner_changes = proxy
+        .receive_name_owner_changed()
+        .await
+        .map_err(|error| format!("subscribe to NameOwnerChanged: {error}"))?;
+    loop {
+        tokio::select! {
+            owner_change = owner_changes.next() => {
+                let owner_change = owner_change
+                    .ok_or_else(|| "NameOwnerChanged stream ended".to_owned())?;
+                let arguments = owner_change.args().map_err(|error| error.to_string())?;
+                // Only a vanished unique name matters: a lease is keyed by the
+                // reporter's unique bus name, never by a well-known alias.
+                if arguments.new_owner().is_none()
+                    && let Some(old) = arguments.old_owner().as_ref()
+                {
+                    let _ = runtime.forget_foreground_peer(old.to_string()).await;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 async fn run_logind_observer(

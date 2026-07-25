@@ -41,6 +41,12 @@
       "default": {
         "cgroup_classes": [],
         "enabled": false,
+        "focus": {
+          "debounce_ms": 150,
+          "enabled": false,
+          "lease_ttl_ms": 15000,
+          "protected": []
+        },
         "process_rules": [],
         "task_profiles": []
       }
@@ -102,6 +108,48 @@
         "minimum": 0
       },
       "uniqueItems": true
+    },
+    "FocusConfig": {
+      "description": "Focus-driven workload selection.\n\nA trusted desktop adapter reports which process owns the focused window; the\ndaemon treats that report as a *workload source*, never as a profile tier.\nWhen no process rule matches the focused workload, [`Self::task_profile`]\nsupplies a gentle default plan so the feature is useful without requiring\noperators to author per-application rules first.",
+      "type": "object",
+      "properties": {
+        "debounce_ms": {
+          "description": "Coalescing window for rapid window switching.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 150,
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "lease_ttl_ms": {
+          "description": "Lease lifetime; a reporter that stops renewing loses the boost.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 15000,
+          "minimum": 15000,
+          "maximum": 600000
+        },
+        "protected": {
+          "description": "Processes that may never be leased as a focused workload.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorkloadMatcher"
+          },
+          "maxItems": 256
+        },
+        "task_profile": {
+          "description": "Task profile applied to a focused workload that matches no process rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "InputConfig": {
       "type": "object",
@@ -330,6 +378,15 @@
           "type": "boolean",
           "default": false
         },
+        "focus": {
+          "$ref": "#/$defs/FocusConfig",
+          "default": {
+            "debounce_ms": 150,
+            "enabled": false,
+            "lease_ttl_ms": 15000,
+            "protected": []
+          }
+        },
         "process_rules": {
           "type": "array",
           "default": [],
@@ -358,6 +415,7 @@
       ]
     },
     "TaskPlan": {
+      "description": "Partial scheduling intent for one process or thread.\n\nEvery absent field preserves the task's current value. In particular,\n`uclamp_min` and `uclamp_max` are independent so a policy can raise a floor\nwithout also widening an administrator-provided ceiling.",
       "type": "object",
       "properties": {
         "affinity": {
@@ -389,15 +447,23 @@
             }
           ]
         },
-        "uclamp": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UclampLimits"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "uclamp_max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 1024,
+          "minimum": 0
+        },
+        "uclamp_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 1024,
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -452,28 +518,6 @@
       "required": [
         "comm_regex",
         "task_profile"
-      ]
-    },
-    "UclampLimits": {
-      "type": "object",
-      "properties": {
-        "max": {
-          "type": "integer",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0
-        },
-        "min": {
-          "type": "integer",
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "min",
-        "max"
       ]
     },
     "WorkloadMatcher": {

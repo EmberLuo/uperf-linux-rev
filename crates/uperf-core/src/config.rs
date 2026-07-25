@@ -31,6 +31,7 @@ pub const MAX_THREAD_RULES_PER_PROCESS: usize = 256;
 pub const MAX_TOTAL_THREAD_RULES: usize = 4096;
 pub const MAX_CGROUP_CLASSES: usize = 256;
 pub const MAX_APP_RULES: usize = 4096;
+pub const MAX_FOCUS_PROTECTED: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -584,6 +585,54 @@ pub struct CgroupClassConfig {
     pub cpu_weight: u16,
 }
 
+/// Focus-driven workload selection.
+///
+/// A trusted desktop adapter reports which process owns the focused window; the
+/// daemon treats that report as a *workload source*, never as a profile tier.
+/// When no process rule matches the focused workload, [`Self::task_profile`]
+/// supplies a gentle default plan so the feature is useful without requiring
+/// operators to author per-application rules first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Task profile applied to a focused workload that matches no process rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_profile: Option<String>,
+    /// Lease lifetime; a reporter that stops renewing loses the boost.
+    #[serde(default = "default_focus_lease_ttl_ms")]
+    #[schemars(range(min = 15_000, max = 600_000))]
+    pub lease_ttl_ms: u64,
+    /// Coalescing window for rapid window switching.
+    #[serde(default = "default_focus_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Processes that may never be leased as a focused workload.
+    #[serde(default)]
+    #[schemars(length(max = MAX_FOCUS_PROTECTED))]
+    pub protected: Vec<WorkloadMatcher>,
+}
+
+const fn default_focus_lease_ttl_ms() -> u64 {
+    15_000
+}
+
+const fn default_focus_debounce_ms() -> u64 {
+    150
+}
+
+impl Default for FocusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            task_profile: None,
+            lease_ttl_ms: default_focus_lease_ttl_ms(),
+            debounce_ms: default_focus_debounce_ms(),
+            protected: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
@@ -598,6 +647,8 @@ pub struct SchedulerConfig {
     #[serde(default)]
     #[schemars(length(max = MAX_CGROUP_CLASSES))]
     pub cgroup_classes: Vec<CgroupClassConfig>,
+    #[serde(default)]
+    pub focus: FocusConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1103,7 +1154,61 @@ fn validate_scheduler(config: &SchedulerConfig, issues: &mut Vec<ValidationIssue
         }
     }
 
+    validate_focus(&config.focus, &task_profiles, issues);
     validate_process_rules(config, &task_profiles, &cgroups, issues);
+}
+
+fn validate_focus(
+    focus: &FocusConfig,
+    task_profiles: &BTreeSet<&str>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_collection_len(
+        "scheduler.focus.protected",
+        focus.protected.len(),
+        MAX_FOCUS_PROTECTED,
+        issues,
+    );
+    match &focus.task_profile {
+        Some(profile) if !task_profiles.contains(profile.as_str()) => {
+            issues.push(ValidationIssue::new(
+                "scheduler.focus.task_profile",
+                "references an unknown task profile",
+            ));
+        }
+        None if focus.enabled => {
+            issues.push(ValidationIssue::new(
+                "scheduler.focus.task_profile",
+                "is required when focus is enabled",
+            ));
+        }
+        _ => {}
+    }
+    if !(15_000..=600_000).contains(&focus.lease_ttl_ms) {
+        issues.push(ValidationIssue::new(
+            "scheduler.focus.lease_ttl_ms",
+            "must be in 15000..=600000",
+        ));
+    }
+    if focus.debounce_ms > 2_000 {
+        issues.push(ValidationIssue::new(
+            "scheduler.focus.debounce_ms",
+            "must not exceed 2000",
+        ));
+    }
+    if focus.debounce_ms >= focus.lease_ttl_ms {
+        issues.push(ValidationIssue::new(
+            "scheduler.focus.debounce_ms",
+            "must be shorter than lease_ttl_ms",
+        ));
+    }
+    for (index, matcher) in focus.protected.iter().take(MAX_FOCUS_PROTECTED).enumerate() {
+        validate_matcher(
+            &format!("scheduler.focus.protected[{index}]"),
+            matcher,
+            issues,
+        );
+    }
 }
 
 fn validate_process_rules(
@@ -1201,10 +1306,24 @@ fn validate_task_plan(path: &str, plan: &TaskPlan, issues: &mut Vec<ValidationIs
             "unsupported scheduling class",
         ));
     }
-    if plan.uclamp.is_some_and(|limits| !limits.is_valid()) {
+    if plan.uclamp_min.is_some_and(|minimum| minimum > 1_024) {
         issues.push(ValidationIssue::new(
-            format!("{path}.uclamp"),
-            "must satisfy 0 <= min <= max <= 1024",
+            format!("{path}.uclamp_min"),
+            "must not exceed 1024",
+        ));
+    }
+    if plan.uclamp_max.is_some_and(|maximum| maximum > 1_024) {
+        issues.push(ValidationIssue::new(
+            format!("{path}.uclamp_max"),
+            "must not exceed 1024",
+        ));
+    }
+    if let (Some(minimum), Some(maximum)) = (plan.uclamp_min, plan.uclamp_max)
+        && minimum > maximum
+    {
+        issues.push(ValidationIssue::new(
+            path,
+            "uclamp_min must not exceed uclamp_max when both are set",
         ));
     }
 }
@@ -1409,6 +1528,24 @@ mod tests {
     }
 
     #[test]
+    fn focus_lease_ttl_matches_bundled_reporter_contract() {
+        let mut policy = valid_policy();
+        for ttl in [15_000, 600_000] {
+            policy.scheduler.focus.lease_ttl_ms = ttl;
+            policy.validate().expect("supported focus lease TTL");
+        }
+
+        for ttl in [14_999, 600_001] {
+            policy.scheduler.focus.lease_ttl_ms = ttl;
+            let error = policy.validate().expect_err("unsupported focus lease TTL");
+            assert!(error.issues().iter().any(|issue| {
+                issue.path == "scheduler.focus.lease_ttl_ms"
+                    && issue.message == "must be in 15000..=600000"
+            }));
+        }
+    }
+
+    #[test]
     fn strict_json_rejects_unknown_fields() {
         let json = r#"{
             "schema_version": 2,
@@ -1552,6 +1689,68 @@ mod tests {
                 .issues()
                 .iter()
                 .any(|issue| issue.message.contains("unknown task profile"))
+        );
+    }
+
+    #[test]
+    fn scheduler_uclamp_fields_are_independent_and_bounded() {
+        let mut config = valid_policy();
+        config.scheduler.task_profiles = vec![
+            TaskProfileConfig {
+                id: "minimum-only".into(),
+                affinity_group: None,
+                plan: TaskPlan {
+                    uclamp_min: Some(205),
+                    ..TaskPlan::default()
+                },
+            },
+            TaskProfileConfig {
+                id: "maximum-only".into(),
+                affinity_group: None,
+                plan: TaskPlan {
+                    uclamp_max: Some(768),
+                    ..TaskPlan::default()
+                },
+            },
+        ];
+        config.validate().expect("independent uclamp fields");
+
+        config.scheduler.task_profiles[0].plan.uclamp_min = Some(1_025);
+        config.scheduler.task_profiles[1].plan.uclamp_max = Some(1_025);
+        let error = config.validate().expect_err("uclamp values are bounded");
+        assert!(
+            error
+                .issues()
+                .iter()
+                .any(|issue| issue.path.ends_with(".uclamp_min"))
+        );
+        assert!(
+            error
+                .issues()
+                .iter()
+                .any(|issue| issue.path.ends_with(".uclamp_max"))
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_reversed_complete_uclamp_patch() {
+        let mut config = valid_policy();
+        config.scheduler.task_profiles.push(TaskProfileConfig {
+            id: "reversed".into(),
+            affinity_group: None,
+            plan: TaskPlan {
+                uclamp_min: Some(513),
+                uclamp_max: Some(512),
+                ..TaskPlan::default()
+            },
+        });
+
+        let error = config.validate().expect_err("uclamp pair must be ordered");
+        assert!(
+            error
+                .issues()
+                .iter()
+                .any(|issue| issue.message.contains("uclamp_min must not exceed"))
         );
     }
 

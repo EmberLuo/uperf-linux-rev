@@ -19,6 +19,14 @@
   <method name="ClearActiveWorkload">
     <arg type="(tass)" direction="out"/>
   </method>
+  <method name="SetForegroundProcess">
+    <arg name="pid" type="u" direction="in"/>
+    <arg name="reason" type="s" direction="in"/>
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ClearForegroundProcess">
+    <arg type="(tass)" direction="out"/>
+  </method>
   <method name="SetFrequencyOverrides">
     <arg name="overrides" type="a(sttts)" direction="in"/>
     <arg type="(tass)" direction="out"/>

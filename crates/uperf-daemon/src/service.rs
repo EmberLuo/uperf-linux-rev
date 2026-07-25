@@ -103,13 +103,14 @@ impl RunningWorkloadScanner {
     fn snapshot(&self, runtime: &RuntimeHandle, caller_uid: u32) -> Vec<RunningWorkload> {
         let published = runtime.snapshot();
         let active = &published.status.active_workload;
+        let explicit_active = active.present && active.source == "explicit";
         let scheduler = &published.scheduler;
         let mut candidates = self
             .candidates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if active.present {
+        if explicit_active {
             // A cached row for a reused PID must not sit beside the daemon's
             // newer stable active identity.
             candidates.retain(|candidate| {
@@ -117,7 +118,7 @@ impl RunningWorkloadScanner {
                     || candidate.identity == active.identity
             });
         }
-        if active.present
+        if explicit_active
             && !candidates
                 .iter()
                 .any(|candidate| candidate.identity == active.identity)
@@ -131,7 +132,7 @@ impl RunningWorkloadScanner {
             });
         }
         for candidate in &mut candidates {
-            candidate.active = active.present && candidate.identity == active.identity;
+            candidate.active = explicit_active && candidate.identity == active.identity;
             candidate.scheduler = if candidate.active {
                 scheduler.clone()
             } else {
@@ -228,6 +229,36 @@ impl DaemonService {
         let caller = self.authorizer.caller_uid(connection, &header).await?;
         self.runtime
             .clear_active_workload(caller)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn set_foreground_process(
+        &self,
+        pid: u32,
+        reason: &str,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<MutationReceipt, ServiceError> {
+        let caller = self
+            .authorizer
+            .require_active_local_session(connection, &header)
+            .await?;
+        let peer = header.sender().map(ToString::to_string);
+        self.runtime
+            .set_foreground_process(pid, reason.to_owned(), caller, peer)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn clear_foreground_process(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<MutationReceipt, ServiceError> {
+        let caller = self.authorizer.caller_uid(connection, &header).await?;
+        self.runtime
+            .clear_foreground_process(caller)
             .await
             .map_err(map_runtime_error)
     }
@@ -727,6 +758,7 @@ mod tests {
                     present: true,
                     identity,
                     name: "custom-engine".to_owned(),
+                    source: "explicit".to_owned(),
                     ..uperf_api::ActiveWorkload::default()
                 },
                 ..DaemonStatus::default()
@@ -739,6 +771,115 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].identity, identity);
+        assert_eq!(candidates[0].matched_pattern, "active");
+        assert!(candidates[0].active);
+        assert_eq!(candidates[0].scheduler, scheduler);
+    }
+
+    #[test]
+    fn focus_only_workload_is_not_synthesized_as_an_explicit_candidate() {
+        let runtime = RuntimeHandle::snapshot_only_with(
+            DaemonStatus {
+                active_workload: uperf_api::ActiveWorkload {
+                    present: true,
+                    identity: WorkloadIdentity {
+                        pid: 77,
+                        start_time_ticks: 1234,
+                        uid: 1000,
+                    },
+                    name: "ordinary".to_owned(),
+                    source: "focus".to_owned(),
+                    ..uperf_api::ActiveWorkload::default()
+                },
+                ..DaemonStatus::default()
+            },
+            SchedulerStatus {
+                enabled: true,
+                matched_rule: "focus-default".to_owned(),
+                applied_tasks: 1,
+                ..SchedulerStatus::default()
+            },
+        );
+
+        assert!(
+            RunningWorkloadScanner::unavailable()
+                .snapshot(&runtime, 1000)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focused_game_candidate_remains_inactive_and_has_no_scheduler_snapshot() {
+        let focused = process(77, 1000, "wine64-preloader", "/usr/bin/wine64");
+        let identity = api_identity(&focused);
+        let procfs = FakeProc::default();
+        procfs.insert_process(focused);
+        let scanner = RunningWorkloadScanner::new(Arc::new(procfs));
+        scanner.refresh().await.expect("refresh candidate");
+        let runtime = RuntimeHandle::snapshot_only_with(
+            DaemonStatus {
+                active_workload: uperf_api::ActiveWorkload {
+                    present: true,
+                    identity,
+                    name: "wine64-preloader".to_owned(),
+                    source: "focus".to_owned(),
+                    ..uperf_api::ActiveWorkload::default()
+                },
+                ..DaemonStatus::default()
+            },
+            SchedulerStatus {
+                enabled: true,
+                matched_rule: "focus-default".to_owned(),
+                applied_tasks: 1,
+                ..SchedulerStatus::default()
+            },
+        );
+
+        let candidates = scanner.snapshot(&runtime, 1000);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].identity, identity);
+        assert_eq!(candidates[0].matched_pattern, "wine");
+        assert!(!candidates[0].active);
+        assert_eq!(candidates[0].scheduler, SchedulerStatus::default());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_workload_replaces_a_scanned_identity_that_reused_the_same_pid() {
+        let procfs = FakeProc::default();
+        procfs.insert_process(process(77, 1000, "wine64-preloader", "/usr/bin/wine64"));
+        let scanner = RunningWorkloadScanner::new(Arc::new(procfs));
+        scanner.refresh().await.expect("refresh stale candidate");
+        let identity = WorkloadIdentity {
+            pid: 77,
+            start_time_ticks: 1234,
+            uid: 1000,
+        };
+        let scheduler = SchedulerStatus {
+            enabled: true,
+            matched_rule: "game-process".to_owned(),
+            applied_tasks: 1,
+            ..SchedulerStatus::default()
+        };
+        let runtime = RuntimeHandle::snapshot_only_with(
+            DaemonStatus {
+                active_workload: uperf_api::ActiveWorkload {
+                    present: true,
+                    identity,
+                    name: "replacement".to_owned(),
+                    source: "explicit".to_owned(),
+                    ..uperf_api::ActiveWorkload::default()
+                },
+                ..DaemonStatus::default()
+            },
+            scheduler.clone(),
+        );
+
+        let candidates = scanner.snapshot(&runtime, 1000);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].identity, identity);
+        assert_eq!(candidates[0].name, "replacement");
         assert_eq!(candidates[0].matched_pattern, "active");
         assert!(candidates[0].active);
         assert_eq!(candidates[0].scheduler, scheduler);

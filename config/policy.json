@@ -123,10 +123,8 @@
         "plan": {
           "nice": 10,
           "scheduling_class": "batch",
-          "uclamp": {
-            "min": 0,
-            "max": 384
-          }
+          "uclamp_min": 0,
+          "uclamp_max": 384
         }
       },
       {
@@ -135,10 +133,8 @@
         "plan": {
           "nice": 0,
           "scheduling_class": "other",
-          "uclamp": {
-            "min": 128,
-            "max": 768
-          }
+          "uclamp_min": 128,
+          "uclamp_max": 768
         }
       },
       {
@@ -147,10 +143,14 @@
         "plan": {
           "nice": -5,
           "scheduling_class": "other",
-          "uclamp": {
-            "min": 512,
-            "max": 1024
-          }
+          "uclamp_min": 512,
+          "uclamp_max": 1024
+        }
+      },
+      {
+        "id": "foreground",
+        "plan": {
+          "uclamp_min": 205
         }
       }
     ],
@@ -166,6 +166,21 @@
         "allowed_cpu_group": "balanced",
         "cpu_weight": 100
       }
-    ]
+    ],
+    "focus": {
+      "enabled": true,
+      "task_profile": "foreground",
+      "lease_ttl_ms": 15000,
+      "debounce_ms": 150,
+      "protected": [
+        { "comm_regex": "^gnome-shell$" },
+        { "comm_regex": "^pipewire" },
+        { "comm_regex": "^wireplumber$" },
+        { "comm_regex": "^dbus-(broker|daemon)" },
+        { "comm_regex": "^systemd" },
+        { "comm_regex": "^Xwayland$" },
+        { "comm_regex": "^kwin_wayland$" }
+      ]
+    }
   }
 }

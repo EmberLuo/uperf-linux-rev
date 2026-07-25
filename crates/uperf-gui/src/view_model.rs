@@ -3,23 +3,39 @@
 use std::collections::BTreeMap;
 
 use uperf_api::{
-    ActiveWorkload, Capabilities, DaemonStatus, FrequencyOverride, FrequencyStatus, ModeInfo,
-    TargetCapability, ThermalStatus, feature,
+    ActiveWorkload, Capabilities, DaemonStatus, FrequencyOverride, FrequencyStatus, HealthStatus,
+    ModeInfo, TargetCapability, ThermalStatus, feature,
 };
 
-use crate::i18n::{localized_mode_description, localized_mode_label, localized_protocol_value, tr};
+use crate::i18n::{
+    localized_mode_description, localized_mode_label, localized_protocol_value, tr, translate_known,
+};
 
 /// Presentation state derived only from versioned API DTOs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewModel {
     pub daemon_state: String,
-    pub health: String,
+    pub health: HealthView,
     pub profile: String,
     pub scene: String,
     pub modes: Vec<ModeView>,
     pub targets: Vec<TargetView>,
     pub thermal: Option<ThermalView>,
     pub workload: Option<WorkloadView>,
+}
+
+/// Aggregate health summary and every structured daemon finding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthView {
+    pub summary: String,
+    pub issues: Vec<HealthIssueView>,
+}
+
+/// One human-readable structured health finding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthIssueView {
+    pub message: String,
+    pub detail: String,
 }
 
 /// One daemon-advertised mode.
@@ -93,7 +109,7 @@ impl ViewModel {
 
         Self {
             daemon_state: localized_protocol_value(&status.state),
-            health: localized_protocol_value(&status.health.summary),
+            health: health_view(&status.health),
             profile: localized_protocol_value(&status.effective_profile),
             scene: localized_protocol_value(&status.dominant_scene),
             modes,
@@ -101,6 +117,26 @@ impl ViewModel {
             thermal,
             workload,
         }
+    }
+}
+
+fn health_view(health: &HealthStatus) -> HealthView {
+    let issues = health
+        .issues
+        .iter()
+        .map(|issue| HealthIssueView {
+            message: translate_known(&issue.message),
+            detail: format!(
+                "{} · {} · {}",
+                localized_protocol_value(&issue.severity),
+                localized_protocol_value(&issue.component),
+                issue.code
+            ),
+        })
+        .collect();
+    HealthView {
+        summary: localized_protocol_value(&health.summary),
+        issues,
     }
 }
 
@@ -203,8 +239,8 @@ fn thermal_view(thermal: &ThermalStatus) -> ThermalView {
 #[cfg(test)]
 mod tests {
     use uperf_api::{
-        ActiveWorkload, Capabilities, DaemonStatus, FrequencyStatus, ModeInfo, TargetCapability,
-        feature,
+        ActiveWorkload, Capabilities, DaemonStatus, FrequencyStatus, HealthIssue, HealthStatus,
+        ModeInfo, TargetCapability, feature,
     };
 
     use super::{ViewModel, frequency_choices, frequency_override};
@@ -309,5 +345,36 @@ mod tests {
         );
         assert!(view.thermal.is_some());
         assert!(view.workload.expect("workload").active.present);
+    }
+
+    #[test]
+    fn informational_health_issues_are_preserved_even_when_health_is_healthy() {
+        let status = DaemonStatus {
+            health: HealthStatus {
+                state: "healthy".into(),
+                summary: "all mandatory components are healthy".into(),
+                issues: vec![HealthIssue {
+                    code: "focus.rejected".into(),
+                    severity: "info".into(),
+                    component: "focus".into(),
+                    message: "focused process is protected".into(),
+                }],
+                ..HealthStatus::default()
+            },
+            ..DaemonStatus::default()
+        };
+
+        let view = ViewModel::from_api(&Capabilities::default(), &status);
+
+        assert_eq!(view.health.summary, "all mandatory components are healthy");
+        assert_eq!(view.health.issues.len(), 1);
+        assert_eq!(
+            view.health.issues[0].message,
+            "focused process is protected"
+        );
+        assert_eq!(
+            view.health.issues[0].detail,
+            "info · focus · focus.rejected"
+        );
     }
 }

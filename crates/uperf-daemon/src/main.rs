@@ -19,7 +19,7 @@ use uperf_core::{FrequencyLimits, Hertz};
 use uperf_daemon::{
     auth::{AuthorizationMode, Authorizer},
     config::{ConfigurationPaths, ResolvedConfiguration},
-    observers::{spawn_input_observer, spawn_logind_observer},
+    observers::{spawn_focus_peer_watcher, spawn_input_observer, spawn_logind_observer},
     runtime::{RuntimeParts, spawn_linux_observers, spawn_runtime},
     service::{DaemonService, RunningWorkloadScanner, run_signal_pump},
 };
@@ -230,6 +230,11 @@ async fn run(options: Result<Options>) -> Result<()> {
         running_workloads,
         service_shutdown_rx.clone(),
     ));
+    let focus_peer_task = spawn_focus_peer_watcher(
+        connection.clone(),
+        runtime.clone(),
+        service_shutdown_rx.clone(),
+    );
     let logind_task = (!options.session_bus)
         .then(|| spawn_logind_observer(connection.clone(), ingress, service_shutdown_rx));
     runtime
@@ -266,6 +271,17 @@ async fn run(options: Result<Options>) -> Result<()> {
         input_observer.stop().await;
     }
     service_shutdown.send_replace(true);
+    match focus_peer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => record_shutdown_error(
+            &mut shutdown_error,
+            anyhow!("focus peer watcher stopped: {error}"),
+        ),
+        Err(error) => record_shutdown_error(
+            &mut shutdown_error,
+            anyhow!("join focus peer watcher: {error}"),
+        ),
+    }
     if let Some(task) = logind_task {
         match task.await {
             Ok(Ok(())) => {}

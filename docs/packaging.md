@@ -56,6 +56,7 @@ Rust source packages when network-free reproducibility is required.
 | `/usr/share/uperf-linux/devices/` | immutable device profiles |
 | `/usr/share/uperf-linux/defaults/` | immutable policy and app-rule seeds |
 | `/usr/share/uperf-linux/schema/` | JSON Schema v2 documents |
+| `/usr/share/gnome-shell/extensions/focus@uperflinux.org/` | focus reporter; installed disabled |
 | `/var/lib/uperf-linux/apps.json` | daemon-managed; not owned by dpkg |
 | `/run/uperf-linux/recovery.json` | actuator-owned current-boot journal |
 
@@ -81,6 +82,12 @@ followed by automatic D-Bus reconnection.
 The same conservative rule applies to upgrades: a service stopped for package
 replacement is not started again implicitly. Revalidate, inspect any retained
 recovery evidence, and start it explicitly.
+
+The GNOME focus reporter follows the same rule. Packaging only places the files
+under `/usr/share/gnome-shell/extensions/`; dpkg never enables a shell
+extension. Each user opts in with
+`gnome-extensions enable focus@uperflinux.org`, and the daemon still ignores
+every report unless `scheduler.focus.enabled` is true in `policy.json`.
 
 The service has no arbitrary network access, uses only Unix sockets, and is
 hardened without hiding `/proc`, `/sys`, or input devices that its stated

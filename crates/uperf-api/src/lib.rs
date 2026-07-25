@@ -56,6 +56,8 @@ pub mod feature {
     pub const RUNNING_WORKLOADS: &str = "running-workloads";
     /// A device profile was selected from the catalog or administrator override.
     pub const DEVICE_PROFILE: &str = "device-profile";
+    /// Compositor-reported focus can supply the active workload.
+    pub const FOREGROUND_FOCUS: &str = "foreground-focus";
 }
 
 /// Oldest configuration schema accepted by this API generation.

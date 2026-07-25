@@ -15,7 +15,7 @@ use uperf_actuator::{
 };
 use uperf_core::{
     AppliedState, DesiredPlan, Hertz, PolicyEngine, ProcessIdentity, ProcessInfo, TargetId,
-    TaskPlan,
+    TaskPlan, WorkloadSource,
 };
 use uperf_platform::{
     PlatformError, ProcessSchedulingState, RuntimePlatform, SystemdUnitProperties,
@@ -26,7 +26,8 @@ pub(crate) struct ReconcileJob {
     pub actuator: Arc<FrequencyActuator>,
     pub environment: Arc<dyn RuntimePlatform>,
     pub policy_engine: PolicyEngine,
-    pub active_workload: Option<ProcessInfo>,
+    pub workload: Option<ProcessInfo>,
+    pub workload_source: WorkloadSource,
     pub desired: DesiredPlan,
     pub applied: AppliedState,
     pub applied_units: BTreeMap<String, SystemdUnitProperties>,
@@ -153,13 +154,14 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
             job.environment.as_ref(),
             job.actuator.as_ref(),
             &job.policy_engine,
-            job.active_workload.as_ref(),
+            job.workload.as_ref(),
+            job.workload_source,
         ) {
             Ok(resolution) => {
                 outcome.desired.tasks.clone_from(&resolution.tasks);
                 outcome.scheduler_warning.clone_from(&resolution.warning);
                 outcome.scheduler_report = SchedulerReport {
-                    workload: job.active_workload.as_ref().map(|process| process.identity),
+                    workload: job.workload.as_ref().map(|process| process.identity),
                     matched_rule: resolution.matched_rule.clone(),
                     cgroup_class: resolution.cgroup_class.clone(),
                     systemd_unit: resolution.cgroup.as_ref().map(|intent| intent.unit.clone()),
@@ -192,7 +194,7 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
     if let Some(resolution) = scheduler
         && let Err(error) = reconcile_scheduler(
             job.actuator.as_ref(),
-            job.active_workload.as_ref(),
+            job.workload.as_ref(),
             &outcome.desired,
             resolution.cgroup,
             &mut outcome.applied,
@@ -274,6 +276,7 @@ fn resolve_scheduler(
     actuator: &FrequencyActuator,
     policy_engine: &PolicyEngine,
     workload: Option<&ProcessInfo>,
+    source: WorkloadSource,
 ) -> Result<SchedulerResolution, String> {
     if !policy_engine.config().scheduler.enabled {
         return Ok(SchedulerResolution {
@@ -325,7 +328,7 @@ fn resolve_scheduler(
     threads.retain(|thread| confirmed.contains(&thread.identity.pid));
 
     let mut decision = policy_engine
-        .evaluate_scheduler(workload, &threads)
+        .evaluate_scheduler(workload, &threads, source)
         .map_err(|error| error.to_string())?;
     let online = environment
         .online_cpus()
@@ -497,12 +500,13 @@ fn reconcile_scheduler(
                 return Err(format!("read task {}: {error}", identity.pid.get()));
             }
         };
-        if task_plan_matches(&current, plan) {
+        let desired_state = apply_task_plan(current.clone(), plan);
+        if desired_state == current {
             verified.insert(*identity, scheduling_state_as_plan(&current));
         } else {
             requests.push(TaskRequest {
                 identity: *identity,
-                desired: apply_task_plan(current, plan),
+                desired: desired_state,
             });
         }
     }
@@ -564,20 +568,6 @@ fn process_disappeared(error: &ActuatorError) -> bool {
     )
 }
 
-fn task_plan_matches(actual: &ProcessSchedulingState, desired: &TaskPlan) -> bool {
-    desired
-        .affinity
-        .as_ref()
-        .is_none_or(|affinity| actual.affinity == *affinity)
-        && desired.nice.is_none_or(|nice| actual.nice == nice)
-        && desired
-            .scheduling_class
-            .is_none_or(|class| actual.policy == class)
-        && desired.uclamp.is_none_or(|limits| {
-            actual.uclamp_min == Some(limits.min) && actual.uclamp_max == Some(limits.max)
-        })
-}
-
 fn apply_task_plan(
     mut current: ProcessSchedulingState,
     desired: &TaskPlan,
@@ -591,37 +581,288 @@ fn apply_task_plan(
     if let Some(class) = desired.scheduling_class {
         current.policy = class;
     }
-    if let Some(limits) = desired.uclamp {
-        current.uclamp_min = Some(limits.min);
-        current.uclamp_max = Some(limits.max);
+    match (desired.uclamp_min, desired.uclamp_max) {
+        (Some(minimum), Some(maximum)) => {
+            current.uclamp_min = Some(minimum);
+            current.uclamp_max = Some(maximum);
+        }
+        (Some(minimum), None) => {
+            current.uclamp_min = Some(
+                current
+                    .uclamp_max
+                    .map_or(minimum, |maximum| minimum.min(maximum)),
+            );
+        }
+        (None, Some(maximum)) => {
+            current.uclamp_max = Some(
+                current
+                    .uclamp_min
+                    .map_or(maximum, |minimum| maximum.max(minimum)),
+            );
+        }
+        (None, None) => {}
     }
     current
 }
 
 fn scheduling_state_as_plan(state: &ProcessSchedulingState) -> TaskPlan {
-    let uclamp = state
-        .uclamp_min
-        .zip(state.uclamp_max)
-        .map(|(min, max)| uperf_core::UclampLimits { min, max });
     TaskPlan {
         affinity: Some(state.affinity.clone()),
         nice: Some(state.nice),
         scheduling_class: Some(state.policy),
-        uclamp,
+        uclamp_min: state.uclamp_min,
+        uclamp_max: state.uclamp_max,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, mpsc},
+        collections::BTreeMap,
+        path::Path,
+        sync::{Arc, Mutex, mpsc},
         thread,
         time::Duration,
     };
 
-    use uperf_core::{FrequencyLimits, Hertz, TargetId};
+    use uperf_actuator::TargetRegistry;
+    use uperf_core::{
+        CpuId, CpuSet, FrequencyLimits, Hertz, ProcessId, ProcessIdentity, ProcessInfo, Scene,
+        SchedulingClass, TargetId, TaskPlan, UserId,
+    };
+    use uperf_platform::{PlatformResult, ProcessController, StateStore, SysfsIo};
+    use uperf_testkit::FakeProc;
 
-    use super::{FrequencySafetyFence, apply_upper_cap};
+    use super::{
+        AppliedState, DesiredPlan, FrequencyActuator, FrequencySafetyFence, ProcessSchedulingState,
+        apply_task_plan, apply_upper_cap, reconcile_scheduler,
+    };
+
+    #[derive(Default)]
+    struct DenyingSysfs;
+
+    impl SysfsIo for DenyingSysfs {
+        fn read_string(&self, path: &Path) -> PlatformResult<String> {
+            Err(uperf_platform::PlatformError::invalid(
+                path.display().to_string(),
+                "frequency paths are unused by task reconciliation",
+            ))
+        }
+
+        fn write_string(&self, path: &Path, _value: &str) -> PlatformResult<()> {
+            Err(uperf_platform::PlatformError::invalid(
+                path.display().to_string(),
+                "frequency paths are unused by task reconciliation",
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryStore(Mutex<Option<Vec<u8>>>);
+
+    impl StateStore for MemoryStore {
+        fn load(&self) -> PlatformResult<Option<Vec<u8>>> {
+            Ok(lock(&self.0).clone())
+        }
+
+        fn store_durable(&self, bytes: &[u8]) -> PlatformResult<()> {
+            *lock(&self.0) = Some(bytes.to_vec());
+            Ok(())
+        }
+
+        fn remove_durable(&self) -> PlatformResult<()> {
+            *lock(&self.0) = None;
+            Ok(())
+        }
+    }
+
+    /// Records the exact order of scheduler writes so restore-before-apply
+    /// ordering is observable.
+    #[derive(Default)]
+    struct RecordingController {
+        states: Mutex<BTreeMap<ProcessId, ProcessSchedulingState>>,
+        writes: Mutex<Vec<(ProcessId, Option<u16>)>>,
+    }
+
+    impl RecordingController {
+        fn insert(&self, pid: ProcessId) {
+            lock(&self.states).insert(
+                pid,
+                ProcessSchedulingState {
+                    affinity: CpuSet::from_ids([CpuId::new(0)]),
+                    nice: 0,
+                    policy: SchedulingClass::Other,
+                    uclamp_min: Some(0),
+                    uclamp_max: Some(768),
+                },
+            );
+        }
+
+        fn writes(&self) -> Vec<(ProcessId, Option<u16>)> {
+            lock(&self.writes).clone()
+        }
+    }
+
+    impl ProcessController for RecordingController {
+        fn read_scheduling(&self, process: ProcessId) -> PlatformResult<ProcessSchedulingState> {
+            lock(&self.states).get(&process).cloned().ok_or_else(|| {
+                uperf_platform::PlatformError::Disappeared(format!("task {}", process.get()))
+            })
+        }
+
+        fn write_scheduling(
+            &self,
+            process: ProcessId,
+            desired: &ProcessSchedulingState,
+        ) -> PlatformResult<ProcessSchedulingState> {
+            lock(&self.writes).push((process, desired.uclamp_min));
+            lock(&self.states).insert(process, desired.clone());
+            Ok(desired.clone())
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn focused(pid: u32) -> ProcessInfo {
+        ProcessInfo {
+            identity: ProcessIdentity {
+                pid: ProcessId::new(pid),
+                start_time_ticks: u64::from(pid),
+                uid: UserId::new(1_000),
+            },
+            owner_control_safe: true,
+            comm: format!("app-{pid}"),
+            executable: Some(format!("/usr/bin/app-{pid}")),
+            desktop_id: None,
+        }
+    }
+
+    fn focus_plan() -> TaskPlan {
+        TaskPlan {
+            uclamp_min: Some(205),
+            ..TaskPlan::default()
+        }
+    }
+
+    fn desired_with(tasks: BTreeMap<ProcessIdentity, TaskPlan>) -> DesiredPlan {
+        DesiredPlan {
+            generation: 1,
+            effective_profile: uperf_core::ProfileId::Balance,
+            dominant_scene: Scene::Idle,
+            frequencies: BTreeMap::new(),
+            tasks,
+        }
+    }
+
+    /// A focus switch must relinquish the previous task before boosting the new
+    /// one; the reverse order would leave a defocused app clamped if the second
+    /// half of the transaction failed.
+    #[test]
+    fn a_focus_switch_restores_the_previous_task_before_boosting_the_next() {
+        let procfs = Arc::new(FakeProc::default());
+        let controller = Arc::new(RecordingController::default());
+        let previous = focused(41);
+        let next = focused(42);
+        for process in [&previous, &next] {
+            procfs.insert_process(process.clone());
+            controller.insert(process.identity.pid);
+        }
+        let actuator = FrequencyActuator::new(
+            Arc::new(DenyingSysfs),
+            Arc::new(MemoryStore::default()),
+            TargetRegistry::default(),
+            "boot-a",
+            "device-a",
+        )
+        .with_process_backend(procfs, controller.clone());
+        let mut applied = AppliedState::default();
+        let mut applied_units = BTreeMap::new();
+        let mut warning = None;
+
+        let boosted = desired_with([(previous.identity, focus_plan())].into());
+        reconcile_scheduler(
+            &actuator,
+            Some(&previous),
+            &boosted,
+            None,
+            &mut applied,
+            &mut applied_units,
+            &mut warning,
+        )
+        .expect("boost the first focused task");
+        assert_eq!(
+            controller.writes(),
+            vec![(previous.identity.pid, Some(205))]
+        );
+        assert_eq!(
+            controller
+                .read_scheduling(previous.identity.pid)
+                .expect("read boosted task")
+                .uclamp_max,
+            Some(768),
+            "a minimum-only focus plan must preserve the current ceiling"
+        );
+
+        let switched = desired_with([(next.identity, focus_plan())].into());
+        reconcile_scheduler(
+            &actuator,
+            Some(&next),
+            &switched,
+            None,
+            &mut applied,
+            &mut applied_units,
+            &mut warning,
+        )
+        .expect("switch focus to the second task");
+
+        assert_eq!(
+            controller.writes(),
+            vec![
+                (previous.identity.pid, Some(205)),
+                (previous.identity.pid, Some(0)),
+                (next.identity.pid, Some(205)),
+            ],
+            "the defocused task must be restored to its original uclamp first"
+        );
+        assert!(!applied.tasks.contains_key(&previous.identity));
+        assert!(applied.tasks.contains_key(&next.identity));
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn partial_uclamp_plan_preserves_the_unspecified_bound() {
+        let state = ProcessSchedulingState {
+            affinity: CpuSet::from_ids([CpuId::new(0)]),
+            nice: 0,
+            policy: SchedulingClass::Other,
+            uclamp_min: Some(64),
+            uclamp_max: Some(128),
+        };
+
+        let raised = apply_task_plan(
+            state.clone(),
+            &TaskPlan {
+                uclamp_min: Some(205),
+                ..TaskPlan::default()
+            },
+        );
+        assert_eq!(raised.uclamp_min, Some(128));
+        assert_eq!(raised.uclamp_max, Some(128));
+
+        let lowered = apply_task_plan(
+            state,
+            &TaskPlan {
+                uclamp_max: Some(32),
+                ..TaskPlan::default()
+            },
+        );
+        assert_eq!(lowered.uclamp_min, Some(64));
+        assert_eq!(lowered.uclamp_max, Some(64));
+    }
 
     #[test]
     fn upper_cap_lowers_an_inverted_minimum_to_the_safe_maximum() {

@@ -514,20 +514,11 @@ pub enum SchedulingClass {
     Idle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct UclampLimits {
-    pub min: u16,
-    pub max: u16,
-}
-
-impl UclampLimits {
-    #[must_use]
-    pub const fn is_valid(self) -> bool {
-        self.min <= self.max && self.max <= 1_024
-    }
-}
-
+/// Partial scheduling intent for one process or thread.
+///
+/// Every absent field preserves the task's current value. In particular,
+/// `uclamp_min` and `uclamp_max` are independent so a policy can raise a floor
+/// without also widening an administrator-provided ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TaskPlan {
@@ -538,7 +529,11 @@ pub struct TaskPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduling_class: Option<SchedulingClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uclamp: Option<UclampLimits>,
+    #[schemars(range(max = 1_024))]
+    pub uclamp_min: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 1_024))]
+    pub uclamp_max: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

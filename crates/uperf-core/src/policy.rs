@@ -675,10 +675,26 @@ pub struct PolicyInput<'a> {
     pub thermal_degraded: bool,
 }
 
+/// Diagnostic rule name reported when the focus default plan is used.
+pub const FOCUS_DEFAULT_RULE: &str = "focus-default";
+
+/// Where the workload under evaluation came from.
+///
+/// Focus reports are advisory telemetry from a trusted desktop adapter, so they
+/// are allowed a rule-less default plan; an explicitly selected workload keeps
+/// the historical "no matching rule means no change" semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkloadSource {
+    #[default]
+    Explicit,
+    Focus,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
     config: PolicyConfig,
     scheduler_rules: Vec<CompiledSchedulerRule>,
+    focus_protected: Vec<CompiledWorkloadMatcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -818,15 +834,35 @@ impl PolicyEngine {
             .iter()
             .map(CompiledSchedulerRule::new)
             .collect::<Result<_, _>>()?;
+        let focus_protected = config
+            .scheduler
+            .focus
+            .protected
+            .iter()
+            .map(CompiledWorkloadMatcher::new)
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             config,
             scheduler_rules,
+            focus_protected,
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &PolicyConfig {
         &self.config
+    }
+
+    /// Report whether a process may never be leased as a focused workload.
+    ///
+    /// Mirrors system76-scheduler's exception list: session infrastructure such
+    /// as the compositor, the audio server, and PID 1 must not be reshaped by a
+    /// focus report even though the MVP only ever raises `uclamp.min`.
+    #[must_use]
+    pub fn focus_protects(&self, process: &ProcessInfo) -> bool {
+        self.focus_protected
+            .iter()
+            .any(|matcher| matcher.is_match(process))
     }
 
     /// Evaluate one immutable observation snapshot into a desired plan.
@@ -942,6 +978,7 @@ impl PolicyEngine {
         &self,
         workload: &ProcessInfo,
         threads: &[ProcessInfo],
+        source: WorkloadSource,
     ) -> Result<SchedulerDecision, PolicyError> {
         let scheduler = &self.config.scheduler;
         if !scheduler.enabled {
@@ -953,7 +990,7 @@ impl PolicyEngine {
             .zip(&self.scheduler_rules)
             .find(|(_, compiled)| compiled.matcher.is_match(workload))
         else {
-            return Ok(SchedulerDecision::default());
+            return self.focus_default_decision(workload, threads, source);
         };
 
         let mut decision = SchedulerDecision {
@@ -992,6 +1029,45 @@ impl PolicyEngine {
             decision.tasks.insert(thread.identity, profile.plan.clone());
         }
         Ok(decision)
+    }
+
+    /// Plan applied to a focused workload that matched no process rule.
+    ///
+    /// Keeps the historical empty decision for explicitly selected workloads so
+    /// `uperfctl workload set` on an unruled process stays a no-op.
+    fn focus_default_decision(
+        &self,
+        workload: &ProcessInfo,
+        threads: &[ProcessInfo],
+        source: WorkloadSource,
+    ) -> Result<SchedulerDecision, PolicyError> {
+        let focus = &self.config.scheduler.focus;
+        if source != WorkloadSource::Focus || !focus.enabled {
+            return Ok(SchedulerDecision::default());
+        }
+        let Some(profile_id) = &focus.task_profile else {
+            return Ok(SchedulerDecision::default());
+        };
+        let profile = self
+            .config
+            .scheduler
+            .task_profiles
+            .iter()
+            .find(|profile| profile.id == *profile_id)
+            .ok_or_else(|| PolicyError::MissingTaskProfile(profile_id.clone()))?;
+        let mut tasks = BTreeMap::new();
+        tasks.insert(workload.identity, profile.plan.clone());
+        for thread in threads {
+            if thread.identity.uid != workload.identity.uid {
+                continue;
+            }
+            tasks.insert(thread.identity, profile.plan.clone());
+        }
+        Ok(SchedulerDecision {
+            tasks,
+            cgroup_class: None,
+            matched_rule: Some(FOCUS_DEFAULT_RULE.to_owned()),
+        })
     }
 }
 
@@ -1278,6 +1354,7 @@ mod tests {
                 allowed_cpus: CpuSet::from(vec![CpuId(0)]),
                 cpu_weight: 500,
             }],
+            focus: crate::FocusConfig::default(),
         };
         let engine = PolicyEngine::new(config).expect("valid policy");
         let workload = process(10, 100, "game", Some("/usr/bin/game"));
@@ -1285,7 +1362,11 @@ mod tests {
         let unmatched = process(12, 102, "Audio", None);
 
         let decision = engine
-            .evaluate_scheduler(&workload, &[render.clone(), unmatched])
+            .evaluate_scheduler(
+                &workload,
+                &[render.clone(), unmatched],
+                WorkloadSource::Explicit,
+            )
             .expect("scheduler decision");
 
         assert_eq!(decision.matched_rule.as_deref(), Some("first"));
@@ -1293,6 +1374,122 @@ mod tests {
         assert_eq!(decision.tasks[&workload.identity].nice, Some(-2));
         assert_eq!(decision.tasks[&render.identity].nice, Some(-5));
         assert_eq!(decision.tasks.len(), 2);
+    }
+
+    fn focus_policy(focus: crate::FocusConfig) -> PolicyEngine {
+        let mut config = policy_config();
+        config.scheduler = SchedulerConfig {
+            enabled: true,
+            task_profiles: vec![TaskProfileConfig {
+                id: "foreground".to_owned(),
+                affinity_group: None,
+                plan: TaskPlan {
+                    uclamp_min: Some(205),
+                    ..TaskPlan::default()
+                },
+            }],
+            process_rules: Vec::new(),
+            cgroup_classes: Vec::new(),
+            focus,
+        };
+        PolicyEngine::new(config).expect("valid policy")
+    }
+
+    fn enabled_focus() -> crate::FocusConfig {
+        crate::FocusConfig {
+            enabled: true,
+            task_profile: Some("foreground".to_owned()),
+            ..crate::FocusConfig::default()
+        }
+    }
+
+    #[test]
+    fn focus_default_plans_the_leader_and_its_own_threads() {
+        let engine = focus_policy(enabled_focus());
+        let workload = process(10, 100, "app", Some("/usr/bin/app"));
+        let thread = process(11, 101, "worker", None);
+        let mut foreign = process(12, 102, "helper", None);
+        foreign.identity.uid = UserId(1_001);
+
+        let decision = engine
+            .evaluate_scheduler(
+                &workload,
+                &[thread.clone(), foreign.clone()],
+                WorkloadSource::Focus,
+            )
+            .expect("scheduler decision");
+
+        assert_eq!(decision.matched_rule.as_deref(), Some(FOCUS_DEFAULT_RULE));
+        assert_eq!(decision.cgroup_class, None);
+        assert_eq!(decision.tasks.len(), 2);
+        assert_eq!(decision.tasks[&workload.identity].uclamp_min, Some(205));
+        assert_eq!(decision.tasks[&workload.identity].uclamp_max, None);
+        assert!(decision.tasks.contains_key(&thread.identity));
+        assert!(!decision.tasks.contains_key(&foreign.identity));
+        // No affinity group means the plan never narrows a CPU mask.
+        assert_eq!(decision.tasks[&workload.identity].affinity, None);
+    }
+
+    #[test]
+    fn an_explicit_workload_without_a_rule_stays_an_empty_decision() {
+        let engine = focus_policy(enabled_focus());
+        let workload = process(10, 100, "app", Some("/usr/bin/app"));
+
+        let decision = engine
+            .evaluate_scheduler(&workload, &[], WorkloadSource::Explicit)
+            .expect("scheduler decision");
+
+        assert_eq!(decision, SchedulerDecision::default());
+    }
+
+    #[test]
+    fn a_disabled_focus_config_plans_nothing() {
+        let workload = process(10, 100, "app", Some("/usr/bin/app"));
+        let disabled = focus_policy(crate::FocusConfig {
+            task_profile: Some("foreground".to_owned()),
+            ..crate::FocusConfig::default()
+        });
+        assert_eq!(
+            disabled
+                .evaluate_scheduler(&workload, &[], WorkloadSource::Focus)
+                .expect("scheduler decision"),
+            SchedulerDecision::default()
+        );
+    }
+
+    #[test]
+    fn enabling_focus_without_a_task_profile_is_rejected_by_validation() {
+        let mut config = policy_config();
+        config.scheduler = SchedulerConfig {
+            enabled: true,
+            focus: crate::FocusConfig {
+                enabled: true,
+                ..crate::FocusConfig::default()
+            },
+            ..SchedulerConfig::default()
+        };
+        let error = PolicyEngine::new(config).expect_err("focus needs a task profile");
+        assert!(error.to_string().contains("scheduler.focus.task_profile"));
+    }
+
+    #[test]
+    fn focus_protection_matches_the_configured_processes() {
+        let engine = focus_policy(crate::FocusConfig {
+            protected: vec![WorkloadMatcher {
+                executable: None,
+                desktop_id: None,
+                comm_regex: Some("^gnome-shell$".to_owned()),
+            }],
+            ..enabled_focus()
+        });
+
+        assert!(engine.focus_protects(&process(
+            10,
+            100,
+            "gnome-shell",
+            Some("/usr/bin/gnome-shell")
+        )));
+        assert!(!engine.focus_protects(&process(11, 101, "app", Some("/usr/bin/app"))));
     }
 
     fn process(

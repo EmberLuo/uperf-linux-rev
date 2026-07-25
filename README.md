@@ -204,6 +204,27 @@ the stable PID/start-time/UID checks described above. The same view reports the
 active workload's matched scheduler rule, desired/applied task counts and
 owned systemd cgroup state.
 
+D-Bus API v1.2 adds focus-driven workload selection. A compositor reports the
+focused process with `SetForegroundProcess(pid, reason)` and releases it with
+`ClearForegroundProcess()`; the shipped GNOME reporter lives in
+[extensions/focus@uperflinux.org/](extensions/focus@uperflinux.org/). Focus is a
+workload *source*, never a profile tier: the effective workload is the explicit
+one if present, otherwise the focused one, and only that workload is matched
+against scheduler rules. An accepted report installs an expiring lease that is
+released when the reporter stops renewing it, when its bus peer disappears, or
+when the reported process exits. Reports are authorized like any other workload
+selection — same UID, safe ownership, not a protected process — and are refused
+for callers outside an active local session, so a remote or inactive session
+cannot steer scheduling. Rejection is reported through `uperfctl health` rather
+than as a call error, because a compositor cannot act on the failure. The
+feature is off unless `scheduler.focus.enabled` is true.
+
+```bash
+uperfctl foreground set 1234
+uperfctl foreground clear
+uperfctl status            # workload: 1234 (source focus)
+```
+
 Debian/Ubuntu releases provide two self-contained alternatives:
 `uperf-linux` is the headless edition, while `uperf-linux-gui` contains the
 same daemon and tools plus the GUI. Installing the GUI edition does not install

@@ -15,7 +15,7 @@ pub struct ApiVersion {
 
 impl ApiVersion {
     /// Contract version implemented by this crate.
-    pub const CURRENT: Self = Self { major: 1, minor: 1 };
+    pub const CURRENT: Self = Self { major: 1, minor: 2 };
 
     /// Whether both endpoints can safely exchange version-1 DTOs.
     #[must_use]
@@ -95,7 +95,7 @@ pub struct ActiveWorkload {
     pub requested_mode: String,
     /// Effective mode after policy and safety constraints.
     pub effective_mode: String,
-    /// Selection source such as `manual`, `rule`, or `detector`.
+    /// Selection source: `explicit` registration or compositor `focus`.
     pub source: String,
 }
 

@@ -24,6 +24,7 @@ pub enum Command {
     Health,
     Mode(ModeAction),
     Workload(WorkloadAction),
+    Foreground(ForegroundAction),
     Targets(Option<String>),
     Frequency(FrequencyAction),
     Reload,
@@ -48,6 +49,12 @@ pub enum WorkloadAction {
         mode: Option<String>,
         reason: String,
     },
+    Clear,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ForegroundAction {
+    Set { pid: u32, reason: String },
     Clear,
 }
 
@@ -139,6 +146,7 @@ impl Cli {
             }
             "mode" => Command::Mode(parse_mode(&mut cursor)?),
             "workload" => Command::Workload(parse_workload(&mut cursor)?),
+            "foreground" => Command::Foreground(parse_foreground(&mut cursor)?),
             "targets" => {
                 let target = cursor.next();
                 cursor.finish()?;
@@ -213,6 +221,28 @@ fn parse_workload(cursor: &mut Cursor) -> Result<WorkloadAction> {
             Ok(WorkloadAction::Clear)
         }
         other => bail!("unknown workload action '{other}'; expected show, set, or clear"),
+    }
+}
+
+fn parse_foreground(cursor: &mut Cursor) -> Result<ForegroundAction> {
+    match cursor.next().as_deref() {
+        Some("set") => {
+            let pid = parse_positive(&cursor.required("PID")?, "PID")?;
+            let mut reason = "uperfctl foreground set".into();
+            while let Some(option) = cursor.next() {
+                match option.as_str() {
+                    "--reason" => reason = cursor.required("reason")?,
+                    other => bail!("unknown foreground set option '{other}'"),
+                }
+            }
+            Ok(ForegroundAction::Set { pid, reason })
+        }
+        Some("clear") => {
+            cursor.finish()?;
+            Ok(ForegroundAction::Clear)
+        }
+        Some(other) => bail!("unknown foreground action '{other}'; expected set or clear"),
+        None => bail!("foreground requires an action; expected set or clear"),
     }
 }
 
@@ -369,6 +399,7 @@ pub fn help(topic: Option<&str>) -> &'static str {
     match topic {
         Some("mode") => MODE_HELP,
         Some("workload") => WORKLOAD_HELP,
+        Some("foreground") => FOREGROUND_HELP,
         Some("frequency" | "freq") => FREQUENCY_HELP,
         Some("config") => CONFIG_HELP,
         Some("targets") => TARGETS_HELP,
@@ -392,6 +423,7 @@ Commands:
   health                 Show health; exits 2 when unhealthy
   mode [list|set MODE]   Inspect or change the policy mode
   workload ...           Inspect, select, or clear the active workload
+  foreground ...         Report or release the focused process
   targets [ID]           Show discovered stable target IDs
   frequency ...          Inspect or change bounded frequency overrides
   reload                 Transactionally reload daemon configuration
@@ -425,6 +457,17 @@ Usage:
 
 The daemon resolves PID, start time, and UID before authorization. Clear
 operates on the exact stable identity currently held by the daemon.
+";
+
+const FOREGROUND_HELP: &str = "\
+Usage:
+  uperfctl foreground set PID [--reason TEXT]
+  uperfctl foreground clear
+
+This is the same lane a compositor uses. An explicit 'workload set' always wins
+over focus, and the lease expires unless it is renewed, so a reporter that dies
+never pins the boost. A rejected PID appears as a focus.rejected health issue
+rather than an error, because the receipt is returned before resolution.
 ";
 
 const TARGETS_HELP: &str = "\

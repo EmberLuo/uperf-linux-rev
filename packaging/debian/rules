@@ -40,6 +40,10 @@ override_dh_auto_install:
 		debian/uperf-linux/usr/share/uperf-linux/schema/policy-v2.schema.json
 	install -Dm0644 config/schema/apps-v2.schema.json \
 		debian/uperf-linux/usr/share/uperf-linux/schema/apps-v2.schema.json
+	install -d debian/uperf-linux/usr/share/gnome-shell/extensions/focus@uperflinux.org
+	install -m0644 extensions/focus@uperflinux.org/extension.js \
+		extensions/focus@uperflinux.org/metadata.json \
+		debian/uperf-linux/usr/share/gnome-shell/extensions/focus@uperflinux.org/
 	cp -a debian/uperf-linux/. debian/uperf-linux-gui/
 	install -Dm0644 packaging/gui/org.uperflinux.Gui.desktop \
 		debian/uperf-linux-gui/usr/share/applications/org.uperflinux.Gui.desktop
