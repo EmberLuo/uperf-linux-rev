@@ -144,7 +144,9 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         }
         "Add rule" => "添加规则",
         "Apply" | "Apps" => "应用",
-        "Apply privileged frequency limits?" => "应用特权频率限制？",
+        "Apply limits" => "应用限制",
+        "Apply limits…" => "应用限制…",
+        "Apply manual frequency limits?" => "应用手动频率限制？",
         "Apply…" => "应用…",
         "Application rules" => "应用规则",
         "Broad game and compatibility-layer matches; detection alone never changes the active mode" => {
@@ -190,6 +192,7 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "Follow system language" => "跟随系统语言",
         "Following the focused application" => "正在跟随焦点应用",
         "Frequency" => "频率",
+        "Frequency limits" => "频率限制",
         "Health" => "健康状态",
         "Health issues" => "健康状态详情",
         "Detailed daemon findings, including informational reports" => {
@@ -217,15 +220,17 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "An explicit selection overrides focus until you clear it again" => {
             "显式选择会覆盖焦点跟随，直到再次清除"
         }
-        "Manual bounds are transactional, read back by the daemon, and constrained by thermal safety" => {
-            "手动频率范围以事务方式应用并由守护进程回读，同时受温控安全限制"
+        "Manual frequency limits" => "手动频率限制",
+        "Set temporary allowed ranges. The kernel still chooses the actual frequency from load, and thermal safety may tighten these limits." => {
+            "设置临时允许范围；实际频率仍由内核按负载选择，温控安全也可能进一步收紧范围。"
         }
-        "Manual frequency override" => "手动频率覆盖",
         "Match by executable path, process-name regex, or both" => {
             "按可执行文件路径、进程名正则表达式或两者共同匹配"
         }
         "Maximum frequency" => "最高频率",
+        "Maximum allowed frequency" => "最高允许频率",
         "Minimum frequency" => "最低频率",
+        "Minimum allowed frequency" => "最低允许频率",
         "Mode" => "模式",
         "Modes are advertised by the running daemon" => "模式由正在运行的守护进程提供",
         "No active workload" => "没有活动工作负载",
@@ -237,6 +242,7 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "No fresh state" => "没有最新状态",
         "No matching processes" => "没有匹配的进程",
         "No overridable targets" => "没有可覆盖的目标",
+        "New manual limits" => "新的手动限制",
         "None" => "无",
         "Off" => "已关闭",
         "Not authorized" => "未授权",
@@ -255,7 +261,8 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         }
         "Process-name regex (optional)" => "进程名正则表达式（可选）",
         "Refresh" => "刷新",
-        "Release all" => "全部释放",
+        "Restore all automatic" => "全部恢复自动调节",
+        "Restore automatic" => "恢复自动调节",
         "Reload" => "重新加载",
         "Remove rule" => "删除规则",
         "Reporter is installed but off" => "上报扩展已安装但未启用",
@@ -291,7 +298,15 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "守护进程会自行解析并验证启动时间和 UID"
         }
         "The focused application is the effective workload" => "焦点应用即当前生效的工作负载",
-        "Thermal and hardware limits remain authoritative." => "温控与硬件限制仍具有最高优先级。",
+        "The kernel still selects the actual frequency, while thermal and hardware limits remain authoritative." => {
+            "实际频率仍由内核选择，温控与硬件限制始终具有最高优先级。"
+        }
+        "The kernel will not select a higher frequency while active" => {
+            "限制生效时，内核不会选择高于此值的频率"
+        }
+        "The kernel will not select a lower frequency while active" => {
+            "限制生效时，内核不会选择低于此值的频率"
+        }
         "Thermal safety" => "温控安全",
         "This daemon is older than the focus contract; update uperf-linux" => {
             "该守护进程版本早于焦点接口，请更新 uperf-linux"
@@ -313,6 +328,11 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "守护进程实际针对的对象，以及调度计划的应用进度"
         }
         "Workload PID" => "工作负载 PID",
+        "Automatic control" => "自动调节",
+        "Changes take effect only after you apply them" => "只有点击应用后更改才会生效",
+        "Current allowed range" => "当前允许范围",
+        "Last confirmed range" => "最近确认范围",
+        "Manual limit active" => "手动限制已生效",
         "any process" => "任意进程",
         "applied" => "已应用",
         "daemon disconnected before the command was sent" => "命令发送前守护进程已断开",

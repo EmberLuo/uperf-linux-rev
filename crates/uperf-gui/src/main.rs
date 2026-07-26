@@ -20,8 +20,8 @@ use i18n::{
 };
 use uperf_api::{
     ActiveWorkload, AppRule, Capabilities, ClientError, DaemonClient, DaemonStatus,
-    FrequencyOverride, FrequencyStatus, RunningWorkload, SchedulerStatus, TelemetrySnapshot,
-    WorkloadRequest, feature,
+    FrequencyOverride, FrequencyStatus, RunningWorkload, SchedulerStatus, TargetCapability,
+    TelemetrySnapshot, WorkloadRequest, feature,
 };
 use view_model::{
     FocusAction, FocusState, FocusView, ReporterState, TargetView, ViewModel, cpu_load_percent,
@@ -132,6 +132,11 @@ struct CpuLoadRow {
     value: gtk::Label,
 }
 
+struct FrequencyOverrideCard {
+    row: adw::ExpanderRow,
+    restore: Option<gtk::Button>,
+}
+
 #[derive(Debug)]
 struct ReconnectBackoff {
     next: Duration,
@@ -211,9 +216,10 @@ struct Ui {
 
     // Frequency page (rebuilt from capabilities)
     override_group: adw::PreferencesGroup,
-    override_dynamic_rows: RefCell<Vec<adw::ActionRow>>,
-    target_status: RefCell<BTreeMap<String, gtk::Label>>,
+    override_dynamic_rows: RefCell<Vec<adw::ExpanderRow>>,
+    target_status: RefCell<BTreeMap<String, FrequencyOverrideCard>>,
     override_ids: RefCell<Vec<String>>,
+    restore_all_button: gtk::Button,
 
     // Apps page: running candidates and persistent rules
     running_group: adw::PreferencesGroup,
@@ -363,11 +369,12 @@ impl Ui {
 
         // Frequency-page widgets
         let override_group = adw::PreferencesGroup::builder()
-            .title(tr("Manual frequency override"))
+            .title(tr("Manual frequency limits"))
             .description(tr(
-                "Manual bounds are transactional, read back by the daemon, and constrained by thermal safety",
+                "Set temporary allowed ranges. The kernel still chooses the actual frequency from load, and thermal safety may tighten these limits.",
             ))
             .build();
+        let restore_all_button = gtk::Button::with_label(tr("Restore all automatic"));
 
         // Apps-page widgets
         let running_group = adw::PreferencesGroup::builder()
@@ -450,6 +457,7 @@ impl Ui {
             override_dynamic_rows: RefCell::new(Vec::new()),
             target_status: RefCell::new(BTreeMap::new()),
             override_ids: RefCell::new(Vec::new()),
+            restore_all_button,
             running_group,
             running_placeholder,
             running_rows: RefCell::new(Vec::new()),
@@ -507,7 +515,7 @@ impl Ui {
             (
                 &frequency,
                 "frequency",
-                tr("Frequency"),
+                tr("Frequency limits"),
                 "power-profile-performance-symbolic",
             ),
             (
@@ -710,15 +718,15 @@ impl Ui {
     }
 
     fn build_frequency_page(self: &Rc<Self>) -> adw::PreferencesPage {
-        let page = new_prefs_page(tr("Frequency"), "power-profile-performance-symbolic");
+        let page = new_prefs_page(tr("Frequency limits"), "power-profile-performance-symbolic");
         page.add(&self.override_group);
 
         let buttons_group = adw::PreferencesGroup::new();
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         hbox.set_halign(gtk::Align::Center);
-        let release_all = gtk::Button::with_label(tr("Release all"));
-        release_all.add_css_class("pill");
-        hbox.append(&release_all);
+        self.restore_all_button.add_css_class("pill");
+        self.restore_all_button.set_sensitive(false);
+        hbox.append(&self.restore_all_button);
         buttons_group.add(&hbox);
         self.add_daemon_control(&self.override_group);
         self.add_daemon_control(&buttons_group);
@@ -726,7 +734,7 @@ impl Ui {
 
         {
             let ui = self.clone();
-            release_all.connect_clicked(move |_| {
+            self.restore_all_button.connect_clicked(move |_| {
                 let ids = ui.override_ids.borrow().clone();
                 if ids.is_empty() {
                     ui.toast(tr("No overridable targets"));
@@ -1103,33 +1111,16 @@ impl Ui {
     #[allow(clippy::too_many_lines)]
     fn add_override_row(self: &Rc<Self>, target: &TargetView) {
         let capability = &target.capability;
-        let cpus = if capability.cpus.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " · CPUs {}",
-                capability
-                    .cpus
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let row = adw::ActionRow::builder()
-            .title(&capability.label)
-            .subtitle(format!("{} · {}{cpus}", capability.id, capability.kind))
+        let display_name = target_display_name(capability);
+        let row = adw::ExpanderRow::builder()
+            .title(&display_name)
+            .subtitle(target_status_text(target.status.as_ref()))
             .build();
-        let status_label = value_label();
-        row.add_suffix(&status_label);
-        self.target_status
-            .borrow_mut()
-            .insert(capability.id.clone(), status_label);
+        row.set_tooltip_text(Some(&format!("{} · {}", capability.id, capability.kind)));
+        let mut restore_button = None;
 
         if capability.can_override && !target.choices_hz.is_empty() {
             self.override_ids.borrow_mut().push(capability.id.clone());
-            let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            controls.set_valign(gtk::Align::Center);
             let labels: Vec<String> = target
                 .choices_hz
                 .iter()
@@ -1141,30 +1132,57 @@ impl Ui {
             minimum.set_tooltip_text(Some(tr("Minimum frequency")));
             maximum.set_tooltip_text(Some(tr("Maximum frequency")));
 
-            let selected_minimum = target
-                .status
-                .as_ref()
-                .map_or(capability.minimum_hz, |status| status.desired_min_hz);
-            let selected_maximum = target
-                .status
-                .as_ref()
-                .map_or(capability.maximum_hz, |status| status.desired_max_hz);
+            let (selected_minimum, selected_maximum) =
+                draft_frequency_bounds(capability, target.status.as_ref());
             minimum.set_selected(closest_index(&target.choices_hz, selected_minimum));
             maximum.set_selected(closest_index(&target.choices_hz, selected_maximum));
 
-            let clear = gtk::Button::with_label(tr("Clear"));
-            let apply = gtk::Button::with_label(tr("Apply…"));
-            apply.add_css_class("destructive-action");
-            controls.append(&minimum);
-            controls.append(&maximum);
-            controls.append(&clear);
-            controls.append(&apply);
-            row.add_suffix(&controls);
+            let minimum_row = adw::ActionRow::builder()
+                .title(tr("Minimum allowed frequency"))
+                .subtitle(tr(
+                    "The kernel will not select a lower frequency while active",
+                ))
+                .build();
+            minimum.set_valign(gtk::Align::Center);
+            minimum_row.add_suffix(&minimum);
+            minimum_row.set_activatable_widget(Some(&minimum));
+            row.add_row(&minimum_row);
+
+            let maximum_row = adw::ActionRow::builder()
+                .title(tr("Maximum allowed frequency"))
+                .subtitle(tr(
+                    "The kernel will not select a higher frequency while active",
+                ))
+                .build();
+            maximum.set_valign(gtk::Align::Center);
+            maximum_row.add_suffix(&maximum);
+            maximum_row.set_activatable_widget(Some(&maximum));
+            row.add_row(&maximum_row);
+
+            let actions = adw::ActionRow::builder()
+                .title(tr("New manual limits"))
+                .subtitle(tr("Changes take effect only after you apply them"))
+                .build();
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            buttons.set_valign(gtk::Align::Center);
+            let restore = gtk::Button::with_label(tr("Restore automatic"));
+            restore.set_sensitive(
+                target
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.override_active),
+            );
+            let apply = gtk::Button::with_label(tr("Apply limits…"));
+            apply.add_css_class("suggested-action");
+            buttons.append(&restore);
+            buttons.append(&apply);
+            actions.add_suffix(&buttons);
+            row.add_row(&actions);
 
             {
                 let ui = self.clone();
                 let target_id = capability.id.clone();
-                clear.connect_clicked(move |_| {
+                restore.connect_clicked(move |_| {
                     ui.send(ClientCommand::ClearFrequency(target_id.clone()));
                 });
             }
@@ -1172,6 +1190,7 @@ impl Ui {
                 let ui = self.clone();
                 let choices = target.choices_hz.clone();
                 let capability = capability.clone();
+                let display_name = display_name.clone();
                 apply.connect_clicked(move |_| {
                     let minimum_index = usize::try_from(minimum.selected()).unwrap_or(usize::MAX);
                     let maximum_index = usize::try_from(maximum.selected()).unwrap_or(usize::MAX);
@@ -1190,10 +1209,20 @@ impl Ui {
                             return;
                         }
                     };
-                    ui.confirm_frequency(request);
+                    ui.confirm_frequency(&display_name, request);
                 });
             }
+            restore_button = Some(restore);
+        } else {
+            row.set_enable_expansion(false);
         }
+        self.target_status.borrow_mut().insert(
+            capability.id.clone(),
+            FrequencyOverrideCard {
+                row: row.clone(),
+                restore: restore_button,
+            },
+        );
         self.override_group.add(&row);
         self.override_dynamic_rows.borrow_mut().push(row);
     }
@@ -1235,13 +1264,31 @@ impl Ui {
 
         for target in &view.targets {
             let text = target_status_text(target.status.as_ref());
-            if let Some(label) = self.target_status.borrow().get(&target.capability.id) {
-                label.set_text(&text);
+            if let Some(card) = self.target_status.borrow().get(&target.capability.id) {
+                card.row.set_subtitle(&text);
+                if let Some(restore) = &card.restore {
+                    restore.set_sensitive(
+                        self.connected.get()
+                            && target
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.override_active),
+                    );
+                }
             }
             if let Some(label) = self.freq_rows.borrow().get(&target.capability.id) {
                 label.set_text(&text);
             }
         }
+        self.restore_all_button.set_sensitive(
+            self.connected.get()
+                && view.targets.iter().any(|target| {
+                    target
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.override_active)
+                }),
+        );
 
         if let Some(thermal) = view.thermal {
             self.thermal_group.set_visible(true);
@@ -1459,18 +1506,18 @@ impl Ui {
         self.load_group.set_visible(!rows.is_empty());
     }
 
-    fn confirm_frequency(self: &Rc<Self>, request: FrequencyOverride) {
+    fn confirm_frequency(self: &Rc<Self>, display_name: &str, request: FrequencyOverride) {
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
-            .message(tr("Apply privileged frequency limits?"))
+            .message(tr("Apply manual frequency limits?"))
             .detail(format!(
                 "{}: {} – {}. {}",
-                request.target_id,
+                display_name,
                 format_frequency(request.min_hz),
                 format_frequency(request.max_hz),
-                tr("Thermal and hardware limits remain authoritative.")
+                tr("The kernel still selects the actual frequency, while thermal and hardware limits remain authoritative.")
             ))
-            .buttons([tr("Cancel"), tr("Apply")])
+            .buttons([tr("Cancel"), tr("Apply limits")])
             .cancel_button(0)
             .default_button(0)
             .build();
@@ -1764,42 +1811,80 @@ fn target_status_text(status: Option<&FrequencyStatus>) -> String {
     status.map_or_else(
         || tr("No fresh state").into(),
         |status| {
-            if !status.applied_verified {
-                return if status.observed_available {
-                    format!(
-                        "{} – {} {} · {}{}",
-                        format_frequency(status.observed_min_hz),
-                        format_frequency(status.observed_max_hz),
-                        tr("observed"),
-                        tr("not managed"),
-                        if status.stale {
-                            format!(" · {}", tr("stale"))
-                        } else {
-                            String::new()
-                        },
-                    )
-                } else {
-                    tr("State unavailable · not managed").to_owned()
-                };
+            let management = if status.override_active {
+                tr("Manual limit active")
+            } else {
+                tr("Automatic control")
+            };
+            if status.observed_available && !status.stale {
+                return format!(
+                    "{management} · {} {} – {}",
+                    tr("Current allowed range"),
+                    format_frequency(status.observed_min_hz),
+                    format_frequency(status.observed_max_hz),
+                );
             }
-            let stale = if status.stale {
-                format!(" · {}", tr("stale"))
-            } else {
-                String::new()
-            };
-            let overridden = if status.override_active {
-                format!(" · {}", tr("override"))
-            } else {
-                String::new()
-            };
-            format!(
-                "{} – {} {}{overridden}{stale}",
-                format_frequency(status.applied_min_hz),
-                format_frequency(status.applied_max_hz),
-                tr("applied")
-            )
+            if status.applied_verified {
+                return format!(
+                    "{management} · {} {} – {} · {}",
+                    tr("Last confirmed range"),
+                    format_frequency(status.applied_min_hz),
+                    format_frequency(status.applied_max_hz),
+                    tr("stale"),
+                );
+            }
+            tr("State unavailable · not managed").to_owned()
         },
     )
+}
+
+fn draft_frequency_bounds(
+    target: &TargetCapability,
+    status: Option<&FrequencyStatus>,
+) -> (u64, u64) {
+    status
+        .filter(|status| status.override_active && status.desired_available)
+        .map_or((target.minimum_hz, target.maximum_hz), |status| {
+            (status.desired_min_hz, status.desired_max_hz)
+        })
+}
+
+fn target_display_name(target: &TargetCapability) -> String {
+    if target.kind == "cpufreq" && !target.cpus.is_empty() {
+        return format!("CPU {}", compact_cpu_list(&target.cpus));
+    }
+    if target.id == "gpu" {
+        return "GPU".to_owned();
+    }
+    target.label.clone()
+}
+
+fn compact_cpu_list(cpus: &[u32]) -> String {
+    let mut cpus = cpus.to_vec();
+    cpus.sort_unstable();
+    cpus.dedup();
+    let mut ranges = Vec::new();
+    let mut start = cpus[0];
+    let mut end = start;
+    for cpu in cpus.into_iter().skip(1) {
+        if cpu == end.saturating_add(1) {
+            end = cpu;
+            continue;
+        }
+        ranges.push(format_cpu_range(start, end));
+        start = cpu;
+        end = cpu;
+    }
+    ranges.push(format_cpu_range(start, end));
+    ranges.join(", ")
+}
+
+fn format_cpu_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}–{end}")
+    }
 }
 
 fn format_frequency(frequency_hz: u64) -> String {
@@ -2542,13 +2627,13 @@ mod tests {
     use super::{
         ErrorDisposition, FocusState, ReconnectBackoff, ReporterState, RequestErrorKind,
         WorkloadClearTarget, cgroup_status_text, classify_client_error, clear_target_for_workload,
-        focus_icon, focus_is_obstructed, format_frequency, generate_rule_id, parse_workload,
-        reporter_state_is_actionable, running_workload_subtitle, scheduler_status_text,
-        thermal_fraction,
+        compact_cpu_list, draft_frequency_bounds, focus_icon, focus_is_obstructed,
+        format_frequency, generate_rule_id, parse_workload, reporter_state_is_actionable,
+        running_workload_subtitle, scheduler_status_text, target_display_name, thermal_fraction,
     };
     use uperf_api::{
-        ActiveWorkload, ApiVersion, AppRule, ClientError, RunningWorkload, SchedulerStatus,
-        WorkloadIdentity,
+        ActiveWorkload, ApiVersion, AppRule, ClientError, FrequencyStatus, RunningWorkload,
+        SchedulerStatus, TargetCapability, WorkloadIdentity,
     };
 
     #[test]
@@ -2653,6 +2738,51 @@ mod tests {
     fn frequency_labels_scale_units() {
         assert_eq!(format_frequency(500), "500 Hz");
         assert_eq!(format_frequency(2_803_200_000), "2.80 GHz");
+    }
+
+    #[test]
+    fn target_names_compact_sparse_cpu_ranges() {
+        let target = TargetCapability {
+            id: "cpu.example".into(),
+            kind: "cpufreq".into(),
+            label: "verbose fallback".into(),
+            cpus: vec![5, 2, 1, 2, 4],
+            ..TargetCapability::default()
+        };
+        assert_eq!(compact_cpu_list(&target.cpus), "1–2, 4–5");
+        assert_eq!(target_display_name(&target), "CPU 1–2, 4–5");
+    }
+
+    #[test]
+    fn frequency_draft_never_treats_missing_desired_state_as_zero_hertz() {
+        let target = TargetCapability {
+            minimum_hz: 300_000_000,
+            maximum_hz: 1_800_000_000,
+            ..TargetCapability::default()
+        };
+        let unavailable = FrequencyStatus {
+            override_active: true,
+            desired_available: false,
+            desired_min_hz: 0,
+            desired_max_hz: 0,
+            ..FrequencyStatus::default()
+        };
+        assert_eq!(
+            draft_frequency_bounds(&target, Some(&unavailable)),
+            (target.minimum_hz, target.maximum_hz)
+        );
+
+        let active = FrequencyStatus {
+            override_active: true,
+            desired_available: true,
+            desired_min_hz: 600_000_000,
+            desired_max_hz: 1_200_000_000,
+            ..FrequencyStatus::default()
+        };
+        assert_eq!(
+            draft_frequency_bounds(&target, Some(&active)),
+            (600_000_000, 1_200_000_000)
+        );
     }
 
     #[test]
