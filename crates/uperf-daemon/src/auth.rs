@@ -13,6 +13,7 @@ use zbus::{
 
 pub const CONTROL_ACTION: &str = "org.uperflinux.control";
 pub const ADMIN_ACTION: &str = "org.uperflinux.admin";
+type LogindSession = (String, u32, String, String, OwnedObjectPath);
 
 /// Production authorization uses `PolicyKit`; session-bus development can
 /// explicitly trust the local peer while still enforcing workload ownership.
@@ -94,35 +95,36 @@ impl Authorizer {
         )
         .await
         .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-        let session: OwnedObjectPath = manager
-            .call("GetSessionByPID", &(caller_pid,))
-            .await
-            .map_err(|_| {
-                ServiceError::NotAuthorized("caller does not belong to a logind session".to_owned())
-            })?;
-        let session = Proxy::new(
-            connection,
-            "org.freedesktop.login1",
-            session.into_inner(),
-            "org.freedesktop.login1.Session",
-        )
-        .await
-        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-        let active: bool = session
-            .get_property("Active")
-            .await
-            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-        let remote: bool = session
-            .get_property("Remote")
-            .await
-            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-        if active && !remote {
-            Ok(uid)
-        } else {
-            Err(ServiceError::NotAuthorized(
-                "only a local, currently active session may report focus".to_owned(),
-            ))
+        let direct_session: Result<OwnedObjectPath, zbus::Error> =
+            manager.call("GetSessionByPID", &(caller_pid,)).await;
+        if let Ok(path) = direct_session {
+            return if session_is_active_local(connection, path).await? {
+                Ok(uid)
+            } else {
+                Err(ServiceError::NotAuthorized(
+                    "only a local, currently active session may report focus".to_owned(),
+                ))
+            };
         }
+
+        // Modern GNOME Shell runs as a systemd user service under
+        // user@UID.service rather than inside session-N.scope, so logind cannot
+        // map its PID back with GetSessionByPID. In that case only, accept the
+        // peer when the same UID owns a genuinely active, non-remote session.
+        // A caller that did map to an inactive or remote session was rejected
+        // above and never receives this fallback.
+        let sessions: Vec<LogindSession> = manager
+            .call("ListSessions", &())
+            .await
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        for (_, session_uid, _, _, path) in sessions {
+            if session_uid == uid && session_is_active_local(connection, path).await? {
+                return Ok(uid);
+            }
+        }
+        Err(ServiceError::NotAuthorized(
+            "caller has no local, currently active logind session".to_owned(),
+        ))
     }
 
     /// Require the caller to hold a `PolicyKit` action.
@@ -171,4 +173,27 @@ impl Authorizer {
             )))
         }
     }
+}
+
+async fn session_is_active_local(
+    connection: &Connection,
+    path: OwnedObjectPath,
+) -> Result<bool, ServiceError> {
+    let session = Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        path.into_inner(),
+        "org.freedesktop.login1.Session",
+    )
+    .await
+    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let active: bool = session
+        .get_property("Active")
+        .await
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let remote: bool = session
+        .get_property("Remote")
+        .await
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    Ok(active && !remote)
 }

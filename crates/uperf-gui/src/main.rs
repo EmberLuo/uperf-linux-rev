@@ -4,7 +4,7 @@ mod view_model;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     thread,
     time::Duration,
@@ -31,6 +31,10 @@ use view_model::{
 const SERVICE_UNIT: &str = "uperf-linux.service";
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
+/// The daemon samples fast enough for policy decisions, but a human-readable
+/// dashboard gains nothing from relaying every 4 Hz sample into GTK layout.
+/// Keep only the latest status and telemetry and repaint them together.
+const GUI_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the reporter is re-probed while its state is something the user may
 /// be fixing right now. A working reporter is left alone and only re-read when
 /// GNOME Shell announces a change, so the idle desktop stays idle.
@@ -123,6 +127,11 @@ enum ErrorDisposition {
     Request(RequestErrorKind),
 }
 
+struct CpuLoadRow {
+    row: adw::ActionRow,
+    value: gtk::Label,
+}
+
 #[derive(Debug)]
 struct ReconnectBackoff {
     next: Duration,
@@ -193,7 +202,7 @@ struct Ui {
 
     // Dashboard: per-CPU utilization (rebuilt as CPU IDs are discovered)
     load_group: adw::PreferencesGroup,
-    load_rows: RefCell<BTreeMap<u32, adw::ActionRow>>,
+    load_rows: RefCell<BTreeMap<u32, CpuLoadRow>>,
 
     // Dashboard: per-target frequency (rebuilt from capabilities)
     freq_group: adw::PreferencesGroup,
@@ -229,6 +238,9 @@ struct Ui {
     mode_ids: RefCell<Vec<String>>,
     connected: Cell<bool>,
     daemon_controls: RefCell<Vec<gtk::Widget>>,
+    pending_status: RefCell<Option<DaemonStatus>>,
+    pending_telemetry: RefCell<Option<TelemetrySnapshot>>,
+    runtime_refresh_scheduled: Cell<bool>,
     commands: Sender<ClientCommand>,
     reporter_commands: Sender<ReporterCommand>,
 }
@@ -263,7 +275,7 @@ impl Ui {
         let window = adw::ApplicationWindow::builder()
             .application(application)
             .title("Uperf Linux")
-            .default_width(520)
+            .default_width(720)
             .default_height(760)
             .build();
 
@@ -456,6 +468,9 @@ impl Ui {
             mode_ids: RefCell::new(Vec::new()),
             connected: Cell::new(false),
             daemon_controls: RefCell::new(Vec::new()),
+            pending_status: RefCell::new(None),
+            pending_telemetry: RefCell::new(None),
+            runtime_refresh_scheduled: Cell::new(false),
             commands,
             reporter_commands,
         });
@@ -526,7 +541,7 @@ impl Ui {
 
         // Narrow layout: hide the header switcher, reveal the bottom bar.
         let breakpoint =
-            adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 500px").unwrap());
+            adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 700px").unwrap());
         breakpoint.add_setter(&switcher, "visible", Some(&false.into()));
         breakpoint.add_setter(&switcher_bar, "reveal", Some(&true.into()));
         self.window.add_breakpoint(breakpoint);
@@ -843,6 +858,10 @@ impl Ui {
 
     fn set_connected(&self, connected: bool) {
         self.connected.set(connected);
+        if !connected {
+            self.pending_status.borrow_mut().take();
+            self.pending_telemetry.borrow_mut().take();
+        }
         for widget in self.daemon_controls.borrow().iter() {
             widget.set_sensitive(connected);
         }
@@ -960,15 +979,14 @@ impl Ui {
                 self.rebuild_running_workloads();
             }
             UiEvent::Status(status) => {
-                *self.status.borrow_mut() = status;
-                self.update_status_widgets();
+                self.queue_runtime_update(Some(status), None);
             }
             UiEvent::Capabilities(capabilities) => {
                 *self.capabilities.borrow_mut() = capabilities;
                 self.rebuild_capability_widgets();
                 self.update_status_widgets();
             }
-            UiEvent::Telemetry(telemetry) => self.update_telemetry(&telemetry),
+            UiEvent::Telemetry(telemetry) => self.queue_runtime_update(None, Some(telemetry)),
             UiEvent::AppRules(rules) => {
                 *self.rules.borrow_mut() = rules;
                 self.rebuild_app_rules();
@@ -1362,32 +1380,81 @@ impl Ui {
         }
     }
 
-    fn update_telemetry(&self, telemetry: &TelemetrySnapshot) {
-        self.rebuild_cpu_loads(&telemetry.cpu_loads);
-        let mut status = self.status.borrow_mut();
-        status.thermal = telemetry.thermal.clone();
-        status.frequencies.clone_from(&telemetry.frequencies);
-        drop(status);
+    /// Coalesce high-rate daemon events into one latest-value GUI repaint.
+    ///
+    /// Status and telemetry are separate D-Bus contracts and may arrive in
+    /// either order. Applying status first and telemetry second preserves the
+    /// newest high-rate temperature/frequency observations without redrawing
+    /// unrelated cards for every signal.
+    fn queue_runtime_update(
+        self: &Rc<Self>,
+        status: Option<DaemonStatus>,
+        telemetry: Option<TelemetrySnapshot>,
+    ) {
+        if let Some(status) = status {
+            *self.pending_status.borrow_mut() = Some(status);
+        }
+        if let Some(telemetry) = telemetry {
+            *self.pending_telemetry.borrow_mut() = Some(telemetry);
+        }
+        if self.runtime_refresh_scheduled.replace(true) {
+            return;
+        }
+        let ui = self.clone();
+        glib::timeout_add_local_once(GUI_REFRESH_INTERVAL, move || {
+            ui.runtime_refresh_scheduled.set(false);
+            ui.apply_runtime_update();
+        });
+    }
+
+    fn apply_runtime_update(&self) {
+        let pending_status = self.pending_status.borrow_mut().take();
+        let pending_telemetry = self.pending_telemetry.borrow_mut().take();
+        if pending_status.is_none() && pending_telemetry.is_none() {
+            return;
+        }
+        if let Some(status) = pending_status {
+            *self.status.borrow_mut() = status;
+        }
+        if let Some(telemetry) = pending_telemetry {
+            self.rebuild_cpu_loads(&telemetry.cpu_loads);
+            let mut status = self.status.borrow_mut();
+            status.thermal = telemetry.thermal;
+            status.frequencies = telemetry.frequencies;
+        }
         self.update_status_widgets();
     }
 
-    /// Rebuild the per-CPU utilization rows keyed by the sparse kernel CPU IDs
-    /// the daemon reports, adding rows as new CPUs appear.
+    /// Update per-CPU utilization rows keyed by sparse kernel CPU IDs.
     fn rebuild_cpu_loads(&self, loads: &[uperf_api::CpuLoad]) {
         let mut rows = self.load_rows.borrow_mut();
+        let live_cpus = loads
+            .iter()
+            .map(|load| load.cpu_id)
+            .collect::<BTreeSet<_>>();
+        let stale_cpus = rows
+            .keys()
+            .filter(|cpu| !live_cpus.contains(cpu))
+            .copied()
+            .collect::<Vec<_>>();
+        for cpu in stale_cpus {
+            if let Some(load_row) = rows.remove(&cpu) {
+                self.load_group.remove(&load_row.row);
+            }
+        }
         for load in loads {
-            let row = rows.entry(load.cpu_id).or_insert_with(|| {
+            let load_row = rows.entry(load.cpu_id).or_insert_with(|| {
                 let row = adw::ActionRow::builder()
                     .title(format!("CPU {}", load.cpu_id))
                     .build();
-                let label = value_label();
-                row.add_suffix(&label);
+                let value = value_label();
+                row.add_suffix(&value);
                 self.load_group.add(&row);
-                row
+                CpuLoadRow { row, value }
             });
-            if let Some(label) = row.last_child().and_downcast::<gtk::Label>() {
-                label.set_text(&format!("{:.0} %", cpu_load_percent(*load)));
-            }
+            load_row
+                .value
+                .set_text(&format!("{:.0} %", cpu_load_percent(*load)));
         }
         self.load_group.set_visible(!rows.is_empty());
     }
