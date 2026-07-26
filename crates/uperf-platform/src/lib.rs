@@ -284,6 +284,8 @@ pub enum InputEvent {
         contact: TouchContactId,
         distance: f64,
     },
+    /// Coalesced non-touch key or relative-pointer activity from one device.
+    Interaction { device: InputDeviceId },
     /// Discard contacts for one device, or every device when `device` is
     /// absent.
     Resync { device: Option<InputDeviceId> },
@@ -296,6 +298,12 @@ pub struct ProcessSchedulingState {
     pub affinity: CpuSet,
     pub nice: i8,
     pub policy: SchedulingClass,
+    /// Exact fixed priority for `SCHED_FIFO`; absent for non-real-time classes.
+    ///
+    /// The default keeps task journal records written before FIFO support
+    /// backward compatible.
+    #[serde(default)]
+    pub rt_priority: Option<u8>,
     pub uclamp_min: Option<u16>,
     pub uclamp_max: Option<u16>,
 }

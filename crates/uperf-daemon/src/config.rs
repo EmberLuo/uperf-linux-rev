@@ -8,12 +8,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use uperf_actuator::{FrequencyTarget, TargetRegistry};
+use uperf_actuator::{FrequencyTarget, ScalarDomain, ScalarTarget, TargetRegistry};
 use uperf_api::{ApiVersion, Capabilities, ModeInfo, TargetCapability, feature};
 use uperf_core::{
     AppRuleEngine, AppsConfig, CONFIG_SCHEMA_VERSION, ConfigBundle, CpuSet, CpuTargetPolicy,
-    DeviceConfig, FrequencyLimits, FrequencyPolicy, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig,
-    PolicyEngine, TargetId, ThermalZoneConfig,
+    DeviceConfig, EnergyModel, FrequencyLimits, FrequencyPolicy, GovernorRollout, Hertz,
+    MAX_CONFIG_FILE_BYTES, PolicyConfig, PolicyEngine, ScalarTargetConfig,
+    ScalarTargetDomainConfig, TargetId, ThermalZoneConfig,
 };
 use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -24,6 +25,9 @@ pub struct ConfigurationPaths {
     pub device_profiles: PathBuf,
     pub policy: PathBuf,
     pub apps: PathBuf,
+    /// Read-only startup diagnostics retained across every hot-reload
+    /// generation.
+    pub startup_warnings: Vec<String>,
 }
 
 impl ConfigurationPaths {
@@ -34,12 +38,19 @@ impl ConfigurationPaths {
             device_profiles: config_directory.as_ref().join("devices"),
             policy: config_directory.as_ref().join("policy.json"),
             apps: state_directory.as_ref().join("apps.json"),
+            startup_warnings: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_device_profiles(mut self, directory: impl Into<PathBuf>) -> Self {
         self.device_profiles = directory.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_startup_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.startup_warnings = warnings;
         self
     }
 }
@@ -55,6 +66,7 @@ pub struct ResolvedTarget {
     pub available_frequencies: Vec<Hertz>,
     pub paths: FrequencyTargetPaths,
     pub automatic_policy: Option<FrequencyPolicy>,
+    pub energy_model: Option<EnergyModel>,
     pub administrator_cap: Option<Hertz>,
     pub critical_cap: Hertz,
     pub sensor_failure_cap: Hertz,
@@ -149,7 +161,8 @@ impl ResolvedConfiguration {
             .context("validate references across device and policy configuration")?;
         let policy_engine = PolicyEngine::new(policy.clone())?;
         let app_rule_engine = AppRuleEngine::new(&apps)?;
-        let (targets, warnings) = resolve_targets(&device, discovery)?;
+        let (targets, mut warnings) = resolve_targets(&device, discovery, policy.governor.rollout)?;
+        warnings.extend(paths.startup_warnings.iter().cloned());
         let thermal_zones = resolve_thermal_zones(&device, discovery)?;
 
         Ok(Self {
@@ -171,11 +184,49 @@ impl ResolvedConfiguration {
     /// Returns an error when any resolved target cannot be converted into a
     /// valid actuator target or when the registry contains conflicting IDs.
     pub fn actuator_registry(&self) -> Result<TargetRegistry> {
-        self.targets
+        let frequencies = self
+            .targets
             .values()
             .map(ResolvedTarget::actuator_target)
-            .collect::<Result<Vec<_>>>()
-            .and_then(|targets| TargetRegistry::new(targets).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let scalars = self.actuator_scalar_targets()?;
+        TargetRegistry::new(frequencies)?
+            .with_scalar_targets(scalars)
+            .map_err(anyhow::Error::from)
+    }
+
+    /// Build the typed scalar targets declared only by the root-owned device
+    /// profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured path or closed value domain cannot
+    /// form a safe actuator target.
+    pub fn actuator_scalar_targets(&self) -> Result<Vec<ScalarTarget>> {
+        self.device
+            .scalar_targets
+            .iter()
+            .map(actuator_scalar_target)
+            .collect()
+    }
+
+    /// Exact logical sysfs paths that the configured actuator may mutate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any scalar target is invalid.
+    pub fn actuator_write_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = self
+            .targets
+            .values()
+            .flat_map(|target| [target.paths.minimum.clone(), target.paths.maximum.clone()])
+            .collect::<Vec<_>>();
+        paths.extend(
+            self.actuator_scalar_targets()?
+                .into_iter()
+                .map(|target| target.path),
+        );
+        Ok(paths)
     }
 
     #[must_use]
@@ -189,6 +240,7 @@ impl ResolvedConfiguration {
                         CpuTargetPolicy {
                             cpus: target.cpus.clone(),
                             frequency,
+                            energy_model: target.energy_model.clone(),
                         },
                     )
                 })
@@ -233,9 +285,32 @@ impl ResolvedConfiguration {
             feature::ACTIVE_WORKLOAD.to_owned(),
             feature::CONFIG_RELOAD_V2.to_owned(),
             feature::LOGIND_SLEEP_WAKE.to_owned(),
+            feature::DECISION_TRACE_V1.to_owned(),
         ];
         if self.policy.input.enabled {
             features.push(feature::EVDEV_SCENES.to_owned());
+            features.push(feature::DESKTOP_INPUT_V1.to_owned());
+        }
+        if self.policy.scheduler.enabled {
+            features.push(feature::SCENE_SCHEDULER_V1.to_owned());
+        }
+        if !self.device.scalar_targets.is_empty() {
+            features.push(feature::SCALAR_TARGETS_V1.to_owned());
+        }
+        if self.policy.governor.rollout != GovernorRollout::Legacy
+            && !self.device.cpu_policies.is_empty()
+            && self
+                .device
+                .cpu_policies
+                .iter()
+                .all(|policy| policy.energy_model.is_some())
+            && self
+                .policy
+                .profiles
+                .iter()
+                .all(|profile| profile.power_budget.is_some())
+        {
+            features.push(feature::ENERGY_GOVERNOR_V1.to_owned());
         }
         features.push(feature::DEVICE_PROFILE.to_owned());
         Capabilities {
@@ -272,6 +347,30 @@ impl ResolvedConfiguration {
             config_schema_max: CONFIG_SCHEMA_VERSION,
         }
     }
+}
+
+fn actuator_scalar_target(config: &ScalarTargetConfig) -> Result<ScalarTarget> {
+    let domain = match &config.domain {
+        ScalarTargetDomainConfig::IntegerRange { minimum, maximum } => ScalarDomain::IntegerRange {
+            minimum: *minimum,
+            maximum: *maximum,
+        },
+        ScalarTargetDomainConfig::IntegerEnum { values } => ScalarDomain::IntegerEnum {
+            values: values.clone(),
+        },
+        ScalarTargetDomainConfig::StringEnum { values } => ScalarDomain::StringEnum {
+            values: values.clone(),
+        },
+        ScalarTargetDomainConfig::CpuList {
+            allowed_cpus,
+            allow_empty,
+        } => ScalarDomain::CpuList {
+            allowed_cpus: allowed_cpus.clone(),
+            allow_empty: *allow_empty,
+        },
+    };
+    ScalarTarget::new(config.id.clone(), PathBuf::from(&config.path), domain)
+        .map_err(anyhow::Error::from)
 }
 
 fn load_device_config(
@@ -425,6 +524,7 @@ fn device_matches(device: &DeviceConfig, discovery: &LinuxDiscovery) -> bool {
 fn resolve_targets(
     device: &DeviceConfig,
     discovery: &LinuxDiscovery,
+    governor_rollout: GovernorRollout,
 ) -> Result<(BTreeMap<TargetId, ResolvedTarget>, Vec<String>)> {
     let mut resolved = BTreeMap::new();
     let mut claimed_discovery_ids = BTreeSet::new();
@@ -488,6 +588,20 @@ fn resolve_targets(
                 configured.id
             );
         }
+        let energy_model = configured
+            .energy_model
+            .as_ref()
+            .map(|model| EnergyModel::from_config(model, &capability.available_frequencies))
+            .transpose();
+        let energy_model = match (energy_model, governor_rollout) {
+            (Ok(model), _) => model,
+            (Err(_), GovernorRollout::Legacy) => None,
+            (Err(error), GovernorRollout::Shadow | GovernorRollout::Energy) => {
+                return Err(error).with_context(|| {
+                    format!("expand calibrated energy model for {}", configured.id)
+                });
+            }
+        };
         claimed_discovery_ids.insert(capability.id.clone());
         resolved.insert(
             configured.id.clone(),
@@ -508,6 +622,7 @@ fn resolve_targets(
                 available_frequencies: capability.available_frequencies.clone(),
                 paths: paths.clone(),
                 automatic_policy: Some(policy),
+                energy_model,
                 administrator_cap: configured.admin_cap_hz,
                 critical_cap,
                 sensor_failure_cap,
@@ -587,6 +702,7 @@ fn resolve_targets(
                 available_frequencies: capability.available_frequencies.clone(),
                 paths: paths.clone(),
                 automatic_policy: None,
+                energy_model: None,
                 administrator_cap: configured.admin_cap_hz,
                 critical_cap,
                 sensor_failure_cap,
@@ -745,8 +861,8 @@ mod tests {
     use tempfile::tempdir;
     use uperf_core::{
         AppsConfig, ConfigBundle, CpuId, CpuPolicyCapability, CpuSet, DeviceCapabilities,
-        DeviceConfig, FrequencyLimits, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig, TargetId,
-        ThermalZoneCapability,
+        DeviceConfig, FrequencyLimits, GovernorRollout, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig,
+        PowerBudgetConfig, TargetId, ThermalZoneCapability,
     };
     use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -866,6 +982,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture keeps frequency, thermal, scalar registry, allowlist and capability assertions on one resolved generation"
+    )]
     fn device_configuration_resolves_against_a_linux_fixture() {
         let temporary = tempdir().expect("temporary root");
         let config_directory = temporary.path().join("etc");
@@ -877,9 +997,16 @@ mod tests {
             synthetic_device_json("vendor-test-soc", "vendor,test-soc"),
         )
         .unwrap();
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../config/policy.json")).unwrap();
+        policy["scheduler"]["realtime"] = serde_json::json!({
+            "enabled": true,
+            "max_priority": 20,
+            "housekeeping_cpus": [0]
+        });
         fs::write(
             config_directory.join("policy.json"),
-            include_bytes!("../../../config/policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
         )
         .unwrap();
         fs::write(
@@ -937,13 +1064,103 @@ mod tests {
             )]),
             warnings: Vec::new(),
         };
-        let resolved = ResolvedConfiguration::load(
-            &ConfigurationPaths::below(&config_directory, &state_directory),
+        let mut resolved = ResolvedConfiguration::load(
+            &ConfigurationPaths::below(&config_directory, &state_directory)
+                .with_startup_warnings(vec!["read-only conflict diagnostic".into()]),
             &discovery,
         )
         .expect("device configuration must resolve");
         assert_eq!(resolved.targets.len(), 1);
         assert_eq!(resolved.thermal_zones.len(), 1);
+        let scalar_id = TargetId::new("scalar.memory").expect("scalar ID");
+        assert!(
+            resolved
+                .actuator_registry()
+                .expect("combined actuator registry")
+                .get_scalar(&scalar_id)
+                .is_some(),
+            "root-owned scalar targets must be registered with the actuator"
+        );
+        assert!(
+            resolved
+                .actuator_write_paths()
+                .expect("mutation write paths")
+                .contains(&PathBuf::from("/sys/class/devfreq/test/max_freq")),
+            "the exact scalar node must be part of the mutation allowlist"
+        );
+        assert!(
+            resolved
+                .capabilities()
+                .features
+                .iter()
+                .any(|feature| feature == uperf_api::feature::SCALAR_TARGETS_V1)
+        );
+        assert!(
+            resolved
+                .capabilities()
+                .features
+                .iter()
+                .any(|feature| feature == uperf_api::feature::SCENE_SCHEDULER_V1)
+        );
+        assert!(
+            resolved
+                .capabilities()
+                .features
+                .iter()
+                .any(|feature| feature == uperf_api::feature::DESKTOP_INPUT_V1)
+        );
+        assert!(
+            !resolved
+                .capabilities()
+                .features
+                .iter()
+                .any(|feature| feature == uperf_api::feature::ENERGY_GOVERNOR_V1),
+            "legacy rollout must not advertise an active energy governor"
+        );
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|warning| warning == "read-only conflict diagnostic")
+        );
+
+        resolved.policy.input.enabled = false;
+        resolved.policy.scheduler.enabled = false;
+        resolved.device.scalar_targets.clear();
+        let disabled = resolved.capabilities();
+        assert!(!disabled.supports(uperf_api::feature::DESKTOP_INPUT_V1));
+        assert!(!disabled.supports(uperf_api::feature::SCENE_SCHEDULER_V1));
+        assert!(!disabled.supports(uperf_api::feature::SCALAR_TARGETS_V1));
+
+        resolved.policy.governor.rollout = GovernorRollout::Shadow;
+        resolved.device.cpu_policies[0].energy_model =
+            Some(uperf_core::CpuEnergyModelConfig::ReferenceCurveV1 {
+                relative_performance: 100,
+                typical_power_mw_per_core: 1_000,
+                typical_frequency_hz: Hertz::new(3_000),
+                sweet_frequency_hz: Hertz::new(2_000),
+                plain_frequency_hz: Hertz::new(1_000),
+                free_frequency_hz: Hertz::new(1_000),
+            });
+        assert!(
+            !resolved
+                .capabilities()
+                .supports(uperf_api::feature::ENERGY_GOVERNOR_V1),
+            "an incomplete shadow budget must not advertise a usable energy governor"
+        );
+        for profile in &mut resolved.policy.profiles {
+            profile.power_budget = Some(PowerBudgetConfig {
+                slow_limit_power_mw: 1_000,
+                fast_limit_power_mw: 2_000,
+                fast_limit_capacity_mj: 1_000,
+                fast_limit_recover_scale: 1.0,
+            });
+        }
+        assert!(
+            resolved
+                .capabilities()
+                .supports(uperf_api::feature::ENERGY_GOVERNOR_V1)
+        );
     }
 
     #[test]
@@ -1046,6 +1263,14 @@ mod tests {
                 "admin_cap_hz": 4_000,
                 "critical_cap_hz": 1_000,
                 "sensor_failure_cap_hz": 1_000
+            }],
+            "scalar_targets": [{
+                "id": "scalar.memory",
+                "path": "/sys/class/devfreq/test/max_freq",
+                "domain": {
+                    "kind": "integer-enum",
+                    "values": [100, 200]
+                }
             }],
             "thermal_zones": [{
                 "id": "soc",

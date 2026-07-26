@@ -31,14 +31,21 @@ fn main() -> Result<()> {
         .probe()
         .context("read-only hardware probe failed")?;
 
-    let document = if arguments.device_draft {
-        eprintln!(
-            "uperf-probe: generated device.json is a non-activatable draft: review inferred frequency values and add explicitly trusted thermal zones"
-        );
-        serde_json::to_value(device_draft(&report.capabilities)?)
-            .context("serialize device configuration draft")?
-    } else {
-        serde_json::to_value(&report).context("serialize probe report")?
+    let document = match arguments.report {
+        ReportKind::DeviceDraft => {
+            eprintln!(
+                "uperf-probe: generated device.json is a non-activatable draft: review inferred frequency values and add explicitly trusted thermal zones"
+            );
+            serde_json::to_value(device_draft(&report.capabilities)?)
+                .context("serialize device configuration draft")?
+        }
+        ReportKind::EnergyDraft => {
+            eprintln!(
+                "uperf-probe: energy data is a calibration worksheet, not a measured or activatable model"
+            );
+            energy_draft(&report.capabilities)
+        }
+        ReportKind::Probe => serde_json::to_value(&report).context("serialize probe report")?,
     };
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -55,9 +62,17 @@ fn main() -> Result<()> {
 #[derive(Debug, Eq, PartialEq)]
 struct Arguments {
     pretty: bool,
-    device_draft: bool,
+    report: ReportKind,
     fixture_root: Option<PathBuf>,
     help: bool,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+enum ReportKind {
+    #[default]
+    Probe,
+    DeviceDraft,
+    EnergyDraft,
 }
 
 impl Arguments {
@@ -65,7 +80,7 @@ impl Arguments {
         let mut arguments = arguments.into_iter();
         let mut parsed = Self {
             pretty: true,
-            device_draft: false,
+            report: ReportKind::Probe,
             fixture_root: None,
             help: false,
         };
@@ -73,7 +88,15 @@ impl Arguments {
             match argument.to_str() {
                 Some("--pretty") => parsed.pretty = true,
                 Some("--compact") => parsed.pretty = false,
-                Some("--device-draft") => parsed.device_draft = true,
+                Some("--device-draft") if parsed.report == ReportKind::Probe => {
+                    parsed.report = ReportKind::DeviceDraft;
+                }
+                Some("--energy-draft") if parsed.report == ReportKind::Probe => {
+                    parsed.report = ReportKind::EnergyDraft;
+                }
+                Some("--device-draft" | "--energy-draft") => {
+                    bail!("--device-draft and --energy-draft are mutually exclusive");
+                }
                 Some("--root") => {
                     let Some(root) = arguments.next() else {
                         bail!("--root requires a fixture directory");
@@ -94,12 +117,13 @@ fn print_help() {
         "\
 uperf-probe - inspect Linux performance-control capabilities without writing them
 
-Usage: uperf-probe [--pretty|--compact] [--device-draft] [--root FIXTURE]
+Usage: uperf-probe [--pretty|--compact] [--device-draft|--energy-draft] [--root FIXTURE]
 
 Options:
   --pretty         Pretty-print JSON (default)
   --compact        Emit compact JSON
   --device-draft   Emit a review-only device.json draft instead of the report
+  --energy-draft   Emit a per-OPP power-calibration worksheet
   --root FIXTURE   Read FIXTURE/sys, FIXTURE/proc and FIXTURE/etc instead of host roots
   -h, --help       Show this help
 
@@ -141,6 +165,8 @@ fn device_draft(capabilities: &uperf_core::DeviceCapabilities) -> Result<DeviceC
                 admin_cap_hz: Some(policy.limits.max),
                 critical_cap_hz: Some(policy.limits.min),
                 sensor_failure_cap_hz: Some(policy.limits.min),
+                // A probe can enumerate OPPs but cannot infer calibrated power.
+                energy_model: None,
             }
         })
         .collect();
@@ -184,6 +210,7 @@ fn device_draft(capabilities: &uperf_core::DeviceCapabilities) -> Result<DeviceC
         cpu_groups,
         cpu_policies,
         devfreq_targets,
+        scalar_targets: Vec::new(),
         // Trust and thermal thresholds require administrator review. An empty
         // list deliberately makes ConfigBundle activation validation fail.
         thermal_zones: Vec::new(),
@@ -209,6 +236,62 @@ fn draft_cpu_model(frequencies: &[Hertz], limits: uperf_core::FrequencyLimits) -
     )
 }
 
+fn energy_draft(capabilities: &uperf_core::DeviceCapabilities) -> serde_json::Value {
+    let policies = capabilities
+        .cpu_policies
+        .iter()
+        .map(|policy| {
+            let mut frequencies = policy.available_frequencies.clone();
+            frequencies.sort_unstable();
+            frequencies.dedup();
+            let maximum = frequencies.last().copied().unwrap_or(policy.limits.max);
+            let points = frequencies
+                .iter()
+                .map(|frequency| {
+                    let relative_capacity = if maximum == Hertz::ZERO {
+                        0
+                    } else {
+                        frequency.get().saturating_mul(1_024) / maximum.get()
+                    };
+                    serde_json::json!({
+                        "frequency_hz": frequency.get(),
+                        "relative_capacity_inferred": relative_capacity,
+                        "power_mw_per_core_measured": null,
+                        "status": "requires-calibration"
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "target_id": policy.id.to_string(),
+                "related_cpus": policy.cpus.iter().map(|cpu| cpu.get()).collect::<Vec<_>>(),
+                "hardware_min_hz": policy.limits.min.get(),
+                "hardware_max_hz": policy.limits.max.get(),
+                "opp_source": if frequencies.is_empty() {
+                    "continuous-range-no-immutable-opp-table"
+                } else {
+                    "kernel-available-frequencies"
+                },
+                "model_kind_after_measurement": "measured-opp-v1",
+                "points": points,
+                "status": "requires-calibration"
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "format": "uperf-linux-energy-draft-v1",
+        "review_only": true,
+        "device_name": capabilities.device_name.clone(),
+        "compatible": capabilities.compatible.clone(),
+        "cpu_policies": policies,
+        "measurement_requirements": [
+            "measure steady-state package power at every selected OPP",
+            "subtract an idle baseline using the same kernel and ambient conditions",
+            "record firmware, kernel, governor, temperature, and repeatability",
+            "do not enable energy rollout until an A/B report is reviewed"
+        ]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +308,7 @@ mod tests {
             arguments,
             Arguments {
                 pretty: false,
-                device_draft: false,
+                report: ReportKind::Probe,
                 fixture_root: Some(PathBuf::from("/tmp/fixture")),
                 help: false,
             }
@@ -240,6 +323,19 @@ mod tests {
     #[test]
     fn parses_device_draft_mode() {
         let arguments = Arguments::parse([OsString::from("--device-draft")]).unwrap();
-        assert!(arguments.device_draft);
+        assert_eq!(arguments.report, ReportKind::DeviceDraft);
+    }
+
+    #[test]
+    fn energy_draft_is_explicit_and_mutually_exclusive() {
+        let arguments = Arguments::parse([OsString::from("--energy-draft")]).unwrap();
+        assert_eq!(arguments.report, ReportKind::EnergyDraft);
+        assert!(
+            Arguments::parse([
+                OsString::from("--device-draft"),
+                OsString::from("--energy-draft"),
+            ])
+            .is_err()
+        );
     }
 }

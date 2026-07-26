@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "id": "cpu.little",
+      "cpus": [0, 1],
+      "frequency": {
+        "hardware_limits": {
+          "min": 1000,
+          "max": 3000
+        },
+        "floor": 1000,
+        "reference": 3000,
+        "efficient_cap": 2000,
+        "hertz_per_unit": 1,
+        "available_frequencies": [1000, 2000, 3000]
+      },
+      "energy_model": {
+        "kind": "measured-opp-v1",
+        "points": [
+          {
+            "frequency_hz": 1000,
+            "relative_capacity": 100,
+            "power_mw_per_core": 100
+          },
+          {
+            "frequency_hz": 2000,
+            "relative_capacity": 220,
+            "power_mw_per_core": 250
+          },
+          {
+            "frequency_hz": 3000,
+            "relative_capacity": 330,
+            "power_mw_per_core": 500
+          }
+        ]
+      }
+    },
+    {
+      "id": "cpu.big",
+      "cpus": [2, 3],
+      "frequency": {
+        "hardware_limits": {
+          "min": 1000,
+          "max": 3000
+        },
+        "floor": 1000,
+        "reference": 3000,
+        "efficient_cap": 2000,
+        "hertz_per_unit": 1,
+        "available_frequencies": [1000, 2000, 3000]
+      },
+      "energy_model": {
+        "kind": "measured-opp-v1",
+        "points": [
+          {
+            "frequency_hz": 1000,
+            "relative_capacity": 150,
+            "power_mw_per_core": 200
+          },
+          {
+            "frequency_hz": 2000,
+            "relative_capacity": 350,
+            "power_mw_per_core": 500
+          },
+          {
+            "frequency_hz": 3000,
+            "relative_capacity": 600,
+            "power_mw_per_core": 1000
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "timestamp_ms": 0,
+      "profile": "balance",
+      "scene": "idle",
+      "integrate_elapsed_time": false,
+      "targets": {
+        "cpu.little": {
+          "raw_load": 0.1,
+          "observed_frequency_hz": 1000
+        },
+        "cpu.big": {
+          "raw_load": 0.1,
+          "observed_frequency_hz": 1000
+        }
+      }
+    },
+    {
+      "timestamp_ms": 20,
+      "profile": "balance",
+      "scene": "idle",
+      "targets": {
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 1000
+        },
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 1000
+        }
+      }
+    },
+    {
+      "timestamp_ms": 40,
+      "profile": "balance",
+      "scene": "touch",
+      "targets": {
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 3000
+        },
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 3000
+        }
+      }
+    },
+    {
+      "timestamp_ms": 140,
+      "profile": "balance",
+      "scene": "idle",
+      "targets": {
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 3000
+        },
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 3000
+        }
+      }
+    }
+  ]
+}

@@ -8,20 +8,25 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use uperf_actuator::{
-    ActuatorError, FrequencyActuator, FrequencyRequest, TaskRequest, UnitRequest,
+    ActuatorError, FrequencyActuator, FrequencyRequest, ScalarRequest, ScalarValue, TaskRequest,
+    UnitRequest,
 };
 use uperf_core::{
-    AppliedState, DesiredPlan, Hertz, PolicyEngine, ProcessIdentity, ProcessInfo, TargetId,
-    TaskPlan, WorkloadSource,
+    AppliedState, DesiredPlan, Hertz, PolicyEngine, ProcessIdentity, ProcessInfo,
+    ScalarSettingValue, TargetId, TaskPlan, WorkloadSource, scheduler_scene_for,
 };
 use uperf_platform::{
     PlatformError, ProcessSchedulingState, RuntimePlatform, SystemdUnitProperties,
 };
 
-/// One immutable state snapshot submitted to the serialized blocking worker.
+use crate::decision_trace::{DecisionTraceContext, DecisionTraceStore};
+
+/// One immutable state snapshot submitted to a blocking mutation lane.
+#[derive(Clone)]
 pub(crate) struct ReconcileJob {
     pub actuator: Arc<FrequencyActuator>,
     pub environment: Arc<dyn RuntimePlatform>,
@@ -35,6 +40,8 @@ pub(crate) struct ReconcileJob {
     pub reconcile_scheduler: bool,
     pub mutation_gate: Arc<Mutex<()>>,
     pub frequency_safety: Arc<FrequencySafetyFence>,
+    pub decision_trace: Arc<DecisionTraceStore>,
+    pub decision_trace_context: DecisionTraceContext,
 }
 
 /// Actual state and independent failure domains returned to the reducer.
@@ -123,10 +130,14 @@ impl FrequencySafetyFence {
 
 /// Execute one reconciliation snapshot.
 ///
-/// A daemon-owned gate spans frequency, task and unit transactions so a
-/// suspend/shutdown restoration cannot interleave between those independently
-/// journaled actuator calls.
+/// Scheduler discovery deliberately happens before entering the daemon-owned
+/// mutation gate. Walking procfs and resolving the systemd unit can block, but
+/// neither operation mutates owned state. The gate therefore spans only the
+/// frequency/scalar and task/unit transactions that must not interleave with a
+/// suspend/shutdown restoration.
 pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
+    let started_at = job.environment.monotonic_millis().get();
+    let elapsed = Instant::now();
     let mut outcome = ReconcileOutcome {
         desired: job.desired.clone(),
         applied: job.applied.clone(),
@@ -138,17 +149,6 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
         scheduler_warning: None,
         scheduler_report: SchedulerReport::default(),
     };
-    let Ok(gate) = job.mutation_gate.lock() else {
-        let message = "runtime mutation gate was poisoned".to_owned();
-        if job.reconcile_frequencies {
-            outcome.frequency_error = Some(message.clone());
-        }
-        if job.reconcile_scheduler {
-            outcome.scheduler_error = Some(message);
-        }
-        return outcome;
-    };
-
     let scheduler = if job.reconcile_scheduler {
         match resolve_scheduler(
             job.environment.as_ref(),
@@ -156,6 +156,7 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
             &job.policy_engine,
             job.workload.as_ref(),
             job.workload_source,
+            scheduler_scene_for(job.desired.dominant_scene),
         ) {
             Ok(resolution) => {
                 outcome.desired.tasks.clone_from(&resolution.tasks);
@@ -177,6 +178,23 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
         None
     };
 
+    if !job.reconcile_frequencies && scheduler.is_none() {
+        record_trace(job, &outcome, started_at, elapsed.elapsed());
+        return outcome;
+    }
+
+    let Ok(gate) = job.mutation_gate.lock() else {
+        let message = "runtime mutation gate was poisoned".to_owned();
+        if job.reconcile_frequencies {
+            outcome.frequency_error = Some(message.clone());
+        }
+        if scheduler.is_some() {
+            outcome.scheduler_error = Some(message);
+        }
+        record_trace(job, &outcome, started_at, elapsed.elapsed());
+        return outcome;
+    };
+
     if job.reconcile_frequencies {
         match job.frequency_safety.with_upper_caps(|upper_caps| {
             reconcile_frequencies(
@@ -186,7 +204,15 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
                 &mut outcome.applied,
             )
         }) {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                if let Err(error) = reconcile_scalars(
+                    job.actuator.as_ref(),
+                    &outcome.desired,
+                    &mut outcome.applied,
+                ) {
+                    outcome.frequency_error = Some(error);
+                }
+            }
             Ok(Err(error)) | Err(error) => outcome.frequency_error = Some(error),
         }
     }
@@ -206,7 +232,27 @@ pub(crate) fn run(job: &ReconcileJob) -> ReconcileOutcome {
     }
 
     drop(gate);
+    record_trace(job, &outcome, started_at, elapsed.elapsed());
     outcome
+}
+
+fn record_trace(
+    job: &ReconcileJob,
+    outcome: &ReconcileOutcome,
+    monotonic_ms: u64,
+    duration: std::time::Duration,
+) {
+    job.decision_trace.record_reconcile(
+        monotonic_ms,
+        duration,
+        &outcome.desired,
+        &outcome.applied,
+        outcome.frequency_attempted,
+        outcome.scheduler_attempted,
+        outcome.frequency_error.as_deref(),
+        outcome.scheduler_error.as_deref(),
+        &job.decision_trace_context,
+    );
 }
 
 fn reconcile_frequencies(
@@ -254,13 +300,83 @@ fn reconcile_frequencies(
             });
         }
     }
-    let result = actuator
-        .apply_batch(&requests)
-        .map_err(|error| format!("apply frequency batch: {error}"))?;
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let result = match actuator.apply_owned_batch_fast(&requests) {
+        Ok(result) => result,
+        Err(ActuatorError::OwnershipRequired(_)) => actuator
+            .apply_batch(&requests)
+            .map_err(|error| format!("durably claim frequency batch: {error}"))?,
+        Err(error) => return Err(format!("apply owned frequency batch: {error}")),
+    };
     for (id, limits) in result.applied {
         applied.frequencies.insert(id, limits);
     }
     Ok(())
+}
+
+fn reconcile_scalars(
+    actuator: &FrequencyActuator,
+    desired: &DesiredPlan,
+    applied: &mut AppliedState,
+) -> Result<(), String> {
+    let removed = applied
+        .scalars
+        .keys()
+        .filter(|id| !desired.scalars.contains_key(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    actuator
+        .restore_scalars(&removed)
+        .map_err(|error| format!("restore inactive scalar targets: {error}"))?;
+    for id in removed {
+        applied.scalars.remove(&id);
+    }
+
+    let mut requests = Vec::new();
+    for (id, desired_value) in &desired.scalars {
+        let current = actuator
+            .read_scalar(id)
+            .map_err(|error| format!("read scalar target {id}: {error}"))?;
+        let desired_value = actuator_scalar_value(desired_value);
+        if current == desired_value {
+            applied
+                .scalars
+                .insert(id.clone(), policy_scalar_value(current));
+        } else {
+            requests.push(ScalarRequest {
+                target: id.clone(),
+                value: desired_value,
+            });
+        }
+    }
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let result = actuator
+        .apply_scalars(&requests)
+        .map_err(|error| format!("apply scalar batch: {error}"))?;
+    for (id, value) in result.applied {
+        applied.scalars.insert(id, policy_scalar_value(value));
+    }
+    Ok(())
+}
+
+fn actuator_scalar_value(value: &ScalarSettingValue) -> ScalarValue {
+    match value {
+        ScalarSettingValue::Integer(value) => ScalarValue::Integer(*value),
+        ScalarSettingValue::String(value) => ScalarValue::String(value.clone()),
+        ScalarSettingValue::CpuList(value) => ScalarValue::CpuList(value.clone()),
+    }
+}
+
+fn policy_scalar_value(value: ScalarValue) -> ScalarSettingValue {
+    match value {
+        ScalarValue::Integer(value) => ScalarSettingValue::Integer(value),
+        ScalarValue::String(value) => ScalarSettingValue::String(value),
+        ScalarValue::CpuList(value) => ScalarSettingValue::CpuList(value),
+    }
 }
 
 fn apply_upper_cap(limits: uperf_core::FrequencyLimits, cap: Hertz) -> uperf_core::FrequencyLimits {
@@ -277,6 +393,7 @@ fn resolve_scheduler(
     policy_engine: &PolicyEngine,
     workload: Option<&ProcessInfo>,
     source: WorkloadSource,
+    scheduler_scene: uperf_core::SchedulerScene,
 ) -> Result<SchedulerResolution, String> {
     if !policy_engine.config().scheduler.enabled {
         return Ok(SchedulerResolution {
@@ -328,7 +445,7 @@ fn resolve_scheduler(
     threads.retain(|thread| confirmed.contains(&thread.identity.pid));
 
     let mut decision = policy_engine
-        .evaluate_scheduler(workload, &threads, source)
+        .evaluate_scheduler(workload, &threads, source, scheduler_scene)
         .map_err(|error| error.to_string())?;
     let online = environment
         .online_cpus()
@@ -580,6 +697,12 @@ fn apply_task_plan(
     }
     if let Some(class) = desired.scheduling_class {
         current.policy = class;
+        if class != uperf_core::SchedulingClass::Fifo {
+            current.rt_priority = None;
+        }
+    }
+    if let Some(priority) = desired.rt_priority {
+        current.rt_priority = Some(priority);
     }
     match (desired.uclamp_min, desired.uclamp_max) {
         (Some(minimum), Some(maximum)) => {
@@ -610,6 +733,7 @@ fn scheduling_state_as_plan(state: &ProcessSchedulingState) -> TaskPlan {
         affinity: Some(state.affinity.clone()),
         nice: Some(state.nice),
         scheduling_class: Some(state.policy),
+        rt_priority: state.rt_priority,
         uclamp_min: state.uclamp_min,
         uclamp_max: state.uclamp_max,
     }
@@ -619,23 +743,24 @@ fn scheduling_state_as_plan(state: &ProcessSchedulingState) -> TaskPlan {
 mod tests {
     use std::{
         collections::BTreeMap,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex, mpsc},
         thread,
         time::Duration,
     };
 
-    use uperf_actuator::TargetRegistry;
+    use uperf_actuator::{ScalarDomain, ScalarTarget, TargetRegistry};
     use uperf_core::{
-        CpuId, CpuSet, FrequencyLimits, Hertz, ProcessId, ProcessIdentity, ProcessInfo, Scene,
-        SchedulingClass, TargetId, TaskPlan, UserId,
+        CpuId, CpuSet, FrequencyLimits, Hertz, ProcessId, ProcessIdentity, ProcessInfo,
+        ScalarSettingValue, Scene, SchedulingClass, TargetId, TaskPlan, UserId,
     };
     use uperf_platform::{PlatformResult, ProcessController, StateStore, SysfsIo};
     use uperf_testkit::FakeProc;
 
     use super::{
         AppliedState, DesiredPlan, FrequencyActuator, FrequencySafetyFence, ProcessSchedulingState,
-        apply_task_plan, apply_upper_cap, reconcile_scheduler,
+        apply_task_plan, apply_upper_cap, reconcile_scalars, reconcile_scheduler,
+        scheduling_state_as_plan,
     };
 
     #[derive(Default)]
@@ -654,6 +779,54 @@ mod tests {
                 path.display().to_string(),
                 "frequency paths are unused by task reconciliation",
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct MemorySysfs {
+        values: Mutex<BTreeMap<PathBuf, String>>,
+        writes: Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    impl MemorySysfs {
+        fn insert(&self, path: impl Into<PathBuf>, value: impl Into<String>) {
+            lock(&self.values).insert(path.into(), value.into());
+        }
+
+        fn value(&self, path: &Path) -> String {
+            lock(&self.values)
+                .get(path)
+                .cloned()
+                .expect("known scalar path")
+        }
+
+        fn take_writes(&self) -> Vec<(PathBuf, String)> {
+            std::mem::take(&mut *lock(&self.writes))
+        }
+    }
+
+    impl SysfsIo for MemorySysfs {
+        fn read_string(&self, path: &Path) -> PlatformResult<String> {
+            lock(&self.values).get(path).cloned().ok_or_else(|| {
+                uperf_platform::PlatformError::invalid(
+                    path.display().to_string(),
+                    "unknown scalar path",
+                )
+            })
+        }
+
+        fn write_string(&self, path: &Path, value: &str) -> PlatformResult<()> {
+            let mut values = lock(&self.values);
+            let Some(stored) = values.get_mut(path) else {
+                return Err(uperf_platform::PlatformError::invalid(
+                    path.display().to_string(),
+                    "unknown scalar path",
+                ));
+            };
+            *stored = value.to_owned();
+            drop(values);
+            lock(&self.writes).push((path.to_path_buf(), value.to_owned()));
+            Ok(())
         }
     }
 
@@ -692,6 +865,7 @@ mod tests {
                     affinity: CpuSet::from_ids([CpuId::new(0)]),
                     nice: 0,
                     policy: SchedulingClass::Other,
+                    rt_priority: None,
                     uclamp_min: Some(0),
                     uclamp_max: Some(768),
                 },
@@ -754,8 +928,91 @@ mod tests {
             effective_profile: uperf_core::ProfileId::Balance,
             dominant_scene: Scene::Idle,
             frequencies: BTreeMap::new(),
+            scalars: BTreeMap::new(),
             tasks,
         }
+    }
+
+    #[test]
+    fn scalar_reconcile_restores_removed_skips_equal_and_tracks_applied_values() {
+        let integer_id = TargetId::new("scalar.integer").expect("integer ID");
+        let mode_id = TargetId::new("scalar.mode").expect("mode ID");
+        let integer_path = PathBuf::from("/sys/class/test/integer");
+        let mode_path = PathBuf::from("/sys/class/test/mode");
+        let sysfs = Arc::new(MemorySysfs::default());
+        sysfs.insert(&integer_path, "10");
+        sysfs.insert(&mode_path, "powersave");
+        let registry = TargetRegistry::default()
+            .with_scalar_targets([
+                ScalarTarget::new(
+                    integer_id.clone(),
+                    integer_path.clone(),
+                    ScalarDomain::IntegerRange {
+                        minimum: 0,
+                        maximum: 100,
+                    },
+                )
+                .expect("integer target"),
+                ScalarTarget::new(
+                    mode_id.clone(),
+                    mode_path.clone(),
+                    ScalarDomain::StringEnum {
+                        values: vec!["performance".to_owned(), "powersave".to_owned()],
+                    },
+                )
+                .expect("mode target"),
+            ])
+            .expect("scalar registry");
+        let actuator = FrequencyActuator::new(
+            sysfs.clone(),
+            Arc::new(MemoryStore::default()),
+            registry,
+            "boot-a",
+            "device-a",
+        );
+        let mut applied = AppliedState::default();
+
+        let mut first = desired_with(BTreeMap::new());
+        first
+            .scalars
+            .insert(integer_id.clone(), ScalarSettingValue::Integer(20));
+        reconcile_scalars(&actuator, &first, &mut applied).expect("apply first scalar");
+        assert_eq!(sysfs.value(&integer_path), "20");
+        assert_eq!(
+            applied.scalars.get(&integer_id),
+            Some(&ScalarSettingValue::Integer(20))
+        );
+        sysfs.take_writes();
+
+        let mut second = desired_with(BTreeMap::new());
+        second.scalars.insert(
+            mode_id.clone(),
+            ScalarSettingValue::String("powersave".to_owned()),
+        );
+        reconcile_scalars(&actuator, &second, &mut applied)
+            .expect("restore removed scalar and read-skip equal scalar");
+        assert_eq!(sysfs.value(&integer_path), "10");
+        assert_eq!(
+            sysfs.take_writes(),
+            vec![(integer_path.clone(), "10".to_owned())],
+            "the already-equal scalar must not be written"
+        );
+        assert!(!applied.scalars.contains_key(&integer_id));
+        assert_eq!(
+            applied.scalars.get(&mode_id),
+            Some(&ScalarSettingValue::String("powersave".to_owned()))
+        );
+
+        second.scalars.insert(
+            mode_id.clone(),
+            ScalarSettingValue::String("performance".to_owned()),
+        );
+        reconcile_scalars(&actuator, &second, &mut applied).expect("apply changed scalar");
+        assert_eq!(sysfs.value(&mode_path), "performance");
+        assert_eq!(
+            applied.scalars.get(&mode_id),
+            Some(&ScalarSettingValue::String("performance".to_owned()))
+        );
     }
 
     /// A focus switch must relinquish the previous task before boosting the new
@@ -839,6 +1096,7 @@ mod tests {
             affinity: CpuSet::from_ids([CpuId::new(0)]),
             nice: 0,
             policy: SchedulingClass::Other,
+            rt_priority: None,
             uclamp_min: Some(64),
             uclamp_max: Some(128),
         };
@@ -862,6 +1120,39 @@ mod tests {
         );
         assert_eq!(lowered.uclamp_min, Some(64));
         assert_eq!(lowered.uclamp_max, Some(64));
+    }
+
+    #[test]
+    fn task_plan_maps_fifo_priority_as_part_of_the_scheduler_policy() {
+        let original = ProcessSchedulingState {
+            affinity: CpuSet::from_ids([CpuId::new(1)]),
+            nice: 0,
+            policy: SchedulingClass::Other,
+            rt_priority: None,
+            uclamp_min: Some(64),
+            uclamp_max: Some(768),
+        };
+        let fifo = apply_task_plan(
+            original,
+            &TaskPlan {
+                scheduling_class: Some(SchedulingClass::Fifo),
+                rt_priority: Some(20),
+                ..TaskPlan::default()
+            },
+        );
+        assert_eq!(fifo.policy, SchedulingClass::Fifo);
+        assert_eq!(fifo.rt_priority, Some(20));
+        assert_eq!(scheduling_state_as_plan(&fifo).rt_priority, Some(20));
+
+        let normal = apply_task_plan(
+            fifo,
+            &TaskPlan {
+                scheduling_class: Some(SchedulingClass::Other),
+                ..TaskPlan::default()
+            },
+        );
+        assert_eq!(normal.policy, SchedulingClass::Other);
+        assert_eq!(normal.rt_priority, None);
     }
 
     #[test]

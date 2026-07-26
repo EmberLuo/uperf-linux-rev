@@ -8,6 +8,19 @@
   <method name="ListRunningWorkloads">
     <arg type="a((utu)ssb(bsuussbs))" direction="out"/>
   </method>
+  <method name="GetDecisionTrace">
+    <arg name="after_id" type="t" direction="in"/>
+    <arg name="limit" type="u" direction="in"/>
+    <arg type="a(tttttssbba(stt)a(stt)bs)" direction="out"/>
+  </method>
+  <method name="GetDecisionTraceV2">
+    <arg name="after_id" type="t" direction="in"/>
+    <arg name="limit" type="u" direction="in"/>
+    <arg type="a((tttttssbba(stt)a(stt)bs)stt(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
+  </method>
+  <method name="GetGovernorStatus">
+    <arg type="(tssss(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
+  </method>
   <method name="SetMode">
     <arg name="mode" type="s" direction="in"/>
     <arg type="(tass)" direction="out"/>
@@ -25,6 +38,10 @@
     <arg type="(tass)" direction="out"/>
   </method>
   <method name="ClearForegroundProcess">
+    <arg type="(tass)" direction="out"/>
+  </method>
+  <method name="ReportFrameHint">
+    <arg name="event" type="s" direction="in"/>
     <arg type="(tass)" direction="out"/>
   </method>
   <method name="SetFrequencyOverrides">

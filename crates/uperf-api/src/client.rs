@@ -3,10 +3,14 @@ use std::collections::BTreeSet;
 use zbus::Connection;
 
 use crate::{
-    ActiveWorkload, ApiVersion, AppRule, Capabilities, ClientError, DaemonStatus, DiagnosticCheck,
-    DiagnosticReport, FrequencyOverride, MutationReceipt, ReloadReport, RunningWorkload,
+    ActiveWorkload, ApiVersion, AppRule, Capabilities, ClientError, DaemonStatus,
+    DecisionTraceEntry, DecisionTraceEntryV2, DiagnosticCheck, DiagnosticReport, FrameHintEvent,
+    FrequencyOverride, GovernorStatus, MutationReceipt, ReloadReport, RunningWorkload,
     TelemetrySnapshot, WorkloadRequest,
 };
+
+/// Maximum number of decision trace entries returned by one D-Bus request.
+pub const MAX_DECISION_TRACE_PAGE: u32 = 512;
 
 #[zbus::proxy(
     default_service = "org.uperflinux.Daemon1",
@@ -56,6 +60,23 @@ pub trait Daemon1 {
     /// Discover running game-like processes without selecting one.
     fn list_running_workloads(&self) -> zbus::Result<Vec<RunningWorkload>>;
 
+    /// Return reconciliation timeline entries with IDs strictly above `after_id`.
+    fn get_decision_trace(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> zbus::Result<Vec<DecisionTraceEntry>>;
+
+    /// Return extended reconciliation entries without changing the v1 tuple.
+    fn get_decision_trace_v2(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> zbus::Result<Vec<DecisionTraceEntryV2>>;
+
+    /// Return the latest stateful-governor and scalar diagnostic snapshot.
+    fn get_governor_status(&self) -> zbus::Result<GovernorStatus>;
+
     /// Select a global policy mode.
     fn set_mode(&self, mode: &str) -> zbus::Result<MutationReceipt>;
 
@@ -70,6 +91,9 @@ pub trait Daemon1 {
 
     /// Release the focus lease held for the caller.
     fn clear_foreground_process(&self) -> zbus::Result<MutationReceipt>;
+
+    /// Report one compositor render or physical-display lifecycle event.
+    fn report_frame_hint(&self, event: &str) -> zbus::Result<MutationReceipt>;
 
     /// Atomically replace overrides for the listed stable targets.
     fn set_frequency_overrides(
@@ -205,6 +229,57 @@ impl DaemonClient {
             .map_err(ClientError::from)
     }
 
+    /// Fetch one bounded page of reconciliation timeline entries.
+    ///
+    /// `after_id` is exclusive. Pass zero for the oldest retained entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` exceeds 512 or the D-Bus call fails.
+    pub async fn decision_trace(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<Vec<DecisionTraceEntry>, ClientError> {
+        validate_decision_trace_limit(limit)?;
+        self.proxy()
+            .await?
+            .get_decision_trace(after_id, limit)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Fetch one bounded page of extended governor/scalar trace entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` exceeds 512 or the D-Bus call fails.
+    pub async fn decision_trace_v2(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<Vec<DecisionTraceEntryV2>, ClientError> {
+        validate_decision_trace_limit(limit)?;
+        self.proxy()
+            .await?
+            .get_decision_trace_v2(after_id, limit)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Return the latest read-only governor diagnostic snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the D-Bus call fails.
+    pub async fn governor_status(&self) -> Result<GovernorStatus, ClientError> {
+        self.proxy()
+            .await?
+            .get_governor_status()
+            .await
+            .map_err(ClientError::from)
+    }
+
     /// Select a global policy mode.
     ///
     /// # Errors
@@ -294,6 +369,26 @@ impl DaemonClient {
         self.proxy()
             .await?
             .clear_foreground_process()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Report a render or physical-display lifecycle event.
+    ///
+    /// The daemon accepts the event only from an active local session peer
+    /// holding the current focus-report lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller is not the active compositor reporter
+    /// or the D-Bus call fails.
+    pub async fn report_frame_hint(
+        &self,
+        event: FrameHintEvent,
+    ) -> Result<MutationReceipt, ClientError> {
+        self.proxy()
+            .await?
+            .report_frame_hint(event.as_str())
             .await
             .map_err(ClientError::from)
     }
@@ -460,6 +555,16 @@ impl DaemonClient {
     }
 }
 
+fn validate_decision_trace_limit(limit: u32) -> Result<(), ClientError> {
+    if limit > MAX_DECISION_TRACE_PAGE {
+        Err(ClientError::InvalidRequest(format!(
+            "decision trace limit {limit} exceeds {MAX_DECISION_TRACE_PAGE}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_compatible(server: ApiVersion) -> Result<(), ClientError> {
     if ApiVersion::CURRENT.is_compatible_with(server) {
         Ok(())
@@ -578,7 +683,8 @@ fn validate_rule(rule: &AppRule) -> Result<(), ClientError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_frequency_overrides, validate_identifier, validate_rule, validate_workload_pid,
+        MAX_DECISION_TRACE_PAGE, validate_decision_trace_limit, validate_frequency_overrides,
+        validate_identifier, validate_rule, validate_workload_pid,
     };
     use crate::{AppRule, ClientError, FrequencyOverride};
 
@@ -596,6 +702,15 @@ mod tests {
     fn workload_requests_only_validate_the_untrusted_pid() {
         assert!(validate_workload_pid(42).is_ok());
         assert!(validate_workload_pid(0).is_err());
+    }
+
+    #[test]
+    fn decision_trace_page_limit_is_checked_before_transport() {
+        assert!(validate_decision_trace_limit(MAX_DECISION_TRACE_PAGE).is_ok());
+        assert!(matches!(
+            validate_decision_trace_limit(MAX_DECISION_TRACE_PAGE + 1),
+            Err(ClientError::InvalidRequest(_))
+        ));
     }
 
     #[test]

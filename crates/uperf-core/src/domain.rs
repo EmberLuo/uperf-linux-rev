@@ -512,6 +512,16 @@ pub enum SchedulingClass {
     Other,
     Batch,
     Idle,
+    Fifo,
+}
+
+/// Typed value for one root-reviewed scalar sysfs resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum ScalarSettingValue {
+    Integer(i64),
+    String(String),
+    CpuList(CpuSet),
 }
 
 /// Partial scheduling intent for one process or thread.
@@ -528,6 +538,10 @@ pub struct TaskPlan {
     pub nice: Option<i8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduling_class: Option<SchedulingClass>,
+    /// Fixed real-time priority used only with `SchedulingClass::Fifo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 50))]
+    pub rt_priority: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(max = 1_024))]
     pub uclamp_min: Option<u16>,
@@ -545,6 +559,8 @@ pub struct DesiredPlan {
     #[serde(default)]
     pub frequencies: BTreeMap<TargetId, FrequencyLimits>,
     #[serde(default)]
+    pub scalars: BTreeMap<TargetId, ScalarSettingValue>,
+    #[serde(default)]
     pub tasks: BTreeMap<ProcessIdentity, TaskPlan>,
 }
 
@@ -554,6 +570,8 @@ pub struct AppliedState {
     pub generation: u64,
     #[serde(default)]
     pub frequencies: BTreeMap<TargetId, FrequencyLimits>,
+    #[serde(default)]
+    pub scalars: BTreeMap<TargetId, ScalarSettingValue>,
     #[serde(default)]
     pub tasks: BTreeMap<ProcessIdentity, TaskPlan>,
 }

@@ -1,0 +1,14 @@
+{
+  "modules": {
+    "sched": {
+      "affinity": {
+        "worker": "little",
+        "worker": "all"
+      },
+      "prio": {
+        "critical": 10,
+        "critical": 20
+      }
+    }
+  }
+}

@@ -184,7 +184,7 @@ fn parse_document<T>(
     }
 }
 
-fn read_config_text(path: &Path) -> Result<String> {
+pub(crate) fn read_config_text(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     read_open_config(file, path)
 }
@@ -234,7 +234,7 @@ fn detect_kind(value: &Value, path: &Path) -> &'static str {
     }
 }
 
-fn ensure_output_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_output_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!("migration output directory must not be a symbolic link");
@@ -254,7 +254,7 @@ fn ensure_output_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_json_atomic(path: &Path, document: &impl Serialize, force: bool) -> Result<()> {
+pub(crate) fn write_json_atomic(path: &Path, document: &impl Serialize, force: bool) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(document)
         .with_context(|| format!("serialize {}", path.display()))?;
     let parent = path

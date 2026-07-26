@@ -12,13 +12,19 @@ use std::{
 use futures_util::StreamExt;
 use tokio::{sync::watch, task::JoinHandle};
 use uperf_linux::{EvdevInputSource, GestureConfig};
-use zbus::{Connection, fdo::DBusProxy, zvariant::OwnedFd};
+use zbus::{
+    Connection, Proxy,
+    fdo::DBusProxy,
+    zvariant::{OwnedFd, OwnedObjectPath},
+};
 
-use crate::runtime::{ObserverIngress, RuntimeHandle};
+use crate::runtime::{ObserverIngress, RuntimeHandle, SessionState};
 
 const INHIBITOR_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTORE_DEADLINE_MARGIN: Duration = Duration::from_millis(250);
+const SESSION_STATE_INTERVAL: Duration = Duration::from_secs(1);
+type LogindSessionRow = (String, u32, String, String, OwnedObjectPath);
 
 #[zbus::proxy(
     default_service = "org.freedesktop.login1",
@@ -28,6 +34,8 @@ const RESTORE_DEADLINE_MARGIN: Duration = Duration::from_millis(250);
 )]
 trait LogindManager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
+
+    fn list_sessions(&self) -> zbus::Result<Vec<LogindSessionRow>>;
 
     #[zbus(property, name = "InhibitDelayMaxUSec")]
     fn inhibit_delay_max_usec(&self) -> zbus::Result<u64>;
@@ -125,6 +133,9 @@ async fn run_logind_observer(
         .receive_prepare_for_sleep()
         .await
         .map_err(|error| error.to_string())?;
+    let mut session_poll = tokio::time::interval(SESSION_STATE_INTERVAL);
+    session_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_session_state = None;
     ingress.report_logind_health(Ok(()));
     loop {
         tokio::select! {
@@ -168,6 +179,24 @@ async fn run_logind_observer(
                     }
                 }
             }
+            _ = session_poll.tick() => {
+                match active_local_session_state(&connection, &proxy).await {
+                    Ok(Some(state)) => {
+                        if last_session_state != Some(state) {
+                            ingress.report_session_state(state).await?;
+                            last_session_state = Some(state);
+                        }
+                    }
+                    Ok(None) => {
+                        last_session_state = None;
+                    }
+                    Err(error) => {
+                        ingress.report_logind_health(Err(format!(
+                            "observe logind IdleHint/LockedHint: {error}"
+                        )));
+                    }
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -175,6 +204,63 @@ async fn run_logind_observer(
             }
         }
     }
+}
+
+async fn active_local_session_state(
+    connection: &Connection,
+    manager: &LogindManagerProxy<'_>,
+) -> Result<Option<SessionState>, String> {
+    let sessions = manager
+        .list_sessions()
+        .await
+        .map_err(|error| format!("list sessions: {error}"))?;
+    let mut found = false;
+    let mut any_locked = false;
+    let mut any_idle = false;
+    for (_, _, _, _, path) in sessions {
+        let session = Proxy::new(
+            connection,
+            "org.freedesktop.login1",
+            path,
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        .map_err(|error| format!("connect to session properties: {error}"))?;
+        let active: bool = session
+            .get_property("Active")
+            .await
+            .map_err(|error| format!("read session Active: {error}"))?;
+        let remote: bool = session
+            .get_property("Remote")
+            .await
+            .map_err(|error| format!("read session Remote: {error}"))?;
+        if !active || remote {
+            continue;
+        }
+        found = true;
+        let locked: bool = session
+            .get_property("LockedHint")
+            .await
+            .map_err(|error| format!("read session LockedHint: {error}"))?;
+        let idle: bool = session
+            .get_property("IdleHint")
+            .await
+            .map_err(|error| format!("read session IdleHint: {error}"))?;
+        if !locked && !idle {
+            return Ok(Some(SessionState::Active));
+        }
+        any_locked |= locked;
+        any_idle |= idle;
+    }
+    Ok(if any_locked {
+        Some(SessionState::Locked)
+    } else if any_idle {
+        Some(SessionState::Idle)
+    } else if found {
+        Some(SessionState::Active)
+    } else {
+        None
+    })
 }
 
 async fn acquire_sleep_inhibitor(proxy: &LogindManagerProxy<'_>) -> Result<OwnedFd, String> {
@@ -256,9 +342,7 @@ pub fn spawn_input_observer(ingress: ObserverIngress) -> Result<Option<InputObse
                             report_input_source_health(&ingress, &source);
                             match outcome {
                                 Ok(Some(event)) => {
-                                    if !ingress
-                                        .send_input_with_backpressure(event, &thread_cancelled)
-                                    {
+                                    if !ingress.send_observed_input(event, &thread_cancelled) {
                                         return;
                                     }
                                 }
@@ -301,13 +385,16 @@ pub fn spawn_input_observer(ingress: ObserverIngress) -> Result<Option<InputObse
 fn report_input_source_health(ingress: &ObserverIngress, source: &EvdevInputSource) {
     if source.device_count() == 0 {
         let detail = source.device_errors().iter().next().map_or_else(
-            || "no supported type-B multitouch device is available".to_owned(),
+            || {
+                "no supported keyboard, relative-pointer, or type-B multitouch device is available"
+                    .to_owned()
+            },
             |(path, error)| format!("cannot use {}: {error}", path.display()),
         );
         ingress.report_input_health(Err(detail));
     } else if let Some((path, error)) = source.device_errors().iter().next() {
         ingress.report_input_health(Err(format!(
-            "touch input is partially degraded; {}: {error}",
+            "input observation is partially degraded; {}: {error}",
             path.display()
         )));
     } else {

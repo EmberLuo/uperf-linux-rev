@@ -22,6 +22,7 @@ function harness(initialPid = null) {
     let watcher = null;
     const sources = new Map();
     const calls = [];
+    const propertyCalls = [];
     const signals = new Map();
 
     class Cancellable {
@@ -37,11 +38,40 @@ function harness(initialPid = null) {
         }
     }
 
-    const connection = {
+    const systemConnection = {
         call_finish(result) {
             if (result.error)
                 throw result.error;
+            return result.reply ?? null;
         },
+    };
+    const sessionConnection = {
+        call_finish(result) {
+            if (result.error)
+                throw result.error;
+            return result.reply ?? null;
+        },
+    };
+    const recordCall = (collection, connection) => (
+        _service,
+        _path,
+        _interface,
+        method,
+        parameters,
+        _replyType,
+        _flags,
+        _timeout,
+        cancellable,
+        callback,
+    ) => {
+        collection.push({
+            method,
+            parameters,
+            cancellable,
+            complete(error = null, reply = null) {
+                callback(connection, {error, reply});
+            },
+        });
     };
     const Gio = {
         BusType: {SYSTEM: 0},
@@ -52,27 +82,10 @@ function harness(initialPid = null) {
         Variant,
         DBus: {
             system: {
-                call(
-                    _service,
-                    _path,
-                    _interface,
-                    method,
-                    parameters,
-                    _replyType,
-                    _flags,
-                    _timeout,
-                    cancellable,
-                    callback,
-                ) {
-                    calls.push({
-                        method,
-                        parameters,
-                        cancellable,
-                        complete(error = null) {
-                            callback(connection, {error});
-                        },
-                    });
-                },
+                call: recordCall(calls, systemConnection),
+            },
+            session: {
+                call: recordCall(propertyCalls, sessionConnection),
             },
         },
         bus_watch_name(_type, _name, _flags, appeared, vanished) {
@@ -103,15 +116,19 @@ function harness(initialPid = null) {
             return addSource('timeout', delay, callback);
         },
     };
-    const display = {
-        connect(_signal, callback) {
+    const signalObject = methods => {
+        const object = {...methods};
+        object.connect = (signal, callback) => {
             const id = nextSignalId++;
-            signals.set(id, callback);
+            signals.set(id, {object, signal, callback});
             return id;
-        },
-        disconnect(id) {
+        };
+        object.disconnect = id => {
             signals.delete(id);
-        },
+        };
+        return object;
+    };
+    const display = signalObject({
         get_focus_window() {
             if (focusedPid === null)
                 return null;
@@ -120,13 +137,26 @@ function harness(initialPid = null) {
                 get_transient_for: () => null,
             };
         },
-    };
+    });
+    const stage = signalObject({});
+    const monitorManager = signalObject({});
+    const sessionMode = signalObject({
+        currentMode: 'user',
+        parentMode: null,
+    });
     const context = vm.createContext({
         console: {warn() {}},
         Gio,
         GLib,
         Extension: class {},
-        global: {display},
+        Main: {sessionMode},
+        global: {
+            display,
+            stage,
+            backend: {
+                get_monitor_manager: () => monitorManager,
+            },
+        },
     });
     vm.runInContext(extensionSource, context, {filename: 'extension.js'});
     const reporter = new context.FocusReporterExtension();
@@ -138,9 +168,16 @@ function harness(initialPid = null) {
         sources.delete(id);
         source.callback();
     };
+    const emit = (object, signal, ...args) => {
+        for (const entry of signals.values()) {
+            if (entry.object === object && entry.signal === signal)
+                entry.callback(object, ...args);
+        }
+    };
     return {
         reporter,
         calls,
+        propertyCalls,
         sources,
         appear() {
             assert.ok(watcher);
@@ -152,6 +189,25 @@ function harness(initialPid = null) {
         },
         setFocusedPid(pid) {
             focusedPid = pid;
+        },
+        emitStage(signal, ...args) {
+            emit(stage, signal, ...args);
+        },
+        setSessionMode(currentMode, parentMode = null) {
+            sessionMode.currentMode = currentMode;
+            sessionMode.parentMode = parentMode;
+            emit(sessionMode, 'updated');
+        },
+        powerSaveChanged() {
+            emit(monitorManager, 'power-save-mode-changed', {});
+        },
+        completePowerSaveMode(mode) {
+            const query = [...propertyCalls]
+                .reverse()
+                .find(call => call.method === 'Get' && !call.completed);
+            assert.ok(query, 'expected a DisplayConfig PowerSaveMode query');
+            query.completed = true;
+            query.complete(null, {deep_unpack: () => [mode]});
         },
         runIdle() {
             runSource(source => source.kind === 'idle');
@@ -292,4 +348,92 @@ function startInitialSet(test, pid) {
     test.reporter.disable();
 }
 
-console.log('focus reporter state tests passed');
+{
+    const test = harness(41);
+    const first = startInitialSet(test, 41);
+    first.complete();
+    test.emitStage('before-paint', {});
+    const started = test.callsNamed('ReportFrameHint');
+    assert.equal(started.length, 1);
+    assert.deepEqual(Array.from(started[0].parameters.value), ['render-started']);
+    started[0].complete();
+    test.emitStage('after-paint', {});
+    test.runAfter(50);
+    const hints = test.callsNamed('ReportFrameHint');
+    assert.equal(hints.length, 2);
+    assert.deepEqual(Array.from(hints[1].parameters.value), ['render-idle']);
+    hints[1].complete();
+    test.reporter.disable();
+}
+
+{
+    const test = harness(41);
+    const first = startInitialSet(test, 41);
+    first.complete();
+    test.emitStage('before-paint', {});
+    const view = {};
+    const frame = (presentationUs, refreshRate = 60) => ({
+        presentation_time: presentationUs,
+        refresh_rate: refreshRate,
+    });
+    test.emitStage('presented', view, frame(1_000_000));
+    test.emitStage('presented', view, frame(1_040_000));
+    const hints = test.callsNamed('ReportFrameHint');
+    assert.equal(
+        hints.filter(call => call.parameters.value[0] === 'deadline-missed').length,
+        1,
+        'a 40 ms interval at 60 Hz must report one missed deadline',
+    );
+    test.reporter.disable();
+}
+
+{
+    const test = harness(41);
+    const first = startInitialSet(test, 41);
+    first.complete();
+    test.completePowerSaveMode(3);
+    const blanked = test.callsNamed('ReportFrameHint').at(-1);
+    assert.deepEqual(Array.from(blanked.parameters.value), ['display-blanked']);
+    blanked.complete();
+    assert.ok(
+        [...test.sources.values()].some(source => source.delay === 5000),
+        'a blank display must schedule an authenticated keepalive',
+    );
+
+    test.powerSaveChanged();
+    test.completePowerSaveMode(0);
+    const unblanked = test.callsNamed('ReportFrameHint').at(-1);
+    assert.deepEqual(Array.from(unblanked.parameters.value), ['display-unblanked']);
+    unblanked.complete();
+    test.reporter.disable();
+}
+
+{
+    const test = harness(41);
+    const first = startInitialSet(test, 41);
+    first.complete();
+    test.setSessionMode('unlock-dialog');
+    const clears = test.callsNamed('ClearForegroundProcess');
+    assert.equal(clears.length, 1, 'locking must immediately clear focused workload');
+    clears[0].complete();
+
+    const before = test.callsNamed('ReportFrameHint').length;
+    test.emitStage('before-paint', {});
+    assert.equal(
+        test.callsNamed('ReportFrameHint').length,
+        before,
+        'lock-screen paints must not produce application frame hints',
+    );
+
+    test.setSessionMode('user');
+    test.runIdle();
+    test.runAfter(120);
+    assert.equal(
+        test.callsNamed('SetForegroundProcess').length,
+        2,
+        'unlocking must re-establish the focused workload lease',
+    );
+    test.reporter.disable();
+}
+
+console.log('compositor reporter state tests passed');

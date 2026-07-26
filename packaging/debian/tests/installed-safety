@@ -13,6 +13,22 @@ if systemctl is-active --quiet uperf-linux.service; then
     exit 1
 fi
 
+unit=/usr/lib/systemd/system/uperf-linux.service
+realtime_example=/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf
+if ! grep -qx 'RestrictRealtime=yes' "$unit"; then
+    echo "default service no longer blocks real-time scheduling" >&2
+    exit 1
+fi
+if ! grep -qx 'RestrictRealtime=no' "$realtime_example" ||
+   ! grep -qx 'LimitRTPRIO=50' "$realtime_example"; then
+    echo "packaged real-time opt-in example is incomplete" >&2
+    exit 1
+fi
+if [ -e /usr/lib/systemd/system/uperf-linux.service.d/50-realtime-opt-in.conf ]; then
+    echo "experimental real-time drop-in was activated by package installation" >&2
+    exit 1
+fi
+
 workdir="$(mktemp -d)"
 journal=/run/uperf-linux/recovery.json
 created_journal=no

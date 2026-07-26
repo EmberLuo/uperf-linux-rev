@@ -12,13 +12,16 @@ use tokio::{
 };
 use uperf_actuator::{
     FileStateStore, FrequencyActuator, FrequencyTarget, RecoveryFrequencyTarget,
-    RecoveryFrequencyTargetManifest, RecoveryManifest, TargetRegistry, inspect_recovery_journal,
+    RecoveryFrequencyTargetManifest, RecoveryManifest, RecoveryResourceTarget, TargetRegistry,
+    inspect_recovery_journal,
 };
 use uperf_api::{OBJECT_PATH, SERVICE_NAME};
 use uperf_core::{FrequencyLimits, Hertz};
 use uperf_daemon::{
     auth::{AuthorizationMode, Authorizer},
     config::{ConfigurationPaths, ResolvedConfiguration},
+    config_watch::{ConfigWatcher, join_config_watcher, spawn_config_watcher},
+    conflicts::competing_controller_warnings,
     observers::{spawn_focus_peer_watcher, spawn_input_observer, spawn_logind_observer},
     runtime::{RuntimeParts, spawn_linux_observers, spawn_runtime},
     service::{DaemonService, RunningWorkloadScanner, run_signal_pump},
@@ -72,8 +75,13 @@ impl Default for Options {
 // actuator operations run on their dedicated or blocking workers.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    uperf_daemon::logging::init();
     if let Err(error) = run(parse_options(env::args().skip(1))).await {
-        eprintln!("uperf-linux: {error:#}");
+        tracing::error!(
+            event = "daemon-exit",
+            error = %format!("{error:#}"),
+            "uperf-linux stopped with an error"
+        );
         std::process::exit(1);
     }
 }
@@ -89,8 +97,37 @@ async fn run(options: Result<Options>) -> Result<()> {
             .with_context(|| format!("open fixture environment {}", root.display()))?,
         None => LinuxEnvironment::host().context("open Linux environment")?,
     });
-    let paths = ConfigurationPaths::below(&options.config_dir, &options.state_dir)
+    let base_paths = ConfigurationPaths::below(&options.config_dir, &options.state_dir)
         .with_device_profiles(&options.device_profile_dir);
+    let mut startup_warnings = match competing_controller_warnings(environment.roots()) {
+        Ok(warnings) => warnings,
+        Err(error) => vec![format!(
+            "competing power controller detection unavailable: {error:#}"
+        )],
+    };
+    for warning in &startup_warnings {
+        tracing::warn!(
+            source = "controller-detection",
+            event = "competing-controller",
+            detail = %warning,
+            "competing power controller detected"
+        );
+    }
+    let config_watcher = match ConfigWatcher::new(&base_paths) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            let warning = format!("automatic configuration reload unavailable: {error:#}");
+            tracing::warn!(
+                source = "config-watch",
+                event = "setup-failed",
+                detail = %warning,
+                "automatic configuration reload is unavailable"
+            );
+            startup_warnings.push(warning);
+            None
+        }
+    };
+    let paths = base_paths.with_startup_warnings(startup_warnings);
     let mutation_setup = if options.read_only {
         None
     } else {
@@ -102,7 +139,12 @@ async fn run(options: Result<Options>) -> Result<()> {
         let process = match LinuxProcessController::host() {
             Ok(controller) => Some(Arc::new(controller) as Arc<dyn ProcessController>),
             Err(error) => {
-                eprintln!("uperf-linux: process scheduling backend unavailable: {error}");
+                tracing::warn!(
+                    source = "scheduler",
+                    event = "backend-unavailable",
+                    error = %error,
+                    "process scheduling backend is unavailable"
+                );
                 None
             }
         };
@@ -112,7 +154,12 @@ async fn run(options: Result<Options>) -> Result<()> {
         {
             Ok(systemd) => Some(Arc::new(systemd) as Arc<dyn SystemdClient>),
             Err(error) => {
-                eprintln!("uperf-linux: systemd cgroup backend unavailable: {error}");
+                tracing::warn!(
+                    source = "systemd",
+                    event = "backend-unavailable",
+                    error = %error,
+                    "systemd cgroup backend is unavailable"
+                );
                 None
             }
         };
@@ -126,8 +173,11 @@ async fn run(options: Result<Options>) -> Result<()> {
             &backends,
         );
         if let Some(reason) = &recovery_failure {
-            eprintln!(
-                "uperf-linux: pre-configuration recovery failed; mutations remain disabled: {reason}"
+            tracing::error!(
+                source = "recovery",
+                event = "pre-configuration-failed",
+                reason = %reason,
+                "pre-configuration recovery failed; mutations remain disabled"
             );
         }
         Some(MutationSetup {
@@ -148,20 +198,24 @@ async fn run(options: Result<Options>) -> Result<()> {
     // daemon from this boot.
     let configuration =
         ResolvedConfiguration::load(&paths, &discovery).context("load configuration generation")?;
-    eprintln!(
-        "uperf-linux: selected device profile {}",
-        configuration.device.device_id
+    tracing::info!(
+        source = "configuration",
+        event = "device-profile-selected",
+        device_id = %configuration.device.device_id,
+        "selected device profile"
     );
     let actuator = if let Some(setup) = mutation_setup {
+        let registry = configuration.actuator_registry()?;
+        let write_paths = configuration.actuator_write_paths()?;
         let sysfs = Arc::new(
             environment
-                .open_actuator_sysfs(configuration.targets.values().map(|target| &target.paths))
+                .open_recovery_sysfs(&write_paths)
                 .context("construct sysfs mutation allowlist")?,
         );
         let actuator = FrequencyActuator::new(
             sysfs,
             setup.store,
-            configuration.actuator_registry()?,
+            registry,
             setup.boot_id,
             setup.fingerprint,
         );
@@ -224,6 +278,8 @@ async fn run(options: Result<Options>) -> Result<()> {
         .context("acquire D-Bus service name")?;
 
     let (service_shutdown, service_shutdown_rx) = watch::channel(false);
+    let config_watch_task = config_watcher
+        .map(|watcher| spawn_config_watcher(watcher, runtime.clone(), service_shutdown_rx.clone()));
     let signal_task = tokio::spawn(run_signal_pump(
         connection.clone(),
         runtime.clone(),
@@ -271,6 +327,11 @@ async fn run(options: Result<Options>) -> Result<()> {
         input_observer.stop().await;
     }
     service_shutdown.send_replace(true);
+    if let Some(task) = config_watch_task
+        && let Err(error) = join_config_watcher(task).await
+    {
+        record_shutdown_error(&mut shutdown_error, error);
+    }
     match focus_peer_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => record_shutdown_error(
@@ -355,9 +416,11 @@ fn recover_before_configuration(
         let discovery = if let Some(discovery) = supplied_discovery {
             discovery
         } else {
-            discovered = if manifest.frequency_targets.is_empty() {
-                environment.discover_device_identity()
-            } else {
+            let has_frequency_resources = manifest
+                .resource_targets
+                .iter()
+                .any(|target| matches!(target, RecoveryResourceTarget::FrequencyPair(_)));
+            discovered = if has_frequency_resources {
                 match environment.discover_recovery_targets() {
                     Ok(discovery) => discovery,
                     Err(error) => {
@@ -366,6 +429,8 @@ fn recover_before_configuration(
                         ));
                     }
                 }
+            } else {
+                environment.discover_device_identity()
             };
             &discovered
         };
@@ -373,7 +438,7 @@ fn recover_before_configuration(
             Ok(registry) => registry,
             Err(error) => return Some(format!("cannot resolve recovery manifest: {error:#}")),
         };
-        (registry, manifest.frequency_write_paths())
+        (registry, manifest.resource_write_paths())
     } else {
         (TargetRegistry::default(), Vec::new())
     };
@@ -417,30 +482,41 @@ fn recovery_registry(
     manifest: &RecoveryManifest,
     discovery: &LinuxDiscovery,
 ) -> Result<TargetRegistry> {
-    let targets = manifest
-        .frequency_targets
-        .iter()
-        .map(|target| match target {
-            RecoveryFrequencyTarget::SelfDescribing(target) => {
-                validate_self_describing_target(target, discovery)?;
-                target.to_frequency_target().map_err(anyhow::Error::from)
+    let mut frequencies = Vec::new();
+    let mut scalars = Vec::new();
+    for resource in &manifest.resource_targets {
+        match resource {
+            RecoveryResourceTarget::FrequencyPair(target) => {
+                let target = match target {
+                    RecoveryFrequencyTarget::SelfDescribing(target) => {
+                        validate_self_describing_target(target, discovery)?;
+                        target.to_frequency_target().map_err(anyhow::Error::from)?
+                    }
+                    RecoveryFrequencyTarget::Legacy(target) => {
+                        let live =
+                            live_target_for_paths(discovery, &target.min_path, &target.max_path)?;
+                        FrequencyTarget::new(
+                            target.id.clone(),
+                            target.min_path.clone(),
+                            target.max_path.clone(),
+                            live.limits.min,
+                            live.limits.max,
+                            live.opps,
+                        )
+                        .and_then(|target| target.with_hertz_per_unit(live.hertz_per_unit))
+                        .map_err(anyhow::Error::from)?
+                    }
+                };
+                frequencies.push(target);
             }
-            RecoveryFrequencyTarget::Legacy(target) => {
-                let live = live_target_for_paths(discovery, &target.min_path, &target.max_path)?;
-                FrequencyTarget::new(
-                    target.id.clone(),
-                    target.min_path.clone(),
-                    target.max_path.clone(),
-                    live.limits.min,
-                    live.limits.max,
-                    live.opps,
-                )
-                .and_then(|target| target.with_hertz_per_unit(live.hertz_per_unit))
-                .map_err(anyhow::Error::from)
+            RecoveryResourceTarget::Scalar(target) => {
+                scalars.push(target.to_scalar_target()?);
             }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    TargetRegistry::new(targets).map_err(anyhow::Error::from)
+        }
+    }
+    TargetRegistry::new(frequencies)?
+        .with_scalar_targets(scalars)
+        .map_err(anyhow::Error::from)
 }
 
 fn validate_self_describing_target(
@@ -528,13 +604,21 @@ async fn wait_for_shutdown_or_reload(
             _ = hangup.recv() => {
                 match runtime.reload().await {
                     Ok(report) => {
-                        eprintln!(
-                            "uperf-linux: reloaded configuration generation {}",
-                            report.config_generation
+                        tracing::info!(
+                            source = "signal",
+                            event = "reload-accepted",
+                            generation = report.config_generation,
+                            "reloaded configuration"
                         );
                     }
                     Err(error) => {
-                        eprintln!("uperf-linux: reload rejected; old generation retained: {error}");
+                        tracing::warn!(
+                            source = "signal",
+                            event = "reload-rejected",
+                            old_generation_retained = true,
+                            error = %error,
+                            "configuration reload was rejected"
+                        );
                     }
                 }
             }
@@ -554,7 +638,12 @@ fn record_shutdown_error(first: &mut Option<anyhow::Error>, error: anyhow::Error
     if first.is_none() {
         *first = Some(error);
     } else {
-        eprintln!("uperf-linux: additional shutdown error: {error:#}");
+        tracing::error!(
+            source = "shutdown",
+            event = "additional-error",
+            error = %format!("{error:#}"),
+            "additional shutdown error"
+        );
     }
 }
 
@@ -641,7 +730,9 @@ mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc};
 
     use tempfile::TempDir;
-    use uperf_actuator::{ActuatorMode, FrequencyRequest};
+    use uperf_actuator::{
+        ActuatorMode, FrequencyRequest, ScalarDomain, ScalarRequest, ScalarTarget, ScalarValue,
+    };
     use uperf_core::{
         CpuId, CpuPolicyCapability, CpuSet, DeviceCapabilities, InputDeviceCapability,
         MilliCelsius, MonotonicMillis, SensorHealth, TargetId, ThermalReading,
@@ -837,6 +928,33 @@ mod tests {
     }
 
     #[test]
+    fn recovery_registry_keeps_legacy_frequency_path_resolution() {
+        let fixture = recovery_fixture();
+        let legacy = uperf_actuator::LegacyRecoveryFrequencyTarget {
+            id: fixture.target.id.clone(),
+            min_path: fixture.target.min_path.clone(),
+            max_path: fixture.target.max_path.clone(),
+        };
+        let frequency = RecoveryFrequencyTarget::Legacy(legacy);
+        let manifest = RecoveryManifest {
+            schema_version: 1,
+            boot_id: "boot-a".to_owned(),
+            device_fingerprint: device_fingerprint(&fixture.discovery),
+            resource_targets: vec![RecoveryResourceTarget::FrequencyPair(frequency.clone())],
+            frequency_targets: vec![frequency],
+            has_tasks: false,
+            has_systemd_units: false,
+        };
+
+        let registry =
+            recovery_registry(&manifest, &fixture.discovery).expect("legacy recovery registry");
+        assert!(
+            registry.get(&fixture.target.id).is_some(),
+            "schema-v1 frequency resources must still resolve through live discovery"
+        );
+    }
+
+    #[test]
     fn recovery_finishes_before_missing_configuration_is_loaded() {
         let fixture = recovery_fixture();
         let writer = Arc::new(
@@ -887,6 +1005,65 @@ mod tests {
             fixture.temporary.path().join("missing-state"),
         );
         assert!(ResolvedConfiguration::load(&missing_paths, &fixture.discovery).is_err());
+    }
+
+    #[test]
+    fn startup_recovery_restores_a_scalar_without_device_configuration() {
+        let fixture = recovery_fixture();
+        let scalar_directory = fixture.temporary.path().join("sys/class/test-bus");
+        fs::create_dir_all(&scalar_directory).expect("scalar directory");
+        let physical_scalar = scalar_directory.join("mode");
+        fs::write(&physical_scalar, "powersave\n").expect("original scalar");
+        let logical_scalar = PathBuf::from("/sys/class/test-bus/mode");
+        let scalar_id = TargetId::new("scalar.bus-mode").expect("scalar ID");
+        let scalar_target = ScalarTarget::new(
+            scalar_id.clone(),
+            logical_scalar.clone(),
+            ScalarDomain::StringEnum {
+                values: vec!["performance".to_owned(), "powersave".to_owned()],
+            },
+        )
+        .expect("scalar target");
+        let writer = Arc::new(
+            fixture
+                .environment
+                .open_recovery_sysfs(std::slice::from_ref(&logical_scalar))
+                .expect("scalar writer"),
+        );
+        let registry = TargetRegistry::default()
+            .with_scalar_targets([scalar_target])
+            .expect("scalar registry");
+        FrequencyActuator::new(
+            writer,
+            fixture.store.clone(),
+            registry,
+            "boot-a",
+            device_fingerprint(&fixture.discovery),
+        )
+        .apply_scalars(&[ScalarRequest {
+            target: scalar_id,
+            value: ScalarValue::String("performance".to_owned()),
+        }])
+        .expect("apply scalar before simulated crash");
+        assert_eq!(
+            fs::read_to_string(&physical_scalar).expect("applied scalar"),
+            "performance"
+        );
+
+        let recovery_failure = recover_before_configuration(
+            &fixture.environment,
+            None,
+            fixture.store.clone(),
+            "boot-a",
+            &device_fingerprint(&fixture.discovery),
+            &MutationBackends::default(),
+        );
+        assert_eq!(recovery_failure, None);
+        assert_eq!(
+            fs::read_to_string(&physical_scalar).expect("restored scalar"),
+            "powersave"
+        );
+        assert!(fixture.store.load().expect("journal state").is_none());
     }
 
     #[test]

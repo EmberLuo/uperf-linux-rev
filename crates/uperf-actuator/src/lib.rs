@@ -1,8 +1,8 @@
 //! Transactional mutations, durable journaling and crash recovery.
 //!
-//! This crate is the only layer allowed to turn a desired frequency range into
-//! machine mutations.  It deliberately accepts discovered logical targets
-//! instead of arbitrary paths from API clients.
+//! This crate is the only layer allowed to turn desired frequency ranges and
+//! typed scalar values into machine mutations. It deliberately accepts
+//! discovered logical targets instead of arbitrary paths from API clients.
 //! While a frequency target is journaled, its user-facing min/max request
 //! nodes are exclusively owned by this actuator; effective sysfs values cannot
 //! distinguish direct writes from constraints owned by other kernel clients.
@@ -20,7 +20,9 @@ use std::{
 use crc32fast::hash as crc32;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uperf_core::{FrequencyLimits, Hertz, ProcessId, ProcessIdentity, TargetId};
+use uperf_core::{
+    CpuId, CpuSet, FrequencyLimits, Hertz, ProcessId, ProcessIdentity, SchedulingClass, TargetId,
+};
 use uperf_platform::{
     PlatformError, ProcReader, ProcessController, ProcessSchedulingState, StateStore, SysfsIo,
     SystemdClient, SystemdUnitInstanceIdentity, SystemdUnitInstanceKey, SystemdUnitProperties,
@@ -38,9 +40,17 @@ const MANIFEST_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const OWNERSHIP_JOURNAL_SCHEMA_VERSION: u32 = 3;
 // v4 defines a frequency entry's original request as the full hardware range,
 // so restoring it releases the actuator's userspace QoS request.
-const JOURNAL_SCHEMA_VERSION: u32 = 4;
+const RELEASE_JOURNAL_SCHEMA_VERSION: u32 = 4;
+// v5 adds typed scalar sysfs resources and a tagged recovery-resource
+// manifest while retaining lossless decoding of v1-v4 frequency journals.
+const SCALAR_JOURNAL_SCHEMA_VERSION: u32 = 5;
+// v6 records the exact SCHED_FIFO priority in task state. The field has a
+// serde default so v1-v5 non-real-time task entries remain losslessly decodable.
+const JOURNAL_SCHEMA_VERSION: u32 = 6;
 const MAX_JOURNAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_ENVELOPE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SCALAR_STRING_BYTES: usize = 256;
+const MAX_SCALAR_CPU_ID: u32 = 4095;
 const FREQUENCY_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
 const FREQUENCY_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -297,10 +307,157 @@ impl FrequencyTarget {
     }
 }
 
+/// A closed, typed value domain for one scalar sysfs attribute.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ScalarDomain {
+    IntegerRange {
+        minimum: i64,
+        maximum: i64,
+    },
+    IntegerEnum {
+        values: Vec<i64>,
+    },
+    StringEnum {
+        values: Vec<String>,
+    },
+    CpuList {
+        allowed_cpus: CpuSet,
+        #[serde(default)]
+        allow_empty: bool,
+    },
+}
+
+impl ScalarDomain {
+    fn canonicalize(mut self, id: &TargetId) -> Result<Self, ActuatorError> {
+        match &mut self {
+            Self::IntegerRange { minimum, maximum } => {
+                if *minimum > *maximum {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{id}: scalar integer range is reversed"
+                    )));
+                }
+            }
+            Self::IntegerEnum { values } => {
+                values.sort_unstable();
+                values.dedup();
+                if values.is_empty() {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{id}: scalar integer enum is empty"
+                    )));
+                }
+            }
+            Self::StringEnum { values } => {
+                values.sort();
+                values.dedup();
+                if values.is_empty() {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{id}: scalar string enum is empty"
+                    )));
+                }
+                for value in values.iter() {
+                    validate_scalar_string(id, value)?;
+                }
+            }
+            Self::CpuList { allowed_cpus, .. } => {
+                if allowed_cpus.is_empty() {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{id}: scalar CPU-list domain has no allowed CPUs"
+                    )));
+                }
+                if allowed_cpus.iter().any(|cpu| cpu.get() > MAX_SCALAR_CPU_ID) {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{id}: scalar CPU-list domain exceeds CPU {MAX_SCALAR_CPU_ID}"
+                    )));
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    fn validate_value(&self, id: &TargetId, value: &ScalarValue) -> Result<(), ActuatorError> {
+        let valid = match (self, value) {
+            (Self::IntegerRange { minimum, maximum }, ScalarValue::Integer(candidate)) => {
+                candidate >= minimum && candidate <= maximum
+            }
+            (Self::IntegerEnum { values }, ScalarValue::Integer(candidate)) => {
+                values.binary_search(candidate).is_ok()
+            }
+            (Self::StringEnum { values }, ScalarValue::String(candidate)) => {
+                values.binary_search(candidate).is_ok()
+            }
+            (
+                Self::CpuList {
+                    allowed_cpus,
+                    allow_empty,
+                },
+                ScalarValue::CpuList(candidate),
+            ) => (*allow_empty || !candidate.is_empty()) && candidate.is_subset(allowed_cpus),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ActuatorError::InvalidScalarValue {
+                target: id.to_string(),
+                value: format!("{value:?}"),
+            })
+        }
+    }
+}
+
+/// One typed value accepted by a [`ScalarTarget`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum ScalarValue {
+    Integer(i64),
+    String(String),
+    CpuList(CpuSet),
+}
+
+/// A single sysfs attribute resolved from root-owned device configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarTarget {
+    pub id: TargetId,
+    pub path: PathBuf,
+    pub domain: ScalarDomain,
+}
+
+impl ScalarTarget {
+    /// Construct and validate a typed scalar target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths or an empty/invalid value domain.
+    pub fn new(
+        id: TargetId,
+        path: impl Into<PathBuf>,
+        domain: ScalarDomain,
+    ) -> Result<Self, ActuatorError> {
+        let path = path.into();
+        validate_sysfs_path(&path)?;
+        let domain = domain.canonicalize(&id)?;
+        Ok(Self { id, path, domain })
+    }
+
+    fn validate_value(&self, value: &ScalarValue) -> Result<(), ActuatorError> {
+        self.domain.validate_value(&self.id, value)
+    }
+
+    fn recovery_manifest(&self) -> RecoveryScalarTargetManifest {
+        RecoveryScalarTargetManifest {
+            id: self.id.clone(),
+            path: self.path.clone(),
+            domain: self.domain.clone(),
+        }
+    }
+}
+
 /// Immutable allowlist of discovered mutation targets.
 #[derive(Clone, Debug, Default)]
 pub struct TargetRegistry {
     targets: BTreeMap<TargetId, FrequencyTarget>,
+    scalar_targets: BTreeMap<TargetId, ScalarTarget>,
 }
 
 impl TargetRegistry {
@@ -336,6 +493,53 @@ impl TargetRegistry {
     pub fn get(&self, id: &TargetId) -> Option<&FrequencyTarget> {
         self.targets.get(id)
     }
+
+    /// Add typed scalar targets to an existing frequency registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a logical ID or sysfs path is already claimed.
+    pub fn with_scalar_targets(
+        mut self,
+        targets: impl IntoIterator<Item = ScalarTarget>,
+    ) -> Result<Self, ActuatorError> {
+        let mut claimed_paths = BTreeMap::<PathBuf, TargetId>::new();
+        for target in self.targets.values() {
+            claimed_paths.insert(target.min_path.clone(), target.id.clone());
+            claimed_paths.insert(target.max_path.clone(), target.id.clone());
+        }
+        for target in targets {
+            let canonical = ScalarTarget::new(
+                target.id.clone(),
+                target.path.clone(),
+                target.domain.clone(),
+            )?;
+            if canonical != target {
+                return Err(ActuatorError::InvalidTarget(format!(
+                    "{}: scalar target is not canonical",
+                    target.id
+                )));
+            }
+            let id = target.id.clone();
+            if self.targets.contains_key(&id) || self.scalar_targets.contains_key(&id) {
+                return Err(ActuatorError::DuplicateTarget(id.to_string()));
+            }
+            if let Some(owner) = claimed_paths.insert(target.path.clone(), id.clone()) {
+                return Err(ActuatorError::InvalidTarget(format!(
+                    "{id} and {owner} both claim {}",
+                    target.path.display()
+                )));
+            }
+            self.scalar_targets.insert(id, target);
+        }
+        Ok(self)
+    }
+
+    /// Resolve a logical scalar target.
+    #[must_use]
+    pub fn get_scalar(&self, id: &TargetId) -> Option<&ScalarTarget> {
+        self.scalar_targets.get(id)
+    }
 }
 
 /// One desired range in an atomic batch.
@@ -343,6 +547,13 @@ impl TargetRegistry {
 pub struct FrequencyRequest {
     pub target: TargetId,
     pub limits: FrequencyLimits,
+}
+
+/// One desired typed scalar value in an atomic batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarRequest {
+    pub target: TargetId,
+    pub value: ScalarValue,
 }
 
 /// One stable process scheduling mutation in a batch.
@@ -400,6 +611,43 @@ impl RecoveryFrequencyTargetManifest {
     }
 }
 
+/// Complete scalar-target identity persisted for configuration-independent
+/// crash recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryScalarTargetManifest {
+    pub id: TargetId,
+    pub path: PathBuf,
+    pub domain: ScalarDomain,
+}
+
+impl RecoveryScalarTargetManifest {
+    /// Rebuild the exact scalar target used when the journal was created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path or typed value domain is invalid or
+    /// non-canonical.
+    pub fn to_scalar_target(&self) -> Result<ScalarTarget, ActuatorError> {
+        let target = ScalarTarget::new(self.id.clone(), self.path.clone(), self.domain.clone())?;
+        if target.recovery_manifest() != *self {
+            return Err(ActuatorError::InvalidTarget(format!(
+                "{}: scalar recovery manifest is not canonical",
+                self.id
+            )));
+        }
+        Ok(target)
+    }
+}
+
+/// Tagged schema-v5 identity for every journal-owned sysfs resource.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "target", rename_all = "kebab-case")]
+pub enum RecoveryResourceManifest {
+    FrequencyPair(RecoveryFrequencyTargetManifest),
+    Scalar(RecoveryScalarTargetManifest),
+}
+
 /// Minimal identity retained by schema-v1 journals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacyRecoveryFrequencyTarget {
@@ -413,6 +661,13 @@ pub struct LegacyRecoveryFrequencyTarget {
 pub enum RecoveryFrequencyTarget {
     SelfDescribing(RecoveryFrequencyTargetManifest),
     Legacy(LegacyRecoveryFrequencyTarget),
+}
+
+/// One resource discovered while inspecting a durable journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryResourceTarget {
+    FrequencyPair(RecoveryFrequencyTarget),
+    Scalar(RecoveryScalarTargetManifest),
 }
 
 impl RecoveryFrequencyTarget {
@@ -447,6 +702,7 @@ pub struct RecoveryManifest {
     pub schema_version: u32,
     pub boot_id: String,
     pub device_fingerprint: String,
+    pub resource_targets: Vec<RecoveryResourceTarget>,
     pub frequency_targets: Vec<RecoveryFrequencyTarget>,
     pub has_tasks: bool,
     pub has_systemd_units: bool,
@@ -462,16 +718,22 @@ impl RecoveryManifest {
     ///
     /// Returns an error for a legacy resource or an invalid/duplicate target.
     pub fn self_describing_registry(&self) -> Result<TargetRegistry, ActuatorError> {
-        self.frequency_targets
-            .iter()
-            .map(|target| match target {
-                RecoveryFrequencyTarget::SelfDescribing(target) => target.to_frequency_target(),
-                RecoveryFrequencyTarget::Legacy(target) => {
-                    Err(ActuatorError::LegacyRecoveryTarget(target.id.to_string()))
+        let mut frequencies = Vec::new();
+        let mut scalars = Vec::new();
+        for target in &self.resource_targets {
+            match target {
+                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::SelfDescribing(
+                    target,
+                )) => frequencies.push(target.to_frequency_target()?),
+                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::Legacy(target)) => {
+                    return Err(ActuatorError::LegacyRecoveryTarget(target.id.to_string()));
                 }
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(TargetRegistry::new)
+                RecoveryResourceTarget::Scalar(target) => {
+                    scalars.push(target.to_scalar_target()?);
+                }
+            }
+        }
+        TargetRegistry::new(frequencies)?.with_scalar_targets(scalars)
     }
 
     /// Exact logical sysfs paths that recovery may need to mutate.
@@ -486,6 +748,26 @@ impl RecoveryManifest {
                 ]
             })
             .collect()
+    }
+
+    /// Exact scalar sysfs paths that recovery may need to mutate.
+    #[must_use]
+    pub fn scalar_write_paths(&self) -> Vec<PathBuf> {
+        self.resource_targets
+            .iter()
+            .filter_map(|target| match target {
+                RecoveryResourceTarget::Scalar(target) => Some(target.path.clone()),
+                RecoveryResourceTarget::FrequencyPair(_) => None,
+            })
+            .collect()
+    }
+
+    /// Exact sysfs paths required for complete frequency and scalar recovery.
+    #[must_use]
+    pub fn resource_write_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.frequency_write_paths();
+        paths.extend(self.scalar_write_paths());
+        paths
     }
 }
 
@@ -509,7 +791,7 @@ pub fn inspect_recovery_journal(
     let frequency_targets = journal
         .entries
         .values()
-        .map(|entry| match &entry.manifest {
+        .map(|entry| match entry.recovery_frequency_manifest() {
             Some(manifest) => RecoveryFrequencyTarget::SelfDescribing(manifest.clone()),
             None => RecoveryFrequencyTarget::Legacy(LegacyRecoveryFrequencyTarget {
                 id: entry.target.clone(),
@@ -517,11 +799,23 @@ pub fn inspect_recovery_journal(
                 max_path: entry.max_path.clone(),
             }),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut resource_targets = frequency_targets
+        .iter()
+        .cloned()
+        .map(RecoveryResourceTarget::FrequencyPair)
+        .collect::<Vec<_>>();
+    resource_targets.extend(
+        journal
+            .scalars
+            .values()
+            .map(|entry| RecoveryResourceTarget::Scalar(entry.recovery_scalar_manifest().clone())),
+    );
     Ok(Some(RecoveryManifest {
         schema_version: journal.schema_version,
         boot_id: journal.boot_id,
         device_fingerprint: journal.device_fingerprint,
+        resource_targets,
         frequency_targets,
         has_tasks: !journal.tasks.is_empty(),
         has_systemd_units: !journal.units.is_empty(),
@@ -539,6 +833,12 @@ pub enum ActuatorMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchOutcome {
     pub applied: BTreeMap<TargetId, FrequencyLimits>,
+}
+
+/// Outcome of applying a complete typed scalar batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarBatchOutcome {
+    pub applied: BTreeMap<TargetId, ScalarValue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -560,6 +860,8 @@ pub enum ActuatorError {
     DuplicateTarget(String),
     #[error("unknown target ID: {0}")]
     UnknownTarget(String),
+    #[error("frequency target is not durably owned: {0}")]
+    OwnershipRequired(String),
     #[error("duplicate request for target ID: {0}")]
     DuplicateRequest(String),
     #[error("invalid frequency range for {target}: {minimum}..{maximum} Hz")]
@@ -568,8 +870,12 @@ pub enum ActuatorError {
         minimum: u64,
         maximum: u64,
     },
-    #[error("invalid numeric value read from {path}: {value:?}")]
+    #[error("invalid scalar value for {target}: {value}")]
+    InvalidScalarValue { target: String, value: String },
+    #[error("invalid value read from {path}: {value:?}")]
     InvalidReadback { path: PathBuf, value: String },
+    #[error("scalar ownership was changed externally: {0}")]
+    ScalarOwnershipLost(String),
     #[error("platform operation failed: {0}")]
     Platform(#[from] PlatformError),
     #[error("journal is invalid: {0}")]
@@ -602,13 +908,49 @@ struct JournalEntry {
     target: TargetId,
     min_path: PathBuf,
     max_path: PathBuf,
+    /// Bare frequency manifest used by schema v2-v4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manifest: Option<RecoveryFrequencyTargetManifest>,
+    /// Tagged frequency/scalar manifest introduced by schema v5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_manifest: Option<RecoveryResourceManifest>,
     original: FrequencyLimits,
     desired: FrequencyLimits,
     applied: FrequencyLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legal_pairs: Option<Vec<FrequencyLimits>>,
+}
+
+impl JournalEntry {
+    fn recovery_frequency_manifest(&self) -> Option<&RecoveryFrequencyTargetManifest> {
+        match self.resource_manifest.as_ref() {
+            Some(RecoveryResourceManifest::FrequencyPair(manifest)) => Some(manifest),
+            Some(RecoveryResourceManifest::Scalar(_)) => None,
+            None => self.manifest.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScalarJournalEntry {
+    target: TargetId,
+    path: PathBuf,
+    manifest: RecoveryResourceManifest,
+    original: ScalarValue,
+    desired: ScalarValue,
+    applied: ScalarValue,
+}
+
+impl ScalarJournalEntry {
+    fn recovery_scalar_manifest(&self) -> &RecoveryScalarTargetManifest {
+        match &self.manifest {
+            RecoveryResourceManifest::Scalar(manifest) => manifest,
+            RecoveryResourceManifest::FrequencyPair(_) => {
+                unreachable!("validated scalar journal manifest")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -630,7 +972,10 @@ impl TaskFieldMask {
         Self {
             affinity: before.affinity != after.affinity,
             nice: before.nice != after.nice,
-            policy: before.policy != after.policy,
+            // Linux changes scheduler class and fixed real-time priority in
+            // one sched_setscheduler operation. Journal ownership therefore
+            // treats them as one indivisible tuple.
+            policy: before.policy != after.policy || before.rt_priority != after.rt_priority,
             uclamp_min: before.uclamp_min != after.uclamp_min,
             uclamp_max: before.uclamp_max != after.uclamp_max,
         }
@@ -679,7 +1024,7 @@ impl TaskFieldMask {
                 && (current.affinity == first.affinity || current.affinity == second.affinity),
             nice: self.nice && (current.nice == first.nice || current.nice == second.nice),
             policy: self.policy
-                && (current.policy == first.policy || current.policy == second.policy),
+                && (same_policy_priority(current, first) || same_policy_priority(current, second)),
             uclamp_min: self.uclamp_min
                 && (current.uclamp_min == first.uclamp_min
                     || current.uclamp_min == second.uclamp_min),
@@ -698,6 +1043,7 @@ impl TaskFieldMask {
         }
         if self.policy {
             destination.policy = source.policy;
+            destination.rt_priority = source.rt_priority;
         }
         if self.uclamp_min {
             destination.uclamp_min = source.uclamp_min;
@@ -710,9 +1056,32 @@ impl TaskFieldMask {
     fn values_equal(self, left: &ProcessSchedulingState, right: &ProcessSchedulingState) -> bool {
         (!self.affinity || left.affinity == right.affinity)
             && (!self.nice || left.nice == right.nice)
-            && (!self.policy || left.policy == right.policy)
+            && (!self.policy || same_policy_priority(left, right))
             && (!self.uclamp_min || left.uclamp_min == right.uclamp_min)
             && (!self.uclamp_max || left.uclamp_max == right.uclamp_max)
+    }
+}
+
+fn same_policy_priority(left: &ProcessSchedulingState, right: &ProcessSchedulingState) -> bool {
+    left.policy == right.policy && left.rt_priority == right.rt_priority
+}
+
+fn validate_journal_scheduling_state(state: &ProcessSchedulingState) -> Result<(), String> {
+    match (state.policy, state.rt_priority) {
+        (SchedulingClass::Fifo, Some(priority)) if (1..=99).contains(&priority) => Ok(()),
+        (SchedulingClass::Fifo, Some(priority)) => Err(format!(
+            "FIFO priority {priority} is outside Linux range 1..=99"
+        )),
+        (SchedulingClass::Fifo, None) => {
+            Err("FIFO policy is missing its fixed priority".to_owned())
+        }
+        (SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle, None) => Ok(()),
+        (
+            SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle,
+            Some(priority),
+        ) => Err(format!(
+            "non-real-time policy carries unexpected priority {priority}"
+        )),
     }
 }
 
@@ -830,6 +1199,15 @@ struct PreparedFrequencyMutation {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedScalarMutation {
+    target: ScalarTarget,
+    before: ScalarValue,
+    desired: ScalarValue,
+    needs_write: bool,
+    needs_journal: bool,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedUnitMutation {
     instance: SystemdUnitInstanceIdentity,
     before: SystemdUnitProperties,
@@ -848,6 +1226,8 @@ struct Journal {
     #[serde(default)]
     entries: BTreeMap<TargetId, JournalEntry>,
     #[serde(default)]
+    scalars: BTreeMap<TargetId, ScalarJournalEntry>,
+    #[serde(default)]
     tasks: BTreeMap<String, TaskJournalEntry>,
     #[serde(default)]
     units: BTreeMap<String, UnitJournalEntry>,
@@ -855,7 +1235,10 @@ struct Journal {
 
 impl Journal {
     fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.tasks.is_empty() && self.units.is_empty()
+        self.entries.is_empty()
+            && self.scalars.is_empty()
+            && self.tasks.is_empty()
+            && self.units.is_empty()
     }
 }
 
@@ -873,7 +1256,7 @@ struct RuntimeState {
     recovery_required: bool,
 }
 
-/// Transactional frequency actuator.
+/// Transactional frequency, scalar, task, and systemd actuator.
 pub struct FrequencyActuator {
     io: Arc<dyn SysfsIo>,
     store: Arc<dyn StateStore>,
@@ -907,6 +1290,7 @@ impl FrequencyActuator {
             device_fingerprint: device_fingerprint.clone(),
             generation: 0,
             entries: BTreeMap::new(),
+            scalars: BTreeMap::new(),
             tasks: BTreeMap::new(),
             units: BTreeMap::new(),
         };
@@ -1043,7 +1427,10 @@ impl FrequencyActuator {
                 |mask| !mask.is_empty(),
             )
         });
-        Ok(!state.journal.entries.is_empty() || tasks_owned || units_owned)
+        Ok(!state.journal.entries.is_empty()
+            || !state.journal.scalars.is_empty()
+            || tasks_owned
+            || units_owned)
     }
 
     /// Carry a failed pre-configuration recovery into a newly constructed
@@ -1076,6 +1463,20 @@ impl FrequencyActuator {
             .get(id)
             .ok_or_else(|| ActuatorError::UnknownTarget(id.to_string()))?;
         read_limits(self.io.as_ref(), target)
+    }
+
+    /// Read and type-check a scalar target's current value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown target, unavailable I/O, malformed
+    /// readback, or a value outside the target's configured domain.
+    pub fn read_scalar(&self, id: &TargetId) -> Result<ScalarValue, ActuatorError> {
+        let target = self
+            .registry
+            .get_scalar(id)
+            .ok_or_else(|| ActuatorError::UnknownTarget(id.to_string()))?;
+        read_scalar(self.io.as_ref(), target)
     }
 
     /// Read scheduler state while verifying that the PID still denotes the
@@ -1174,6 +1575,7 @@ impl FrequencyActuator {
                 device_fingerprint: self.device_fingerprint.clone(),
                 generation: state.journal.generation.saturating_add(1),
                 entries: BTreeMap::new(),
+                scalars: BTreeMap::new(),
                 tasks: BTreeMap::new(),
                 units: BTreeMap::new(),
             };
@@ -1247,8 +1649,7 @@ impl FrequencyActuator {
                 );
             }
             if entry
-                .manifest
-                .as_ref()
+                .recovery_frequency_manifest()
                 .is_some_and(|manifest| target.recovery_manifest() != *manifest)
             {
                 return self.degrade_locked(
@@ -1290,6 +1691,9 @@ impl FrequencyActuator {
                 );
             }
         }
+        if let Err(error) = self.recover_scalars_locked(&mut state) {
+            return self.degrade_locked(&mut state, format!("scalar recovery failed: {error}"));
+        }
         if let Err(error) = self.recover_tasks_locked(&mut state) {
             return self.degrade_locked(&mut state, format!("task recovery failed: {error}"));
         }
@@ -1304,6 +1708,7 @@ impl FrequencyActuator {
             );
         }
         state.journal.entries.clear();
+        state.journal.scalars.clear();
         state.journal.tasks.clear();
         state.journal.units.clear();
         state.journal.generation = state.journal.generation.saturating_add(1);
@@ -1403,7 +1808,10 @@ impl FrequencyActuator {
                     target: mutation.target.id.clone(),
                     min_path: mutation.target.min_path.clone(),
                     max_path: mutation.target.max_path.clone(),
-                    manifest: Some(mutation.target.recovery_manifest()),
+                    manifest: None,
+                    resource_manifest: Some(RecoveryResourceManifest::FrequencyPair(
+                        mutation.target.recovery_manifest(),
+                    )),
                     original: hardware_limits(&mutation.target),
                     desired: mutation.previous_request,
                     applied: mutation.previous_request,
@@ -1514,7 +1922,357 @@ impl FrequencyActuator {
         Ok(BatchOutcome { applied })
     }
 
-    /// Apply a verified, journaled batch of non-real-time task scheduling state.
+    /// Apply a verified frequency batch using an existing durable ownership
+    /// claim, without persisting the individual transition.
+    ///
+    /// This is the high-rate counterpart to [`Self::apply_batch`]. Every target
+    /// must already have an entry created and durably stored by
+    /// [`Self::apply_batch`]; this method never claims a new target and never
+    /// accesses the durable state store. Successful transitions update only
+    /// the in-memory journal. If the process crashes, recovery uses the older
+    /// durable claim to release the target to its full hardware range.
+    ///
+    /// Hardware does not expose a true multi-target transaction, so failure
+    /// restores every attempted target to the actuator request recorded before
+    /// this call. A failed rollback places the actuator in read-only degraded
+    /// mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate requests, targets without
+    /// durable ownership, unavailable I/O, mutation/readback mismatch, or
+    /// incomplete rollback.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fast transaction phases are kept adjacent to make the no-persistence and rollback invariants auditable"
+    )]
+    pub fn apply_owned_batch_fast(
+        &self,
+        requests: &[FrequencyRequest],
+    ) -> Result<BatchOutcome, ActuatorError> {
+        let mut state = self.lock_state()?;
+        ensure_mutation_ready(&state)?;
+        if requests.is_empty() {
+            return Ok(BatchOutcome {
+                applied: BTreeMap::new(),
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            if !seen.insert(request.target.clone()) {
+                return Err(ActuatorError::DuplicateRequest(request.target.to_string()));
+            }
+            let target = self
+                .registry
+                .get(&request.target)
+                .ok_or_else(|| ActuatorError::UnknownTarget(request.target.to_string()))?;
+            let existing_entry = state
+                .journal
+                .entries
+                .get(&target.id)
+                .ok_or_else(|| ActuatorError::OwnershipRequired(target.id.to_string()))?;
+            let desired_request = target.snap_limits(request.limits)?;
+            let before_effective = read_limits(self.io.as_ref(), target)?;
+            let previous_request = existing_entry.desired;
+            prepared.push(PreparedFrequencyMutation {
+                target: target.clone(),
+                before_effective,
+                previous_request,
+                desired_request,
+                needs_write: previous_request != desired_request
+                    || before_effective != desired_request,
+            });
+        }
+
+        if prepared.iter().all(|mutation| !mutation.needs_write) {
+            return Ok(BatchOutcome {
+                applied: prepared
+                    .into_iter()
+                    .map(|mutation| (mutation.target.id, mutation.before_effective))
+                    .collect(),
+            });
+        }
+
+        let generation_before = state.journal.generation;
+        let entries_before = prepared
+            .iter()
+            .filter(|mutation| mutation.needs_write)
+            .map(|mutation| {
+                state
+                    .journal
+                    .entries
+                    .get(&mutation.target.id)
+                    .cloned()
+                    .map(|entry| (mutation.target.id.clone(), entry))
+                    .ok_or_else(|| ActuatorError::OwnershipRequired(mutation.target.id.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        state.journal.generation = state.journal.generation.saturating_add(1);
+        for mutation in prepared.iter().filter(|mutation| mutation.needs_write) {
+            let entry = state
+                .journal
+                .entries
+                .get_mut(&mutation.target.id)
+                .ok_or_else(|| ActuatorError::OwnershipRequired(mutation.target.id.to_string()))?;
+            entry.applied = mutation.before_effective;
+            entry.desired = mutation.desired_request;
+            entry.legal_pairs = Some(transaction_legal_pairs(
+                mutation.before_effective,
+                mutation.desired_request,
+            ));
+        }
+
+        let mut applied = BTreeMap::new();
+        let mut attempted = Vec::new();
+        let mut failure = None;
+        for (index, mutation) in prepared.iter().enumerate() {
+            if !mutation.needs_write {
+                applied.insert(mutation.target.id.clone(), mutation.before_effective);
+                continue;
+            }
+            attempted.push(index);
+            match apply_requested_limits(
+                self.io.as_ref(),
+                &mutation.target,
+                mutation.before_effective,
+                mutation.desired_request,
+            ) {
+                Ok(actual) => {
+                    let entry = state
+                        .journal
+                        .entries
+                        .get_mut(&mutation.target.id)
+                        .ok_or_else(|| {
+                            ActuatorError::OwnershipRequired(mutation.target.id.to_string())
+                        })?;
+                    entry.applied = actual;
+                    entry.legal_pairs = Some(vec![actual]);
+                    applied.insert(mutation.target.id.clone(), actual);
+                }
+                Err(error) => {
+                    failure = Some((mutation.target.id.clone(), error));
+                    break;
+                }
+            }
+        }
+
+        if let Some((failed_target, error)) = failure {
+            if let Err(rollback) =
+                rollback_frequency_requests(self.io.as_ref(), &prepared, &attempted)
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "fast transaction failed for {failed_target}: {error}; rollback failed: {rollback}"
+                    ),
+                );
+            }
+            state.journal.generation = generation_before;
+            for (target, entry) in entries_before {
+                state.journal.entries.insert(target, entry);
+            }
+            return Err(ActuatorError::Transaction {
+                target: failed_target.to_string(),
+                reason: error.to_string(),
+            });
+        }
+
+        Ok(BatchOutcome { applied })
+    }
+
+    /// Apply an atomic, verified batch of typed scalar sysfs values.
+    ///
+    /// A scalar path is accepted only when it belongs to a [`ScalarTarget`] in
+    /// the immutable registry. The first mutation durably records the exact
+    /// typed original value and tagged recovery manifest before any write.
+    /// Failed multi-target batches roll attempted writes back in reverse order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid/duplicate requests, externally changed
+    /// ownership, durable journal failure, mutation/readback mismatch, or
+    /// incomplete rollback.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scalar transaction phases stay adjacent so pre-journal and reverse-rollback coverage remain auditable"
+    )]
+    pub fn apply_scalars(
+        &self,
+        requests: &[ScalarRequest],
+    ) -> Result<ScalarBatchOutcome, ActuatorError> {
+        let mut state = self.lock_state()?;
+        ensure_mutation_ready(&state)?;
+        if requests.is_empty() {
+            return Ok(ScalarBatchOutcome {
+                applied: BTreeMap::new(),
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            if !seen.insert(request.target.clone()) {
+                return Err(ActuatorError::DuplicateRequest(request.target.to_string()));
+            }
+            let target = self
+                .registry
+                .get_scalar(&request.target)
+                .ok_or_else(|| ActuatorError::UnknownTarget(request.target.to_string()))?;
+            target.validate_value(&request.value)?;
+            let before = read_scalar(self.io.as_ref(), target)?;
+            let existing = state.journal.scalars.get(&target.id);
+            if let Some(entry) = existing {
+                if entry.path != target.path
+                    || entry.recovery_scalar_manifest() != &target.recovery_manifest()
+                {
+                    return Err(ActuatorError::InvalidTarget(format!(
+                        "{} scalar journal identity changed",
+                        target.id
+                    )));
+                }
+                if before != entry.applied && before != entry.desired {
+                    return Err(ActuatorError::ScalarOwnershipLost(target.id.to_string()));
+                }
+            }
+            let needs_write = before != request.value;
+            let needs_journal = existing.map_or(needs_write, |entry| {
+                entry.desired != request.value || entry.applied != before
+            });
+            prepared.push(PreparedScalarMutation {
+                target: target.clone(),
+                before,
+                desired: request.value.clone(),
+                needs_write,
+                needs_journal,
+            });
+        }
+
+        if prepared
+            .iter()
+            .all(|mutation| !mutation.needs_write && !mutation.needs_journal)
+        {
+            return Ok(ScalarBatchOutcome {
+                applied: prepared
+                    .into_iter()
+                    .map(|mutation| (mutation.target.id, mutation.before))
+                    .collect(),
+            });
+        }
+
+        let journal_before = state.journal.clone();
+        state.journal.generation = state.journal.generation.saturating_add(1);
+        for mutation in prepared.iter().filter(|mutation| mutation.needs_journal) {
+            let mut entry = state
+                .journal
+                .scalars
+                .get(&mutation.target.id)
+                .cloned()
+                .unwrap_or_else(|| ScalarJournalEntry {
+                    target: mutation.target.id.clone(),
+                    path: mutation.target.path.clone(),
+                    manifest: RecoveryResourceManifest::Scalar(mutation.target.recovery_manifest()),
+                    original: mutation.before.clone(),
+                    desired: mutation.before.clone(),
+                    applied: mutation.before.clone(),
+                });
+            entry.applied.clone_from(&mutation.before);
+            entry.desired.clone_from(&mutation.desired);
+            state
+                .journal
+                .scalars
+                .insert(mutation.target.id.clone(), entry);
+        }
+        if let Err(error) = persist_journal(self.store.as_ref(), &state.journal) {
+            state.journal = journal_before;
+            return self.degrade_locked(
+                &mut state,
+                format!("cannot persist pre-mutation scalar journal: {error}"),
+            );
+        }
+
+        let mut applied = BTreeMap::new();
+        let mut attempted = Vec::new();
+        let mut failure = None;
+        for (index, mutation) in prepared.iter().enumerate() {
+            if !mutation.needs_write {
+                applied.insert(mutation.target.id.clone(), mutation.before.clone());
+                continue;
+            }
+            attempted.push(index);
+            match write_scalar(self.io.as_ref(), &mutation.target, &mutation.desired) {
+                Ok(actual) => {
+                    if let Some(entry) = state.journal.scalars.get_mut(&mutation.target.id) {
+                        entry.applied.clone_from(&actual);
+                        entry.desired.clone_from(&actual);
+                    }
+                    applied.insert(mutation.target.id.clone(), actual);
+                }
+                Err(error) => {
+                    failure = Some((mutation.target.id.clone(), error));
+                    break;
+                }
+            }
+        }
+
+        if let Some((failed_target, error)) = failure {
+            if let Err(rollback) = rollback_scalars(self.io.as_ref(), &prepared, &attempted) {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "scalar transaction failed for {failed_target}: {error}; rollback failed: {rollback}"
+                    ),
+                );
+            }
+            state.journal = journal_before;
+            if let Err(persist_error) = self.persist_or_remove_locked(&mut state, "scalar rollback")
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "scalar transaction failed for {failed_target}: {error}; rollback succeeded but journal update failed: {persist_error}"
+                    ),
+                );
+            }
+            return Err(ActuatorError::Transaction {
+                target: failed_target.to_string(),
+                reason: error.to_string(),
+            });
+        }
+
+        if prepared.iter().any(|mutation| mutation.needs_write)
+            && let Err(error) = persist_journal(self.store.as_ref(), &state.journal)
+        {
+            if let Err(rollback) = rollback_scalars(self.io.as_ref(), &prepared, &attempted) {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "post-mutation scalar journal failed: {error}; rollback failed: {rollback}"
+                    ),
+                );
+            }
+            state.journal = journal_before;
+            if let Err(persist_error) =
+                self.persist_or_remove_locked(&mut state, "post-mutation scalar rollback")
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "post-mutation scalar journal failed: {error}; rollback succeeded but journal update failed: {persist_error}"
+                    ),
+                );
+            }
+            return self.degrade_locked(
+                &mut state,
+                format!("post-mutation scalar journal failed; batch rolled back: {error}"),
+            );
+        }
+
+        Ok(ScalarBatchOutcome { applied })
+    }
+
+    /// Apply a verified, journaled batch of task scheduling state.
     ///
     /// # Errors
     ///
@@ -1928,6 +2686,11 @@ impl FrequencyActuator {
             state.journal.entries.keys().cloned().collect::<Vec<_>>()
         };
         self.restore_targets(&ids)?;
+        let scalar_ids = {
+            let state = self.lock_state()?;
+            state.journal.scalars.keys().cloned().collect::<Vec<_>>()
+        };
+        self.restore_scalars(&scalar_ids)?;
         let task_ids = {
             let state = self.lock_state()?;
             state
@@ -2008,6 +2771,88 @@ impl FrequencyActuator {
         }
         state.journal.generation = state.journal.generation.saturating_add(1);
         self.persist_or_remove_locked(&mut state, "frequency restore")
+    }
+
+    /// Restore selected scalar resources to their exact journaled originals.
+    ///
+    /// A scalar changed to a third value by another writer is treated as
+    /// relinquished ownership: it is removed from the journal without
+    /// overwriting that external value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and degrades the actuator when identity validation,
+    /// readback, restoration, or durable journal completion fails.
+    pub fn restore_scalars(&self, ids: &[TargetId]) -> Result<(), ActuatorError> {
+        let mut state = self.lock_state()?;
+        ensure_mutation_ready(&state)?;
+        let entries = ids
+            .iter()
+            .filter_map(|id| state.journal.scalars.get(id).cloned())
+            .collect::<Vec<_>>();
+        let mut restoration = Vec::new();
+        for entry in &entries {
+            let Some(target) = self.registry.get_scalar(&entry.target) else {
+                return self.degrade_locked(
+                    &mut state,
+                    format!("restore scalar target {} is not present", entry.target),
+                );
+            };
+            if entry.path != target.path
+                || entry.recovery_scalar_manifest() != &target.recovery_manifest()
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!(
+                        "restore scalar target identity changed for {}",
+                        entry.target
+                    ),
+                );
+            }
+            let current = match read_scalar(self.io.as_ref(), target) {
+                Ok(current) => current,
+                Err(error) => {
+                    return self.degrade_locked(
+                        &mut state,
+                        format!(
+                            "cannot read scalar target {} during restore: {error}",
+                            entry.target
+                        ),
+                    );
+                }
+            };
+            let owned = current == entry.applied || current == entry.desired;
+            let needs_write = owned && current != entry.original;
+            if needs_write && let Some(journal_entry) = state.journal.scalars.get_mut(&entry.target)
+            {
+                journal_entry.applied.clone_from(&current);
+                journal_entry.desired.clone_from(&entry.original);
+            }
+            restoration.push((entry.clone(), target.clone(), needs_write));
+        }
+        if restoration.iter().any(|(_, _, needs_write)| *needs_write)
+            && let Err(error) = persist_journal(self.store.as_ref(), &state.journal)
+        {
+            return self.degrade_locked(
+                &mut state,
+                format!("cannot persist scalar restore intent: {error}"),
+            );
+        }
+        for (entry, target, needs_write) in &restoration {
+            if *needs_write
+                && let Err(error) = write_scalar(self.io.as_ref(), target, &entry.original)
+            {
+                return self.degrade_locked(
+                    &mut state,
+                    format!("scalar restore failed for {}: {error}", entry.target),
+                );
+            }
+        }
+        for entry in &entries {
+            state.journal.scalars.remove(&entry.target);
+        }
+        state.journal.generation = state.journal.generation.saturating_add(1);
+        self.persist_or_remove_locked(&mut state, "scalar restore")
     }
 
     /// Restore selected process identities when their current state is still
@@ -2268,6 +3113,48 @@ impl FrequencyActuator {
         Ok(())
     }
 
+    fn recover_scalars_locked(&self, state: &mut RuntimeState) -> Result<(), ActuatorError> {
+        if state.journal.scalars.is_empty() {
+            return Ok(());
+        }
+        let entries = state.journal.scalars.values().cloned().collect::<Vec<_>>();
+        let mut restoration = Vec::new();
+        for entry in &entries {
+            let target = self.registry.get_scalar(&entry.target).ok_or_else(|| {
+                ActuatorError::InvalidJournal(format!(
+                    "scalar journal target {} is not present",
+                    entry.target
+                ))
+            })?;
+            if entry.path != target.path
+                || entry.recovery_scalar_manifest() != &target.recovery_manifest()
+            {
+                return Err(ActuatorError::InvalidJournal(format!(
+                    "scalar journal target identity changed for {}",
+                    entry.target
+                )));
+            }
+            let current = read_scalar(self.io.as_ref(), target)?;
+            let owned = current == entry.applied || current == entry.desired;
+            let needs_write = owned && current != entry.original;
+            if needs_write && let Some(journal_entry) = state.journal.scalars.get_mut(&entry.target)
+            {
+                journal_entry.applied.clone_from(&current);
+                journal_entry.desired.clone_from(&entry.original);
+            }
+            restoration.push((entry.clone(), target.clone(), needs_write));
+        }
+        if restoration.iter().any(|(_, _, needs_write)| *needs_write) {
+            persist_journal(self.store.as_ref(), &state.journal)?;
+        }
+        for (entry, target, needs_write) in restoration {
+            if needs_write {
+                write_scalar(self.io.as_ref(), &target, &entry.original)?;
+            }
+        }
+        Ok(())
+    }
+
     fn recover_units_locked(&self, state: &mut RuntimeState) -> Result<(), ActuatorError> {
         if state.journal.units.is_empty() {
             return Ok(());
@@ -2407,6 +3294,173 @@ fn read_limits(
         path: target.min_path.clone(),
         value: format!("{}..{}", minimum.get(), maximum.get()),
     })
+}
+
+fn validate_scalar_string(id: &TargetId, value: &str) -> Result<(), ActuatorError> {
+    if value.is_empty()
+        || value.len() > MAX_SCALAR_STRING_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(ActuatorError::InvalidTarget(format!(
+            "{id}: invalid scalar string enum value {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_scalar(io: &dyn SysfsIo, target: &ScalarTarget) -> Result<ScalarValue, ActuatorError> {
+    let raw = io.read_string(&target.path)?;
+    let trimmed = raw.trim();
+    let value = match &target.domain {
+        ScalarDomain::IntegerRange { .. } | ScalarDomain::IntegerEnum { .. } => trimmed
+            .parse::<i64>()
+            .map(ScalarValue::Integer)
+            .map_err(|_| ActuatorError::InvalidReadback {
+                path: target.path.clone(),
+                value: raw.clone(),
+            })?,
+        ScalarDomain::StringEnum { .. } => ScalarValue::String(trimmed.to_owned()),
+        ScalarDomain::CpuList { .. } => {
+            ScalarValue::CpuList(parse_scalar_cpu_list(&target.path, trimmed)?)
+        }
+    };
+    target
+        .validate_value(&value)
+        .map_err(|_| ActuatorError::InvalidReadback {
+            path: target.path.clone(),
+            value: raw,
+        })?;
+    Ok(value)
+}
+
+fn write_scalar(
+    io: &dyn SysfsIo,
+    target: &ScalarTarget,
+    desired: &ScalarValue,
+) -> Result<ScalarValue, ActuatorError> {
+    target.validate_value(desired)?;
+    let encoded = encode_scalar_value(desired);
+    io.write_string(&target.path, &encoded)?;
+    let actual = read_scalar(io, target)?;
+    if actual != *desired {
+        return Err(ActuatorError::Transaction {
+            target: target.id.to_string(),
+            reason: format!("scalar readback differs: expected {desired:?}, got {actual:?}"),
+        });
+    }
+    Ok(actual)
+}
+
+fn encode_scalar_value(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Integer(value) => value.to_string(),
+        ScalarValue::String(value) => value.clone(),
+        ScalarValue::CpuList(cpus) => format_scalar_cpu_list(cpus),
+    }
+}
+
+fn format_scalar_cpu_list(cpus: &CpuSet) -> String {
+    let ids = cpus.iter().map(|cpu| cpu.get()).collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < ids.len() {
+        let start = ids[index];
+        let mut end = start;
+        while index + 1 < ids.len() && ids[index + 1] == end.saturating_add(1) {
+            index += 1;
+            end = ids[index];
+        }
+        if start == end {
+            ranges.push(start.to_string());
+        } else {
+            ranges.push(format!("{start}-{end}"));
+        }
+        index += 1;
+    }
+    ranges.join(",")
+}
+
+fn parse_scalar_cpu_list(path: &Path, value: &str) -> Result<CpuSet, ActuatorError> {
+    if value.is_empty() {
+        return Ok(CpuSet::new());
+    }
+    let mut cpus = CpuSet::new();
+    for comma_part in value.split(',') {
+        if comma_part.trim().is_empty() {
+            return Err(ActuatorError::InvalidReadback {
+                path: path.to_path_buf(),
+                value: value.to_owned(),
+            });
+        }
+        for token in comma_part.split_ascii_whitespace() {
+            let (start, end) = if let Some((start, end)) = token.split_once('-') {
+                if end.contains('-') {
+                    return Err(ActuatorError::InvalidReadback {
+                        path: path.to_path_buf(),
+                        value: value.to_owned(),
+                    });
+                }
+                (
+                    parse_scalar_cpu_id(path, value, start)?,
+                    parse_scalar_cpu_id(path, value, end)?,
+                )
+            } else {
+                let cpu = parse_scalar_cpu_id(path, value, token)?;
+                (cpu, cpu)
+            };
+            if start > end {
+                return Err(ActuatorError::InvalidReadback {
+                    path: path.to_path_buf(),
+                    value: value.to_owned(),
+                });
+            }
+            for cpu in start..=end {
+                cpus.insert(CpuId::new(cpu));
+            }
+        }
+    }
+    Ok(cpus)
+}
+
+fn parse_scalar_cpu_id(path: &Path, original: &str, value: &str) -> Result<u32, ActuatorError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|cpu| *cpu <= MAX_SCALAR_CPU_ID)
+        .ok_or_else(|| ActuatorError::InvalidReadback {
+            path: path.to_path_buf(),
+            value: original.to_owned(),
+        })
+}
+
+fn rollback_scalars(
+    io: &dyn SysfsIo,
+    prepared: &[PreparedScalarMutation],
+    attempted: &[usize],
+) -> Result<(), ActuatorError> {
+    let mut failures = Vec::new();
+    for index in attempted.iter().rev() {
+        let mutation = &prepared[*index];
+        let current = match read_scalar(io, &mutation.target) {
+            Ok(current) => current,
+            Err(error) => {
+                failures.push(format!("{}: {error}", mutation.target.id));
+                continue;
+            }
+        };
+        if current == mutation.before || current != mutation.desired {
+            continue;
+        }
+        if let Err(error) = write_scalar(io, &mutation.target, &mutation.before) {
+            failures.push(format!("{}: {error}", mutation.target.id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ActuatorError::Rollback(failures.join("; ")))
+    }
 }
 
 fn apply_requested_limits(
@@ -2637,7 +3691,10 @@ fn upgrade_legacy_journal(
                 entry.target
             )));
         }
-        entry.manifest = Some(target.recovery_manifest());
+        entry.manifest = None;
+        entry.resource_manifest = Some(RecoveryResourceManifest::FrequencyPair(
+            target.recovery_manifest(),
+        ));
         entry.legal_pairs = Some(legacy_frequency_pairs(entry));
         // Older schemas stored an effective aggregate here. Replaying that
         // value could turn another kernel client's transient cap into a
@@ -2922,6 +3979,8 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
         LEGACY_JOURNAL_SCHEMA_VERSION
             | MANIFEST_JOURNAL_SCHEMA_VERSION
             | OWNERSHIP_JOURNAL_SCHEMA_VERSION
+            | RELEASE_JOURNAL_SCHEMA_VERSION
+            | SCALAR_JOURNAL_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(ActuatorError::InvalidJournal(format!(
@@ -2934,6 +3993,7 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             "boot ID and device fingerprint must be non-empty".to_owned(),
         ));
     }
+    let mut claimed_sysfs_paths = BTreeMap::<PathBuf, String>::new();
     for (key, entry) in &journal.entries {
         if key != &entry.target {
             return Err(ActuatorError::InvalidJournal(format!(
@@ -2945,6 +4005,18 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
         validate_sysfs_path(&entry.max_path)
             .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+        for path in [&entry.min_path, &entry.max_path] {
+            if let Some(owner) =
+                claimed_sysfs_paths.insert(path.clone(), format!("frequency {}", entry.target))
+            {
+                return Err(ActuatorError::InvalidJournal(format!(
+                    "{} and frequency {} both claim {}",
+                    owner,
+                    entry.target,
+                    path.display()
+                )));
+            }
+        }
         for (name, limits) in [
             ("original", entry.original),
             ("desired", entry.desired),
@@ -2957,67 +4029,69 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                 )));
             }
         }
-        match (journal.schema_version, &entry.manifest) {
+        let manifest = match (
+            journal.schema_version,
+            &entry.manifest,
+            &entry.resource_manifest,
+        ) {
+            (LEGACY_JOURNAL_SCHEMA_VERSION, None, None) => None,
             (
                 MANIFEST_JOURNAL_SCHEMA_VERSION
                 | OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
+                | RELEASE_JOURNAL_SCHEMA_VERSION,
                 Some(manifest),
-            ) => {
-                if manifest.id != entry.target
-                    || manifest.min_path != entry.min_path
-                    || manifest.max_path != entry.max_path
-                {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "{} recovery manifest identity does not match its entry",
-                        entry.target
-                    )));
-                }
-                let target = manifest
-                    .to_frequency_target()
-                    .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-                for limits in [entry.original, entry.desired, entry.applied] {
-                    target
-                        .validate_limits(limits)
-                        .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-                }
-                if journal.schema_version == JOURNAL_SCHEMA_VERSION
-                    && entry.original != hardware_limits(&target)
-                {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "{} schema-v{} original request is not the full hardware range",
-                        entry.target, journal.schema_version
-                    )));
-                }
-            }
-            (
-                MANIFEST_JOURNAL_SCHEMA_VERSION
-                | OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
                 None,
-            ) => {
+            )
+            | (
+                SCALAR_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
+                None,
+                Some(RecoveryResourceManifest::FrequencyPair(manifest)),
+            ) => Some(manifest),
+            _ => {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v{} entry has no recovery manifest",
+                    "{} schema-v{} has an invalid recovery manifest representation",
                     entry.target, journal.schema_version
                 )));
             }
-            (LEGACY_JOURNAL_SCHEMA_VERSION, None) => {}
-            (LEGACY_JOURNAL_SCHEMA_VERSION, Some(_)) => {
+        };
+        if let Some(manifest) = manifest {
+            if manifest.id != entry.target
+                || manifest.min_path != entry.min_path
+                || manifest.max_path != entry.max_path
+            {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v1 entry unexpectedly contains a manifest",
+                    "{} recovery manifest identity does not match its entry",
                     entry.target
                 )));
             }
-            _ => unreachable!("schema version was checked above"),
+            let target = manifest
+                .to_frequency_target()
+                .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+            for limits in [entry.original, entry.desired, entry.applied] {
+                target
+                    .validate_limits(limits)
+                    .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+            }
+            if journal.schema_version >= RELEASE_JOURNAL_SCHEMA_VERSION
+                && entry.original != hardware_limits(&target)
+            {
+                return Err(ActuatorError::InvalidJournal(format!(
+                    "{} schema-v{} original request is not the full hardware range",
+                    entry.target, journal.schema_version
+                )));
+            }
         }
         match (journal.schema_version, &entry.legal_pairs) {
-            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, Some(pairs))
-                if !pairs.is_empty() =>
-            {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                Some(pairs),
+            ) if !pairs.is_empty() => {
                 let mut unique = Vec::with_capacity(pairs.len());
                 let target = entry
-                    .manifest
-                    .as_ref()
+                    .recovery_frequency_manifest()
                     .expect("schema-v3+ manifest checked above")
                     .to_frequency_target()
                     .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
@@ -3045,7 +4119,13 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _) => {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                _,
+            ) => {
                 return Err(ActuatorError::InvalidJournal(format!(
                     "{} schema-v{} entry has no legal frequency pairs",
                     entry.target, journal.schema_version
@@ -3061,6 +4141,52 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             _ => unreachable!("schema version was checked above"),
         }
     }
+    if journal.schema_version < SCALAR_JOURNAL_SCHEMA_VERSION && !journal.scalars.is_empty() {
+        return Err(ActuatorError::InvalidJournal(format!(
+            "schema-v{} unexpectedly contains scalar resources",
+            journal.schema_version
+        )));
+    }
+    for (key, entry) in &journal.scalars {
+        if key != &entry.target || journal.entries.contains_key(key) {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "scalar journal key does not uniquely match {}",
+                entry.target
+            )));
+        }
+        validate_sysfs_path(&entry.path)
+            .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+        if let Some(owner) =
+            claimed_sysfs_paths.insert(entry.path.clone(), format!("scalar {}", entry.target))
+        {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} and scalar {} both claim {}",
+                owner,
+                entry.target,
+                entry.path.display()
+            )));
+        }
+        let RecoveryResourceManifest::Scalar(manifest) = &entry.manifest else {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} scalar entry has a non-scalar manifest",
+                entry.target
+            )));
+        };
+        if manifest.id != entry.target || manifest.path != entry.path {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} scalar recovery manifest identity does not match its entry",
+                entry.target
+            )));
+        }
+        let target = manifest
+            .to_scalar_target()
+            .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+        for value in [&entry.original, &entry.desired, &entry.applied] {
+            target
+                .validate_value(value)
+                .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+        }
+    }
     if journal
         .tasks
         .iter()
@@ -3071,13 +4197,28 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
         ));
     }
     for entry in journal.tasks.values() {
+        for (name, state) in [
+            ("original", &entry.original),
+            ("desired", &entry.desired),
+            ("applied", &entry.applied),
+        ] {
+            validate_journal_scheduling_state(state).map_err(|detail| {
+                ActuatorError::InvalidJournal(format!(
+                    "task journal {name} state for pid {} is invalid: {detail}",
+                    entry.identity.pid.get()
+                ))
+            })?;
+        }
         match (
             journal.schema_version,
             entry.owned_fields,
             entry.relinquished_fields,
         ) {
             (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
                 Some(owned),
                 Some(relinquished),
             ) => {
@@ -3088,7 +4229,14 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _, _) => {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                _,
+                _,
+            ) => {
                 return Err(ActuatorError::InvalidJournal(format!(
                     "schema-v{} task entry for pid {} has no ownership masks",
                     journal.schema_version,
@@ -3121,7 +4269,10 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
             entry.relinquished_fields,
         ) {
             (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
                 Some(instance),
                 Some(owned),
                 Some(relinquished),
@@ -3140,7 +4291,15 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                     )));
                 }
             }
-            (OWNERSHIP_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION, _, _, _) => {
+            (
+                OWNERSHIP_JOURNAL_SCHEMA_VERSION
+                | RELEASE_JOURNAL_SCHEMA_VERSION
+                | SCALAR_JOURNAL_SCHEMA_VERSION
+                | JOURNAL_SCHEMA_VERSION,
+                _,
+                _,
+                _,
+            ) => {
                 return Err(ActuatorError::InvalidJournal(format!(
                     "schema-v{} systemd entry {} lacks identity or ownership masks",
                     journal.schema_version, entry.unit
@@ -3180,7 +4339,7 @@ fn persist_or_remove_journal(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -3199,17 +4358,19 @@ mod tests {
 
     use super::{
         ActuatorError, ActuatorMode, FrequencyActuator, FrequencyRequest, FrequencyTarget,
-        JOURNAL_SCHEMA_VERSION, LEGACY_JOURNAL_SCHEMA_VERSION, MANIFEST_JOURNAL_SCHEMA_VERSION,
-        OWNERSHIP_JOURNAL_SCHEMA_VERSION, RecoveryFrequencyTarget, TargetRegistry, TaskRequest,
-        UnitRequest, decode_journal, encode_journal, inspect_recovery_journal,
-        transaction_legal_pairs,
+        JOURNAL_SCHEMA_VERSION, JournalEnvelope, LEGACY_JOURNAL_SCHEMA_VERSION,
+        MANIFEST_JOURNAL_SCHEMA_VERSION, OWNERSHIP_JOURNAL_SCHEMA_VERSION,
+        RELEASE_JOURNAL_SCHEMA_VERSION, RecoveryFrequencyTarget, RecoveryResourceManifest,
+        RecoveryResourceTarget, SCALAR_JOURNAL_SCHEMA_VERSION, ScalarDomain, ScalarRequest,
+        ScalarTarget, ScalarValue, TargetRegistry, TaskRequest, UnitRequest, decode_journal,
+        encode_journal, inspect_recovery_journal, transaction_legal_pairs,
     };
 
     #[derive(Default)]
     struct MemorySysfs {
         values: Mutex<BTreeMap<PathBuf, String>>,
         writes: Mutex<Vec<(PathBuf, String)>>,
-        fail_on_write: Mutex<Option<usize>>,
+        fail_on_writes: Mutex<BTreeSet<usize>>,
         mutate_on_failure: Mutex<BTreeMap<PathBuf, String>>,
         scripted_reads: Mutex<BTreeMap<PathBuf, VecDeque<String>>>,
     }
@@ -3225,8 +4386,23 @@ mod tests {
             }
         }
 
+        fn with_values(values: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
+            Self {
+                values: Mutex::new(values.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
         fn fail_on(&self, write_number: usize) {
-            *self.fail_on_write.lock().expect("fault lock") = Some(write_number);
+            let mut failures = self.fail_on_writes.lock().expect("fault lock");
+            failures.clear();
+            failures.insert(write_number);
+        }
+
+        fn fail_on_many(&self, write_numbers: impl IntoIterator<Item = usize>) {
+            let mut failures = self.fail_on_writes.lock().expect("fault lock");
+            failures.clear();
+            failures.extend(write_numbers);
         }
 
         fn mutate_on_failed_write(&self, values: impl IntoIterator<Item = (PathBuf, String)>) {
@@ -3260,6 +4436,13 @@ mod tests {
                 (PathBuf::from("/sys/test/max"), maximum.to_owned()),
             ]);
         }
+
+        fn set_value(&self, path: impl Into<PathBuf>, value: impl Into<String>) {
+            self.values
+                .lock()
+                .expect("values lock")
+                .insert(path.into(), value.into());
+        }
     }
 
     impl SysfsIo for MemorySysfs {
@@ -3286,7 +4469,12 @@ mod tests {
         fn write_string(&self, path: &Path, value: &str) -> PlatformResult<()> {
             let mut writes = self.writes.lock().expect("writes lock");
             writes.push((path.to_path_buf(), value.to_owned()));
-            if *self.fail_on_write.lock().expect("fault lock") == Some(writes.len()) {
+            if self
+                .fail_on_writes
+                .lock()
+                .expect("fault lock")
+                .contains(&writes.len())
+            {
                 let mutations = self
                     .mutate_on_failure
                     .lock()
@@ -3325,6 +4513,10 @@ mod tests {
 
         fn fail_on_store(&self, store_number: usize) {
             *self.fail_on_store.lock().expect("store fault lock") = Some(store_number);
+        }
+
+        fn store_calls(&self) -> usize {
+            *self.store_calls.lock().expect("store calls lock")
         }
 
         fn fail_remove(&self) {
@@ -3668,8 +4860,51 @@ mod tests {
         )
     }
 
+    fn scalar_id(name: &str) -> TargetId {
+        TargetId::new(name).expect("scalar target ID")
+    }
+
+    fn integer_scalar(name: &str, path: &str) -> ScalarTarget {
+        ScalarTarget::new(
+            scalar_id(name),
+            path,
+            ScalarDomain::IntegerRange {
+                minimum: 0,
+                maximum: 100,
+            },
+        )
+        .expect("integer scalar target")
+    }
+
+    fn scalar_actuator(
+        io: Arc<MemorySysfs>,
+        store: Arc<MemoryStore>,
+        targets: impl IntoIterator<Item = ScalarTarget>,
+        boot_id: &str,
+    ) -> FrequencyActuator {
+        FrequencyActuator::new(
+            io,
+            store,
+            TargetRegistry::default()
+                .with_scalar_targets(targets)
+                .expect("scalar registry"),
+            boot_id,
+            "device-a",
+        )
+    }
+
     fn limits(minimum: u64, maximum: u64) -> FrequencyLimits {
         FrequencyLimits::new(Hertz::new(minimum), Hertz::new(maximum)).expect("limits")
+    }
+
+    fn use_legacy_frequency_manifests(journal: &mut super::Journal) {
+        for entry in journal.entries.values_mut() {
+            if let Some(super::RecoveryResourceManifest::FrequencyPair(manifest)) =
+                entry.resource_manifest.take()
+            {
+                entry.manifest = Some(manifest);
+            }
+        }
     }
 
     fn process_identity(pid: u32, start_time_ticks: u64) -> ProcessIdentity {
@@ -3699,8 +4934,17 @@ mod tests {
             affinity: CpuSet::from_ids([CpuId::new(0), CpuId::new(2)]),
             nice,
             policy: SchedulingClass::Other,
+            rt_priority: None,
             uclamp_min: Some(128),
             uclamp_max: Some(896),
+        }
+    }
+
+    fn fifo_scheduling(nice: i8, priority: u8) -> ProcessSchedulingState {
+        ProcessSchedulingState {
+            policy: SchedulingClass::Fifo,
+            rt_priority: Some(priority),
+            ..scheduling(nice)
         }
     }
 
@@ -3766,6 +5010,784 @@ mod tests {
         );
         assert!(store.load().expect("load journal").is_none());
         assert!(!actuator.has_owned_resources().expect("owned resources"));
+    }
+
+    #[test]
+    fn fast_batch_requires_prior_durable_ownership() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+
+        assert!(matches!(
+            actuator.apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }]),
+            Err(ActuatorError::OwnershipRequired(target)) if target == id().to_string()
+        ));
+        assert!(io.writes().is_empty());
+        assert_eq!(store.store_calls(), 0);
+        assert!(!actuator.has_owned_resources().expect("owned resources"));
+    }
+
+    #[test]
+    fn fast_batch_updates_memory_without_persisting_each_transition() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        actuator
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed durable ownership");
+        let store_calls = store.store_calls();
+        let durable_before = store.load().expect("load durable ownership");
+        store.fail_on_store(store_calls + 1);
+
+        let first = actuator
+            .apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(1_000, 1_000),
+            }])
+            .expect("first fast transition");
+        assert_eq!(first.applied[&id()], limits(1_000, 1_000));
+        let second = actuator
+            .apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }])
+            .expect("second fast transition uses in-memory request");
+        assert_eq!(second.applied[&id()], limits(3_000, 3_000));
+
+        assert_eq!(
+            io.writes(),
+            vec![
+                (PathBuf::from("/sys/test/min"), "2000".to_owned()),
+                (PathBuf::from("/sys/test/min"), "1000".to_owned()),
+                (PathBuf::from("/sys/test/max"), "1000".to_owned()),
+                (PathBuf::from("/sys/test/max"), "3000".to_owned()),
+                (PathBuf::from("/sys/test/min"), "3000".to_owned()),
+            ]
+        );
+        assert_eq!(store.store_calls(), store_calls);
+        assert_eq!(
+            store.load().expect("load unchanged durable ownership"),
+            durable_before
+        );
+        let durable =
+            decode_journal(&durable_before.expect("durable ownership must remain present"))
+                .expect("decode durable ownership");
+        assert_eq!(durable.entries[&id()].desired, limits(2_000, 3_000));
+    }
+
+    #[test]
+    fn fast_batch_reasserts_an_unchanged_owned_request_after_external_drift() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        let request = FrequencyRequest {
+            target: id(),
+            limits: limits(2_000, 3_000),
+        };
+        actuator
+            .apply_batch(std::slice::from_ref(&request))
+            .expect("seed durable ownership");
+        let writes_before_drift = io.writes().len();
+        let store_calls = store.store_calls();
+
+        io.set_admin_pair("1000", "2000");
+        let outcome = actuator
+            .apply_owned_batch_fast(&[request])
+            .expect("reassert the owned request");
+
+        assert_eq!(outcome.applied[&id()], limits(2_000, 3_000));
+        assert_eq!(
+            actuator.read_limits(&id()).expect("corrected limits"),
+            limits(2_000, 3_000)
+        );
+        assert_eq!(
+            &io.writes()[writes_before_drift..],
+            &[
+                (PathBuf::from("/sys/test/max"), "3000".to_owned()),
+                (PathBuf::from("/sys/test/min"), "2000".to_owned()),
+            ]
+        );
+        assert_eq!(
+            store.store_calls(),
+            store_calls,
+            "drift correction must remain on the owned fast path"
+        );
+    }
+
+    #[test]
+    fn crash_after_fast_batch_recovers_from_the_original_durable_claim() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let first_process = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        first_process
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed durable ownership");
+        first_process
+            .apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }])
+            .expect("unpersisted fast transition");
+        assert_eq!(
+            first_process.read_limits(&id()).expect("fast limits"),
+            limits(3_000, 3_000)
+        );
+        drop(first_process);
+
+        let restarted = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        assert!(
+            restarted
+                .startup_recovery_required()
+                .expect("startup recovery state")
+        );
+        restarted.recover_pending().expect("recover durable claim");
+        assert_eq!(
+            restarted.read_limits(&id()).expect("recovered limits"),
+            limits(1_000, 3_000)
+        );
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn failed_fast_batch_rolls_back_without_persisting() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        actuator
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed durable ownership");
+        let store_calls = store.store_calls();
+        let durable_before = store.load().expect("load durable ownership");
+        store.fail_on_store(store_calls + 1);
+        io.fail_on(3);
+
+        assert!(matches!(
+            actuator.apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(1_000, 1_000),
+            }]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert_eq!(
+            actuator.read_limits(&id()).expect("rolled-back request"),
+            limits(2_000, 3_000)
+        );
+        assert_eq!(store.store_calls(), store_calls);
+        assert_eq!(
+            store.load().expect("load unchanged durable ownership"),
+            durable_before
+        );
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadWrite
+        ));
+
+        let retry = actuator
+            .apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(3_000, 3_000),
+            }])
+            .expect("retry from restored in-memory request");
+        assert_eq!(retry.applied[&id()], limits(3_000, 3_000));
+        assert_eq!(store.store_calls(), store_calls);
+    }
+
+    #[test]
+    fn failed_fast_rollback_degrades_without_persisting_unknown_state() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = actuator(io.clone(), store.clone(), "boot-a", "device-a");
+        actuator
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed durable ownership");
+        let store_calls = store.store_calls();
+        io.fail_on_many([3, 4]);
+
+        assert!(matches!(
+            actuator.apply_owned_batch_fast(&[FrequencyRequest {
+                target: id(),
+                limits: limits(1_000, 2_000),
+            }]),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert_eq!(
+            actuator
+                .read_limits(&id())
+                .expect("partially mutated limits"),
+            limits(2_000, 2_000)
+        );
+        assert_eq!(store.store_calls(), store_calls);
+        assert!(matches!(
+            actuator.apply_owned_batch_fast(&[]),
+            Err(ActuatorError::Degraded(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_registry_rejects_invalid_domains_and_path_aliases() {
+        assert!(matches!(
+            ScalarTarget::new(
+                scalar_id("scalar.bad-range"),
+                "/sys/test/bad",
+                ScalarDomain::IntegerRange {
+                    minimum: 10,
+                    maximum: 1,
+                },
+            ),
+            Err(ActuatorError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            ScalarTarget::new(
+                scalar_id("scalar.bad-string"),
+                "/sys/test/bad",
+                ScalarDomain::StringEnum {
+                    values: vec!["bad\nvalue".to_owned()],
+                },
+            ),
+            Err(ActuatorError::InvalidTarget(_))
+        ));
+        let alias = integer_scalar("scalar.alias", "/sys/test/min");
+        assert!(matches!(
+            TargetRegistry::new([target()])
+                .expect("frequency registry")
+                .with_scalar_targets([alias]),
+            Err(ActuatorError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_apply_is_typed_verified_and_restores_the_exact_original() {
+        let path = PathBuf::from("/sys/test/scalar");
+        let io = Arc::new(MemorySysfs::with_values([(
+            path.clone(),
+            "10\n".to_owned(),
+        )]));
+        let store = Arc::new(MemoryStore::default());
+        let scalar = integer_scalar("scalar.bus", path.to_str().expect("UTF-8 path"));
+        let actuator = scalar_actuator(io.clone(), store.clone(), [scalar], "boot-a");
+
+        let outcome = actuator
+            .apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(20),
+            }])
+            .expect("apply scalar");
+        assert_eq!(
+            outcome.applied[&scalar_id("scalar.bus")],
+            ScalarValue::Integer(20)
+        );
+        assert_eq!(io.writes(), vec![(path.clone(), "20".to_owned())]);
+        let journal = decode_journal(
+            &store
+                .load()
+                .expect("load scalar journal")
+                .expect("owned scalar journal"),
+        )
+        .expect("decode scalar journal");
+        assert_eq!(journal.schema_version, JOURNAL_SCHEMA_VERSION);
+        let entry = &journal.scalars[&scalar_id("scalar.bus")];
+        assert_eq!(entry.original, ScalarValue::Integer(10));
+        assert_eq!(entry.desired, ScalarValue::Integer(20));
+        assert_eq!(entry.applied, ScalarValue::Integer(20));
+        assert!(matches!(
+            entry.manifest,
+            RecoveryResourceManifest::Scalar(_)
+        ));
+
+        actuator
+            .restore_scalars(&[scalar_id("scalar.bus")])
+            .expect("restore scalar");
+        assert_eq!(
+            actuator
+                .read_scalar(&scalar_id("scalar.bus"))
+                .expect("read restored scalar"),
+            ScalarValue::Integer(10)
+        );
+        assert_eq!(
+            io.writes(),
+            vec![(path.clone(), "20".to_owned()), (path, "10".to_owned()),]
+        );
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn unchanged_scalar_value_does_not_write_or_claim_ownership() {
+        let path = PathBuf::from("/sys/test/scalar");
+        let io = Arc::new(MemorySysfs::with_values([(path, "10".to_owned())]));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [integer_scalar("scalar.bus", "/sys/test/scalar")],
+            "boot-a",
+        );
+        let request = ScalarRequest {
+            target: scalar_id("scalar.bus"),
+            value: ScalarValue::Integer(10),
+        };
+
+        actuator
+            .apply_scalars(std::slice::from_ref(&request))
+            .expect("unclaimed no-op");
+        assert!(io.writes().is_empty());
+        assert_eq!(store.store_calls(), 0);
+        assert!(!actuator.has_owned_resources().expect("ownership"));
+
+        let changed = ScalarRequest {
+            value: ScalarValue::Integer(20),
+            ..request
+        };
+        actuator
+            .apply_scalars(std::slice::from_ref(&changed))
+            .expect("claim scalar");
+        let writes = io.writes().len();
+        let stores = store.store_calls();
+        actuator.apply_scalars(&[changed]).expect("owned no-op");
+        assert_eq!(io.writes().len(), writes);
+        assert_eq!(store.store_calls(), stores);
+    }
+
+    #[test]
+    fn scalar_batch_supports_integer_string_and_canonical_cpu_list_values() {
+        let integer_path = PathBuf::from("/sys/test/integer");
+        let string_path = PathBuf::from("/sys/test/string");
+        let cpus_path = PathBuf::from("/sys/test/cpus");
+        let io = Arc::new(MemorySysfs::with_values([
+            (integer_path.clone(), "1".to_owned()),
+            (string_path.clone(), "powersave\n".to_owned()),
+            (cpus_path.clone(), "0-1,4\n".to_owned()),
+        ]));
+        let store = Arc::new(MemoryStore::default());
+        let integer = ScalarTarget::new(
+            scalar_id("scalar.integer"),
+            &integer_path,
+            ScalarDomain::IntegerEnum {
+                values: vec![3, 1, 3],
+            },
+        )
+        .expect("integer enum");
+        let string = ScalarTarget::new(
+            scalar_id("scalar.string"),
+            &string_path,
+            ScalarDomain::StringEnum {
+                values: vec!["powersave".to_owned(), "performance".to_owned()],
+            },
+        )
+        .expect("string enum");
+        let cpus = ScalarTarget::new(
+            scalar_id("scalar.cpus"),
+            &cpus_path,
+            ScalarDomain::CpuList {
+                allowed_cpus: CpuSet::from_ids((0..=4).map(CpuId::new)),
+                allow_empty: false,
+            },
+        )
+        .expect("CPU-list target");
+        let actuator = scalar_actuator(io.clone(), store, [integer, string, cpus], "boot-a");
+        let desired_cpus =
+            CpuSet::from_ids([CpuId::new(0), CpuId::new(1), CpuId::new(2), CpuId::new(4)]);
+
+        actuator
+            .apply_scalars(&[
+                ScalarRequest {
+                    target: scalar_id("scalar.integer"),
+                    value: ScalarValue::Integer(3),
+                },
+                ScalarRequest {
+                    target: scalar_id("scalar.string"),
+                    value: ScalarValue::String("performance".to_owned()),
+                },
+                ScalarRequest {
+                    target: scalar_id("scalar.cpus"),
+                    value: ScalarValue::CpuList(desired_cpus.clone()),
+                },
+            ])
+            .expect("apply typed scalar batch");
+
+        assert_eq!(
+            io.writes(),
+            vec![
+                (integer_path, "3".to_owned()),
+                (string_path, "performance".to_owned()),
+                (cpus_path, "0-2,4".to_owned()),
+            ]
+        );
+        assert_eq!(
+            actuator
+                .read_scalar(&scalar_id("scalar.cpus"))
+                .expect("read CPU list"),
+            ScalarValue::CpuList(desired_cpus)
+        );
+    }
+
+    #[test]
+    fn invalid_scalar_request_is_rejected_before_journaling_or_writing() {
+        let io = Arc::new(MemorySysfs::with_values([(
+            PathBuf::from("/sys/test/scalar"),
+            "10".to_owned(),
+        )]));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [integer_scalar("scalar.bus", "/sys/test/scalar")],
+            "boot-a",
+        );
+
+        assert!(matches!(
+            actuator.apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::String("20".to_owned()),
+            }]),
+            Err(ActuatorError::InvalidScalarValue { .. })
+        ));
+        assert!(matches!(
+            actuator.apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(101),
+            }]),
+            Err(ActuatorError::InvalidScalarValue { .. })
+        ));
+        assert!(io.writes().is_empty());
+        assert_eq!(store.store_calls(), 0);
+    }
+
+    #[test]
+    fn scalar_readback_mismatch_is_detected_and_rolled_back() {
+        let path = PathBuf::from("/sys/test/scalar");
+        let io = Arc::new(MemorySysfs::with_values([(path.clone(), "10".to_owned())]));
+        io.script_reads(&path, ["10", "30"]);
+        let store = Arc::new(MemoryStore::default());
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [integer_scalar("scalar.bus", "/sys/test/scalar")],
+            "boot-a",
+        );
+
+        assert!(matches!(
+            actuator.apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(20),
+            }]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert_eq!(
+            io.writes(),
+            vec![(path.clone(), "20".to_owned()), (path, "10".to_owned()),]
+        );
+        assert_eq!(
+            actuator
+                .read_scalar(&scalar_id("scalar.bus"))
+                .expect("rolled-back scalar"),
+            ScalarValue::Integer(10)
+        );
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn scalar_batch_failure_rolls_back_attempted_targets_in_reverse_order() {
+        let first_path = PathBuf::from("/sys/test/first");
+        let second_path = PathBuf::from("/sys/test/second");
+        let io = Arc::new(MemorySysfs::with_values([
+            (first_path.clone(), "10".to_owned()),
+            (second_path.clone(), "20".to_owned()),
+        ]));
+        io.fail_on(2);
+        let store = Arc::new(MemoryStore::default());
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [
+                integer_scalar("scalar.first", "/sys/test/first"),
+                integer_scalar("scalar.second", "/sys/test/second"),
+            ],
+            "boot-a",
+        );
+
+        assert!(matches!(
+            actuator.apply_scalars(&[
+                ScalarRequest {
+                    target: scalar_id("scalar.first"),
+                    value: ScalarValue::Integer(20),
+                },
+                ScalarRequest {
+                    target: scalar_id("scalar.second"),
+                    value: ScalarValue::Integer(30),
+                },
+            ]),
+            Err(ActuatorError::Transaction { .. })
+        ));
+        assert_eq!(
+            io.writes(),
+            vec![
+                (first_path, "20".to_owned()),
+                (second_path, "30".to_owned()),
+                (PathBuf::from("/sys/test/first"), "10".to_owned()),
+            ]
+        );
+        assert_eq!(
+            actuator
+                .read_scalar(&scalar_id("scalar.first"))
+                .expect("first rollback"),
+            ScalarValue::Integer(10)
+        );
+        assert!(store.load().expect("journal rollback").is_none());
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadWrite
+        ));
+    }
+
+    #[test]
+    fn failed_scalar_rollback_degrades_and_restart_recovers_the_durable_intent() {
+        let first_path = PathBuf::from("/sys/test/first");
+        let second_path = PathBuf::from("/sys/test/second");
+        let io = Arc::new(MemorySysfs::with_values([
+            (first_path, "10".to_owned()),
+            (second_path, "20".to_owned()),
+        ]));
+        io.fail_on_many([2, 3]);
+        let store = Arc::new(MemoryStore::default());
+        let targets = || {
+            [
+                integer_scalar("scalar.first", "/sys/test/first"),
+                integer_scalar("scalar.second", "/sys/test/second"),
+            ]
+        };
+        let first_process = scalar_actuator(io.clone(), store.clone(), targets(), "boot-a");
+
+        assert!(matches!(
+            first_process.apply_scalars(&[
+                ScalarRequest {
+                    target: scalar_id("scalar.first"),
+                    value: ScalarValue::Integer(20),
+                },
+                ScalarRequest {
+                    target: scalar_id("scalar.second"),
+                    value: ScalarValue::Integer(30),
+                },
+            ]),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert!(store.load().expect("durable recovery intent").is_some());
+        drop(first_process);
+
+        let restarted = scalar_actuator(io.clone(), store.clone(), targets(), "boot-a");
+        restarted
+            .recover_pending()
+            .expect("recover failed scalar rollback");
+        assert_eq!(
+            restarted
+                .read_scalar(&scalar_id("scalar.first"))
+                .expect("first recovered"),
+            ScalarValue::Integer(10)
+        );
+        assert_eq!(
+            restarted
+                .read_scalar(&scalar_id("scalar.second"))
+                .expect("second recovered"),
+            ScalarValue::Integer(20)
+        );
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn post_scalar_journal_failure_rolls_back_and_degrades() {
+        let first_path = PathBuf::from("/sys/test/first");
+        let second_path = PathBuf::from("/sys/test/second");
+        let io = Arc::new(MemorySysfs::with_values([
+            (first_path.clone(), "10".to_owned()),
+            (second_path.clone(), "20".to_owned()),
+        ]));
+        let store = Arc::new(MemoryStore::default());
+        store.fail_on_store(2);
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [
+                integer_scalar("scalar.first", "/sys/test/first"),
+                integer_scalar("scalar.second", "/sys/test/second"),
+            ],
+            "boot-a",
+        );
+
+        assert!(matches!(
+            actuator.apply_scalars(&[
+                ScalarRequest {
+                    target: scalar_id("scalar.first"),
+                    value: ScalarValue::Integer(20),
+                },
+                ScalarRequest {
+                    target: scalar_id("scalar.second"),
+                    value: ScalarValue::Integer(30),
+                },
+            ]),
+            Err(ActuatorError::Degraded(_))
+        ));
+        assert_eq!(
+            io.writes(),
+            vec![
+                (first_path.clone(), "20".to_owned()),
+                (second_path.clone(), "30".to_owned()),
+                (second_path, "20".to_owned()),
+                (first_path, "10".to_owned()),
+            ]
+        );
+        assert!(store.load().expect("rolled-back journal").is_none());
+    }
+
+    #[test]
+    fn scalar_restore_preserves_an_external_value_and_relinquishes_ownership() {
+        let path = PathBuf::from("/sys/test/scalar");
+        let io = Arc::new(MemorySysfs::with_values([(path.clone(), "10".to_owned())]));
+        let store = Arc::new(MemoryStore::default());
+        let actuator = scalar_actuator(
+            io.clone(),
+            store.clone(),
+            [integer_scalar("scalar.bus", "/sys/test/scalar")],
+            "boot-a",
+        );
+        actuator
+            .apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(20),
+            }])
+            .expect("claim scalar");
+        io.set_value(&path, "30");
+        assert!(matches!(
+            actuator.apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(40),
+            }]),
+            Err(ActuatorError::ScalarOwnershipLost(_))
+        ));
+        let writes = io.writes().len();
+
+        actuator
+            .restore_scalars(&[scalar_id("scalar.bus")])
+            .expect("relinquish externally changed scalar");
+        assert_eq!(
+            actuator
+                .read_scalar(&scalar_id("scalar.bus"))
+                .expect("external scalar"),
+            ScalarValue::Integer(30)
+        );
+        assert_eq!(io.writes().len(), writes);
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn tagged_recovery_manifest_unifies_frequency_and_scalar_resources() {
+        let scalar_path = PathBuf::from("/sys/test/scalar");
+        let io = Arc::new(MemorySysfs::with_values([
+            (PathBuf::from("/sys/test/min"), "1000".to_owned()),
+            (PathBuf::from("/sys/test/max"), "3000".to_owned()),
+            (scalar_path, "10".to_owned()),
+        ]));
+        let store = Arc::new(MemoryStore::default());
+        let registry = TargetRegistry::new([target()])
+            .expect("frequency registry")
+            .with_scalar_targets([integer_scalar("scalar.bus", "/sys/test/scalar")])
+            .expect("combined registry");
+        let first_process =
+            FrequencyActuator::new(io.clone(), store.clone(), registry, "boot-a", "device-a");
+        first_process
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("claim frequency");
+        first_process
+            .apply_scalars(&[ScalarRequest {
+                target: scalar_id("scalar.bus"),
+                value: ScalarValue::Integer(20),
+            }])
+            .expect("claim scalar");
+        let bytes = store.load().expect("load journal").expect("journal bytes");
+        let mut schema_v5 = decode_journal(&bytes).expect("decode current journal");
+        schema_v5.schema_version = SCALAR_JOURNAL_SCHEMA_VERSION;
+        store
+            .store_durable(&encode_journal(&schema_v5).expect("encode schema-v5 journal"))
+            .expect("store schema-v5 journal");
+
+        let manifest = inspect_recovery_journal(store.as_ref())
+            .expect("inspect tagged-resource journal")
+            .expect("tagged recovery manifest");
+        assert_eq!(manifest.schema_version, SCALAR_JOURNAL_SCHEMA_VERSION);
+        assert!(matches!(
+            manifest.resource_targets.as_slice(),
+            [
+                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::SelfDescribing(_)),
+                RecoveryResourceTarget::Scalar(_),
+            ]
+        ));
+        assert_eq!(
+            manifest.scalar_write_paths(),
+            [PathBuf::from("/sys/test/scalar")]
+        );
+        let recovery_registry = manifest
+            .self_describing_registry()
+            .expect("combined self-describing registry");
+        drop(first_process);
+
+        let restarted =
+            FrequencyActuator::new(io, store.clone(), recovery_registry, "boot-a", "device-a");
+        restarted
+            .recover_pending()
+            .expect("recover combined resources");
+        assert_eq!(
+            restarted
+                .read_scalar(&scalar_id("scalar.bus"))
+                .expect("recovered scalar"),
+            ScalarValue::Integer(10)
+        );
+        assert_eq!(
+            restarted.read_limits(&id()).expect("recovered frequency"),
+            limits(1_000, 3_000)
+        );
+        assert!(store.load().expect("journal removed").is_none());
+    }
+
+    #[test]
+    fn schema_v4_frequency_journal_decodes_and_upgrades_to_current() {
+        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
+        let store = Arc::new(MemoryStore::default());
+        actuator(io.clone(), store.clone(), "boot-a", "device-a")
+            .apply_batch(&[FrequencyRequest {
+                target: id(),
+                limits: limits(2_000, 3_000),
+            }])
+            .expect("seed current frequency journal");
+        let bytes = store.load().expect("load journal").expect("journal bytes");
+        let mut v4 = decode_journal(&bytes).expect("decode current journal");
+        v4.schema_version = RELEASE_JOURNAL_SCHEMA_VERSION;
+        use_legacy_frequency_manifests(&mut v4);
+        let v4_bytes = encode_journal(&v4).expect("encode v4 journal");
+        store.store_durable(&v4_bytes).expect("store v4 journal");
+
+        let manifest = inspect_recovery_journal(store.as_ref())
+            .expect("decode v4 journal")
+            .expect("v4 manifest");
+        assert_eq!(manifest.schema_version, RELEASE_JOURNAL_SCHEMA_VERSION);
+        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
+        restarted.recover_pending().expect("upgrade and recover v4");
+        assert!(store.load().expect("journal removed").is_none());
     }
 
     #[test]
@@ -4256,6 +6278,7 @@ mod tests {
         legacy.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
         for entry in legacy.entries.values_mut() {
             entry.manifest = None;
+            entry.resource_manifest = None;
             entry.legal_pairs = None;
         }
         store
@@ -4286,7 +6309,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_schema_v1_limits_are_never_persisted_as_v4() {
+    fn invalid_schema_v1_limits_are_never_persisted_as_current() {
         let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
         let store = Arc::new(MemoryStore::default());
         actuator(io.clone(), store.clone(), "boot-a", "device-a")
@@ -4301,6 +6324,7 @@ mod tests {
         legacy.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
         for entry in legacy.entries.values_mut() {
             entry.manifest = None;
+            entry.resource_manifest = None;
             entry.legal_pairs = None;
             entry.desired = limits(4_000, 4_000);
             entry.applied = limits(4_000, 4_000);
@@ -4337,6 +6361,7 @@ mod tests {
         let bytes = store.load().expect("load journal").expect("journal bytes");
         let mut legacy = decode_journal(&bytes).expect("decode current journal");
         legacy.schema_version = OWNERSHIP_JOURNAL_SCHEMA_VERSION;
+        use_legacy_frequency_manifests(&mut legacy);
         legacy
             .entries
             .get_mut(&id())
@@ -4367,15 +6392,18 @@ mod tests {
             .expect("apply");
         let bytes = store.load().expect("load journal").expect("journal bytes");
         let mut journal = decode_journal(&bytes).expect("decode journal");
-        journal
+        let resource_manifest = journal
             .entries
             .values_mut()
             .next()
             .expect("frequency entry")
-            .manifest
+            .resource_manifest
             .as_mut()
-            .expect("recovery manifest")
-            .min_path = PathBuf::from("/sys/other/min");
+            .expect("recovery manifest");
+        let super::RecoveryResourceManifest::FrequencyPair(manifest) = resource_manifest else {
+            panic!("frequency recovery manifest");
+        };
+        manifest.min_path = PathBuf::from("/sys/other/min");
         store
             .store_durable(&encode_journal(&journal).expect("encode inconsistent journal"))
             .expect("store inconsistent journal");
@@ -4536,6 +6564,135 @@ mod tests {
     }
 
     #[test]
+    fn fifo_priority_is_journaled_and_restored_after_restart() {
+        let store = Arc::new(MemoryStore::default());
+        let proc_reader = Arc::new(FakeProc::default());
+        let controller = Arc::new(FaultingProcessController::default());
+        let identity = process_identity(41, 10);
+        let original = scheduling(0);
+        let desired = fifo_scheduling(-5, 20);
+        insert_process(&proc_reader, identity);
+        controller.insert(identity.pid, original.clone());
+        control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader.clone()),
+            Some(controller.clone()),
+            None,
+        )
+        .apply_tasks(&[TaskRequest {
+            identity,
+            desired: desired.clone(),
+        }])
+        .expect("apply FIFO task");
+
+        assert_eq!(
+            controller
+                .read_scheduling(identity.pid)
+                .expect("read FIFO state"),
+            desired
+        );
+        let bytes = store.load().expect("load journal").expect("task journal");
+        let journal = decode_journal(&bytes).expect("decode task journal");
+        assert_eq!(journal.schema_version, JOURNAL_SCHEMA_VERSION);
+        assert_eq!(
+            journal.tasks[&super::task_journal_key(identity)]
+                .applied
+                .rt_priority,
+            Some(20)
+        );
+
+        control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader),
+            Some(controller.clone()),
+            None,
+        )
+        .recover_pending()
+        .expect("recover FIFO task after restart");
+        assert_eq!(
+            controller
+                .read_scheduling(identity.pid)
+                .expect("read restored task"),
+            original
+        );
+        assert!(store.load().expect("cleared task journal").is_none());
+    }
+
+    #[test]
+    fn schema_v5_task_without_priority_field_remains_decodable() {
+        let store = Arc::new(MemoryStore::default());
+        let proc_reader = Arc::new(FakeProc::default());
+        let controller = Arc::new(FaultingProcessController::default());
+        let identity = process_identity(41, 10);
+        let original = scheduling(0);
+        insert_process(&proc_reader, identity);
+        controller.insert(identity.pid, original.clone());
+        control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader.clone()),
+            Some(controller.clone()),
+            None,
+        )
+        .apply_tasks(&[TaskRequest {
+            identity,
+            desired: scheduling(-5),
+        }])
+        .expect("create task journal");
+
+        let current = decode_journal(&store.load().expect("load journal").expect("journal bytes"))
+            .expect("decode current journal");
+        let mut value = serde_json::to_value(current).expect("serialize journal value");
+        value["schema_version"] = serde_json::json!(SCALAR_JOURNAL_SCHEMA_VERSION);
+        let tasks = value["tasks"].as_object_mut().expect("task journal object");
+        for entry in tasks.values_mut() {
+            for field in ["original", "desired", "applied"] {
+                entry[field]
+                    .as_object_mut()
+                    .expect("scheduler state object")
+                    .remove("rt_priority");
+            }
+        }
+        let payload = serde_json::to_vec(&value).expect("serialize schema-v5 payload");
+        let envelope = JournalEnvelope {
+            checksum: super::crc32(&payload),
+            payload,
+        };
+        let encoded = serde_json::to_vec(&envelope).expect("serialize schema-v5 envelope");
+        let decoded = decode_journal(&encoded).expect("decode schema-v5 task journal");
+        assert_eq!(decoded.schema_version, SCALAR_JOURNAL_SCHEMA_VERSION);
+        assert!(
+            decoded
+                .tasks
+                .values()
+                .all(|entry| entry.original.rt_priority.is_none()
+                    && entry.desired.rt_priority.is_none()
+                    && entry.applied.rt_priority.is_none())
+        );
+        store
+            .store_durable(&encoded)
+            .expect("store schema-v5 task journal");
+
+        control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader),
+            Some(controller.clone()),
+            None,
+        )
+        .recover_pending()
+        .expect("upgrade and restore schema-v5 task");
+        assert_eq!(
+            controller
+                .read_scheduling(identity.pid)
+                .expect("restored task"),
+            original
+        );
+    }
+
+    #[test]
     fn unchanged_task_and_unit_requests_claim_no_ownership() {
         let task_store = Arc::new(MemoryStore::default());
         let proc_reader = Arc::new(FakeProc::default());
@@ -4638,6 +6795,50 @@ mod tests {
         assert_eq!(restored.affinity, original.affinity);
         assert_eq!(restored.nice, 7);
         assert_eq!(restored.policy, SchedulingClass::Batch);
+        assert!(store.load().expect("cleared journal").is_none());
+    }
+
+    #[test]
+    fn fifo_policy_and_priority_relinquish_as_one_owned_field() {
+        let store = Arc::new(MemoryStore::default());
+        let proc_reader = Arc::new(FakeProc::default());
+        let controller = Arc::new(FaultingProcessController::default());
+        let identity = process_identity(41, 10);
+        insert_process(&proc_reader, identity);
+        controller.insert(identity.pid, scheduling(0));
+        let actuator = control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader),
+            Some(controller.clone()),
+            None,
+        );
+        actuator
+            .apply_tasks(&[TaskRequest {
+                identity,
+                desired: fifo_scheduling(0, 10),
+            }])
+            .expect("claim FIFO tuple");
+
+        let administrator = fifo_scheduling(0, 15);
+        controller.set_admin(identity.pid, administrator.clone());
+        let outcome = actuator
+            .apply_tasks(&[TaskRequest {
+                identity,
+                desired: fifo_scheduling(0, 20),
+            }])
+            .expect("relinquish externally changed FIFO tuple");
+        assert_eq!(outcome.applied[&identity], administrator);
+
+        actuator
+            .restore_tasks(&[identity])
+            .expect("clear relinquished FIFO tuple");
+        assert_eq!(
+            controller
+                .read_scheduling(identity.pid)
+                .expect("administrator FIFO tuple"),
+            administrator
+        );
         assert!(store.load().expect("cleared journal").is_none());
     }
 
@@ -4747,6 +6948,59 @@ mod tests {
             actuator.mode().expect("mode"),
             ActuatorMode::ReadWrite
         ));
+    }
+
+    #[test]
+    fn fifo_batch_failure_rolls_back_exact_original_priority() {
+        let store = Arc::new(MemoryStore::default());
+        let proc_reader = Arc::new(FakeProc::default());
+        let controller = Arc::new(FaultingProcessController::default());
+        let first = process_identity(41, 10);
+        let second = process_identity(42, 20);
+        // Existing external priorities above our configurable hard cap still
+        // have to be read and restored exactly; they are never generated by a
+        // uperf task plan.
+        let first_original = fifo_scheduling(0, 98);
+        let second_original = scheduling(1);
+        insert_process(&proc_reader, first);
+        insert_process(&proc_reader, second);
+        controller.insert(first.pid, first_original.clone());
+        controller.insert(second.pid, second_original.clone());
+        controller.fail_on(2);
+        let actuator = control_actuator(
+            store,
+            "boot-a",
+            Some(proc_reader),
+            Some(controller.clone()),
+            None,
+        );
+
+        let error = actuator
+            .apply_tasks(&[
+                TaskRequest {
+                    identity: first,
+                    desired: fifo_scheduling(-5, 20),
+                },
+                TaskRequest {
+                    identity: second,
+                    desired: fifo_scheduling(-4, 10),
+                },
+            ])
+            .expect_err("second task write must fail");
+
+        assert!(matches!(error, ActuatorError::Transaction { .. }));
+        assert_eq!(
+            controller
+                .read_scheduling(first.pid)
+                .expect("first exact FIFO rollback"),
+            first_original
+        );
+        assert_eq!(
+            controller
+                .read_scheduling(second.pid)
+                .expect("second exact rollback"),
+            second_original
+        );
     }
 
     #[test]

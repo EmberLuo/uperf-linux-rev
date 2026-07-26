@@ -20,6 +20,11 @@
           "margin": 0.15,
           "burst": 0.06
         },
+        "junk": {
+          "margin": 0.2,
+          "burst": 0.1,
+          "limit_efficiency": false
+        },
         "wake": {
           "margin": 0.15,
           "burst": 0.08
@@ -43,6 +48,11 @@
         "gesture": {
           "margin": 0.25,
           "burst": 0.16
+        },
+        "junk": {
+          "margin": 0.35,
+          "burst": 0.25,
+          "limit_efficiency": false
         },
         "switch": {
           "margin": 0.25,
@@ -79,6 +89,10 @@
           "margin": 0.35,
           "burst": 0.25
         },
+        "junk": {
+          "margin": 0.45,
+          "burst": 0.35
+        },
         "switch": {
           "margin": 0.35,
           "burst": 0.25
@@ -94,6 +108,18 @@
       }
     }
   ],
+  "governor": {
+    "rollout": "legacy",
+    "active_sample_ms": 20,
+    "idle_sample_ms": 80,
+    "active_load_threshold": 0.3,
+    "idle_load_threshold": 0.15,
+    "ema_time_constant_ms": 40,
+    "predict_threshold": 0.15,
+    "prediction_gain": 1.0,
+    "ramp_latency_ms": 100,
+    "min_opp_residency_ms": 10
+  },
   "load": {
     "enabled": true,
     "sample_interval_ms": 250,
@@ -116,6 +142,11 @@
   },
   "scheduler": {
     "enabled": true,
+    "realtime": {
+      "enabled": false,
+      "max_priority": 20,
+      "housekeeping_cpus": []
+    },
     "task_profiles": [
       {
         "id": "background",
@@ -151,6 +182,18 @@
         "id": "foreground",
         "plan": {
           "uclamp_min": 205
+        },
+        "scenes": {
+          "idle": {
+            "uclamp_min": 128
+          },
+          "touch": {
+            "uclamp_min": 384
+          },
+          "boost": {
+            "nice": -5,
+            "uclamp_min": 512
+          }
         }
       }
     ],
@@ -182,5 +225,9 @@
         { "comm_regex": "^kwin_wayland$" }
       ]
     }
+  },
+  "session": {
+    "display_blanked_profile": "powersave",
+    "locked_profile": "powersave"
   }
 }

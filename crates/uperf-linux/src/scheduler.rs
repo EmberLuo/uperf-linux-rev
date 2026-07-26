@@ -4,7 +4,7 @@
 //! `rustix`. Linux does not currently expose `sched_setscheduler(2)` or
 //! `sched_setattr(2)` through `rustix`, so policy and uclamp changes are
 //! delegated to root-owned util-linux tools and always verified from
-//! `/proc/<tid>/sched`.
+//! `/proc/<tid>/sched` and `/proc/<tid>/stat`.
 
 use std::{
     fmt, fs, io,
@@ -28,6 +28,7 @@ use uperf_platform::{
 const PROC_ROOT: &str = "/proc";
 const ONLINE_CPUS: &str = "/sys/devices/system/cpu/online";
 const UCLAMP_MAX: u16 = 1024;
+const LINUX_RT_PRIORITY_MAX: u8 = 99;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(1);
 const TOOL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -35,11 +36,16 @@ trait SchedulingApi: Send + Sync {
     fn read(&self, process: ProcessId) -> PlatformResult<ProcessSchedulingState>;
     fn set_affinity(&self, process: ProcessId, affinity: &CpuSet) -> PlatformResult<()>;
     fn set_nice(&self, process: ProcessId, nice: i8) -> PlatformResult<()>;
-    fn set_policy(&self, process: ProcessId, policy: SchedulingClass) -> PlatformResult<()>;
+    fn set_policy(
+        &self,
+        process: ProcessId,
+        policy: SchedulingClass,
+        rt_priority: Option<u8>,
+    ) -> PlatformResult<()>;
     fn set_uclamp(&self, process: ProcessId, minimum: u16, maximum: u16) -> PlatformResult<()>;
 }
 
-/// Linux implementation of typed, non-real-time process scheduling controls.
+/// Linux implementation of typed process scheduling controls.
 ///
 /// A `ProcessId` may denote either a PID or a TID on Linux. Callers which need
 /// PID-reuse resistance must validate the corresponding `ProcessIdentity`
@@ -143,6 +149,11 @@ impl LinuxProcessController {
                 format!("nice value {} is outside -20..=19", desired.nice),
             ));
         }
+        validate_policy_priority(
+            Path::new("/proc/<tid>/sched"),
+            desired.policy,
+            desired.rt_priority,
+        )?;
         validate_uclamp(desired.uclamp_min, desired.uclamp_max)?;
         if (desired.uclamp_min.is_some() || desired.uclamp_max.is_some())
             && (original.uclamp_min.is_none() || original.uclamp_max.is_none())
@@ -168,7 +179,9 @@ impl LinuxProcessController {
             failures.push(format!("uclamp: {error}"));
         }
         if applied.contains(&AppliedChange::Policy)
-            && let Err(error) = self.api.set_policy(process, original.policy)
+            && let Err(error) = self
+                .api
+                .set_policy(process, original.policy, original.rt_priority)
         {
             failures.push(format!("policy: {error}"));
         }
@@ -233,8 +246,11 @@ impl ProcessController for LinuxProcessController {
             }
             applied.push(AppliedChange::Nice);
         }
-        if desired.policy != original.policy {
-            if let Err(error) = self.api.set_policy(process, desired.policy) {
+        if desired.policy != original.policy || desired.rt_priority != original.rt_priority {
+            if let Err(error) = self
+                .api
+                .set_policy(process, desired.policy, desired.rt_priority)
+            {
                 return Err(self.fail_with_rollback(process, &original, &applied, error));
             }
             applied.push(AppliedChange::Policy);
@@ -289,6 +305,7 @@ fn matches_desired(actual: &ProcessSchedulingState, desired: &ProcessSchedulingS
     actual.affinity == desired.affinity
         && actual.nice == desired.nice
         && actual.policy == desired.policy
+        && actual.rt_priority == desired.rt_priority
         && desired
             .uclamp_min
             .is_none_or(|minimum| actual.uclamp_min == Some(minimum))
@@ -336,10 +353,24 @@ impl SchedulingApi for RealSchedulingApi {
         let contents =
             fs::read_to_string(&path).map_err(|error| map_process_io("read", &path, error))?;
         let parsed = parse_scheduler_file(&path, &contents)?;
+        let stat_path = scheduler_stat_path(&self.proc_root, process);
+        let stat_contents = fs::read_to_string(&stat_path)
+            .map_err(|error| map_process_io("read", &stat_path, error))?;
+        let stat = parse_scheduler_stat(&stat_path, &stat_contents)?;
+        if parsed.policy != stat.policy {
+            return Err(PlatformError::invalid(
+                &stat_path,
+                format!(
+                    "scheduler policy changed during read: sched reported {:?}, stat reported {:?}",
+                    parsed.policy, stat.policy
+                ),
+            ));
+        }
         Ok(ProcessSchedulingState {
             affinity,
             nice,
-            policy: parsed.policy,
+            policy: stat.policy,
+            rt_priority: stat.rt_priority,
             uclamp_min: parsed.uclamp_min,
             uclamp_max: parsed.uclamp_max,
         })
@@ -368,26 +399,22 @@ impl SchedulingApi for RealSchedulingApi {
         })
     }
 
-    fn set_policy(&self, process: ProcessId, policy: SchedulingClass) -> PlatformResult<()> {
+    fn set_policy(
+        &self,
+        process: ProcessId,
+        policy: SchedulingClass,
+        rt_priority: Option<u8>,
+    ) -> PlatformResult<()> {
         let Some(tool) = &self.chrt else {
             return Err(PlatformError::Unsupported(
                 "trusted /usr/bin/chrt is unavailable",
             ));
         };
-        let policy = match policy {
-            SchedulingClass::Other => "--other",
-            SchedulingClass::Batch => "--batch",
-            SchedulingClass::Idle => "--idle",
-        };
+        let resource = scheduling_path(&self.proc_root, process);
         run_util_linux(
             tool,
-            &[
-                policy.to_owned(),
-                "--pid".to_owned(),
-                "0".to_owned(),
-                process.0.to_string(),
-            ],
-            &scheduling_path(&self.proc_root, process),
+            &chrt_arguments(&resource, process, policy, rt_priority)?,
+            &resource,
         )
     }
 
@@ -403,6 +430,30 @@ impl SchedulingApi for RealSchedulingApi {
             &scheduling_path(&self.proc_root, process),
         )
     }
+}
+
+fn chrt_arguments(
+    resource: &Path,
+    process: ProcessId,
+    policy: SchedulingClass,
+    rt_priority: Option<u8>,
+) -> PlatformResult<[String; 4]> {
+    validate_policy_priority(resource, policy, rt_priority)?;
+    let (flag, priority) = match policy {
+        SchedulingClass::Other => ("--other", 0),
+        SchedulingClass::Batch => ("--batch", 0),
+        SchedulingClass::Idle => ("--idle", 0),
+        SchedulingClass::Fifo => (
+            "--fifo",
+            rt_priority.expect("validated FIFO priority is present"),
+        ),
+    };
+    Ok([
+        flag.to_owned(),
+        "--pid".to_owned(),
+        priority.to_string(),
+        process.0.to_string(),
+    ])
 }
 
 fn uclampset_arguments(process: ProcessId, minimum: u16, maximum: u16) -> [String; 6] {
@@ -496,6 +547,12 @@ struct ParsedScheduler {
     uclamp_max: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedSchedulerStat {
+    policy: SchedulingClass,
+    rt_priority: Option<u8>,
+}
+
 fn parse_scheduler_file(path: &Path, contents: &str) -> PlatformResult<ParsedScheduler> {
     let mut policy = None;
     let mut uclamp_min = None;
@@ -513,23 +570,7 @@ fn parse_scheduler_file(path: &Path, contents: &str) -> PlatformResult<ParsedSch
                 let raw = value.parse::<u32>().map_err(|error| {
                     PlatformError::invalid(path, format!("invalid scheduler policy: {error}"))
                 })?;
-                let base = raw & !0x4000_0000;
-                policy = Some(match base {
-                    0 => SchedulingClass::Other,
-                    3 => SchedulingClass::Batch,
-                    5 => SchedulingClass::Idle,
-                    1 | 2 | 6 | 7 => {
-                        return Err(PlatformError::Unsupported(
-                            "real-time, deadline, and sched_ext tasks are outside v1 control",
-                        ));
-                    }
-                    _ => {
-                        return Err(PlatformError::invalid(
-                            path,
-                            format!("unknown Linux scheduler policy {base}"),
-                        ));
-                    }
-                });
+                policy = Some(scheduling_class_from_linux(path, raw)?);
             }
             "uclamp.min" => uclamp_min = Some(parse_uclamp_value(path, "uclamp.min", value)?),
             "uclamp.max" => uclamp_max = Some(parse_uclamp_value(path, "uclamp.max", value)?),
@@ -543,6 +584,98 @@ fn parse_scheduler_file(path: &Path, contents: &str) -> PlatformResult<ParsedSch
         uclamp_min,
         uclamp_max,
     })
+}
+
+fn parse_scheduler_stat(path: &Path, contents: &str) -> PlatformResult<ParsedSchedulerStat> {
+    // `comm` is parenthesized and may itself contain spaces or `)`.  No field
+    // after comm contains `)`, so the final delimiter is unambiguous.
+    let comm_end = contents.rfind(") ").ok_or_else(|| {
+        PlatformError::invalid(path, "missing closing process name in stat record")
+    })?;
+    let fields = contents[comm_end + 2..]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    // `fields[0]` is stat field 3. rt_priority and policy are fields 40/41.
+    let raw_priority = fields
+        .get(37)
+        .ok_or_else(|| PlatformError::invalid(path, "stat record is missing rt_priority"))?
+        .parse::<u32>()
+        .map_err(|error| PlatformError::invalid(path, format!("invalid rt_priority: {error}")))?;
+    let raw_policy = fields
+        .get(38)
+        .ok_or_else(|| PlatformError::invalid(path, "stat record is missing policy"))?
+        .parse::<u32>()
+        .map_err(|error| PlatformError::invalid(path, format!("invalid policy: {error}")))?;
+    let policy = scheduling_class_from_linux(path, raw_policy)?;
+    let rt_priority = match policy {
+        SchedulingClass::Fifo => Some(u8::try_from(raw_priority).map_err(|error| {
+            PlatformError::invalid(
+                path,
+                format!("FIFO priority {raw_priority} cannot be represented: {error}"),
+            )
+        })?),
+        SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle => {
+            if raw_priority != 0 {
+                return Err(PlatformError::invalid(
+                    path,
+                    format!("non-real-time policy {policy:?} reported rt_priority {raw_priority}"),
+                ));
+            }
+            None
+        }
+    };
+    validate_policy_priority(path, policy, rt_priority)?;
+    Ok(ParsedSchedulerStat {
+        policy,
+        rt_priority,
+    })
+}
+
+fn scheduling_class_from_linux(path: &Path, raw: u32) -> PlatformResult<SchedulingClass> {
+    let base = raw & !0x4000_0000;
+    match base {
+        0 => Ok(SchedulingClass::Other),
+        1 => Ok(SchedulingClass::Fifo),
+        3 => Ok(SchedulingClass::Batch),
+        5 => Ok(SchedulingClass::Idle),
+        2 | 6 | 7 => Err(PlatformError::Unsupported(
+            "SCHED_RR, deadline, and sched_ext tasks are outside controlled scheduling classes",
+        )),
+        _ => Err(PlatformError::invalid(
+            path,
+            format!("unknown Linux scheduler policy {base}"),
+        )),
+    }
+}
+
+fn validate_policy_priority(
+    path: &Path,
+    policy: SchedulingClass,
+    rt_priority: Option<u8>,
+) -> PlatformResult<()> {
+    match (policy, rt_priority) {
+        (SchedulingClass::Fifo, Some(priority))
+            if (1..=LINUX_RT_PRIORITY_MAX).contains(&priority) =>
+        {
+            Ok(())
+        }
+        (SchedulingClass::Fifo, Some(priority)) => Err(PlatformError::invalid(
+            path,
+            format!("FIFO priority {priority} is outside 1..={LINUX_RT_PRIORITY_MAX}"),
+        )),
+        (SchedulingClass::Fifo, None) => Err(PlatformError::invalid(
+            path,
+            "SCHED_FIFO requires an explicit real-time priority",
+        )),
+        (
+            SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle,
+            Some(priority),
+        ) => Err(PlatformError::invalid(
+            path,
+            format!("non-real-time policy cannot carry rt_priority {priority}"),
+        )),
+        (SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle, None) => Ok(()),
+    }
 }
 
 fn parse_uclamp_value(path: &Path, field: &str, value: &str) -> PlatformResult<u16> {
@@ -704,6 +837,10 @@ fn scheduling_path(proc_root: &Path, process: ProcessId) -> PathBuf {
     proc_root.join(process.0.to_string()).join("sched")
 }
 
+fn scheduler_stat_path(proc_root: &Path, process: ProcessId) -> PathBuf {
+    proc_root.join(process.0.to_string()).join("stat")
+}
+
 fn map_rustix_error(
     operation: &'static str,
     path: &Path,
@@ -782,6 +919,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_exact_fifo_priority_from_proc_stat() {
+        let sched = parse_scheduler_file(
+            Path::new("sched"),
+            "policy : 1\nuclamp.min : 0\nuclamp.max : 1024\n",
+        )
+        .unwrap();
+        assert_eq!(sched.policy, SchedulingClass::Fifo);
+
+        let mut fields = vec!["0"; 39];
+        fields[0] = "S";
+        fields[37] = "12";
+        fields[38] = "1";
+        let contents = format!("42 (render ) worker) {}\n", fields.join(" "));
+
+        let parsed = parse_scheduler_stat(Path::new("stat"), &contents).unwrap();
+
+        assert_eq!(parsed.policy, SchedulingClass::Fifo);
+        assert_eq!(parsed.rt_priority, Some(12));
+    }
+
+    #[test]
     fn uclampset_uses_the_portable_util_linux_cli() {
         assert_eq!(
             uclampset_arguments(ProcessId(42), 205, 512),
@@ -790,11 +948,43 @@ mod tests {
     }
 
     #[test]
-    fn refuses_realtime_and_invalid_uclamp() {
+    fn chrt_uses_an_explicit_fifo_priority() {
+        assert_eq!(
+            chrt_arguments(
+                Path::new("sched"),
+                ProcessId(42),
+                SchedulingClass::Fifo,
+                Some(20),
+            )
+            .unwrap(),
+            ["--fifo", "--pid", "20", "42"].map(str::to_owned)
+        );
+        assert!(
+            chrt_arguments(
+                Path::new("sched"),
+                ProcessId(42),
+                SchedulingClass::Fifo,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            chrt_arguments(
+                Path::new("sched"),
+                ProcessId(42),
+                SchedulingClass::Other,
+                Some(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn refuses_sched_rr_and_invalid_uclamp() {
         assert!(
             parse_scheduler_file(
                 Path::new("sched"),
-                "policy : 1\nuclamp.min : 0\nuclamp.max : 1024\n",
+                "policy : 2\nuclamp.min : 0\nuclamp.max : 1024\n",
             )
             .is_err()
         );
@@ -869,6 +1059,32 @@ mod tests {
     }
 
     #[test]
+    fn fifo_priority_is_verified_and_rolled_back_as_part_of_policy() {
+        let directory = tempdir().unwrap();
+        let online = directory.path().join("online");
+        fs::write(&online, "0-7\n").unwrap();
+        let original = state(&[0, 1], 0, SchedulingClass::Other, Some(0), Some(1024));
+        let api = Arc::new(FakeSchedulingApi::new(original.clone()));
+        let controller = LinuxProcessController::with_api(api.clone(), online);
+        let mut requested = original.clone();
+        requested.policy = SchedulingClass::Fifo;
+        requested.rt_priority = Some(20);
+        requested.uclamp_min = Some(256);
+        *api.fail_on.lock().unwrap() = Some("uclamp");
+
+        assert!(
+            controller
+                .write_scheduling(ProcessId(42), &requested)
+                .is_err()
+        );
+        assert_eq!(*api.state.lock().unwrap(), original);
+        assert_eq!(
+            *api.operations.lock().unwrap(),
+            ["policy", "uclamp", "policy"]
+        );
+    }
+
+    #[test]
     fn rejects_pid_zero_without_touching_kernel() {
         let controller = LinuxProcessController {
             api: Arc::new(FakeSchedulingApi::new(state(
@@ -904,6 +1120,7 @@ mod tests {
             affinity: cpus.iter().copied().map(CpuId).collect(),
             nice,
             policy,
+            rt_priority: None,
             uclamp_min: minimum,
             uclamp_max: maximum,
         }
@@ -953,9 +1170,16 @@ mod tests {
             Ok(())
         }
 
-        fn set_policy(&self, _process: ProcessId, policy: SchedulingClass) -> PlatformResult<()> {
+        fn set_policy(
+            &self,
+            _process: ProcessId,
+            policy: SchedulingClass,
+            rt_priority: Option<u8>,
+        ) -> PlatformResult<()> {
             self.record("policy")?;
-            self.state.lock().unwrap().policy = policy;
+            let mut state = self.state.lock().unwrap();
+            state.policy = policy;
+            state.rt_priority = rt_priority;
             Ok(())
         }
 

@@ -102,6 +102,7 @@ pub fn migrate_c_v1(root: &Value) -> Result<MigrationResult, MigrationError> {
         cpu_groups: BTreeMap::new(),
         cpu_policies,
         devfreq_targets,
+        scalar_targets: Vec::new(),
         thermal_zones: Vec::new(),
     };
     let policy = migrate_policy(object, &mut warnings)?;
@@ -198,6 +199,7 @@ fn migrate_cpu_policies(
             admin_cap_hz: None,
             critical_cap_hz: Some(floor),
             sensor_failure_cap_hz: Some(floor),
+            energy_model: None,
         });
     }
     Ok(policies)
@@ -336,6 +338,8 @@ fn migrate_policy(
                         margin: patch_margin,
                         burst: patch_burst,
                         limit_efficiency: patch_limit,
+                        power_budget: None,
+                        scalar_values: BTreeMap::new(),
                     },
                 );
             }
@@ -351,6 +355,8 @@ fn migrate_policy(
             margin,
             burst,
             limit_efficiency,
+            power_budget: None,
+            scalar_values: BTreeMap::new(),
             scenes,
         });
     }
@@ -405,11 +411,13 @@ fn migrate_policy(
         default_profile: ProfileId::Balance,
         profiles,
         load,
+        governor: crate::GovernorConfig::default(),
         thermal: ThermalPolicyConfig {
             sample_interval_ms: 250,
         },
         input,
         scheduler: SchedulerConfig::default(),
+        session: None,
     })
 }
 

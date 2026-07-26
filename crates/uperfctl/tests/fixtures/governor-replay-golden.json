@@ -1,0 +1,346 @@
+{
+  "format": "uperf-governor-replay-v1",
+  "input_schema_version": 1,
+  "candidate_rollout": "shadow",
+  "steps": [
+    {
+      "index": 0,
+      "timestamp_ms": 0,
+      "profile": "balance",
+      "scene": "idle",
+      "integrate_elapsed_time": false,
+      "thermal_degraded": false,
+      "targets": {
+        "cpu.big": {
+          "raw_load": 0.1,
+          "observed_frequency_hz": 1000,
+          "legacy": {
+            "min": 1000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 1000,
+            "max": 2000
+          },
+          "minimum_delta_hz": 0,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.1,
+            "ema_load": 0.1,
+            "predicted_load": 0.1,
+            "selected_load": 0.1,
+            "effective_demand": 0.19,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 40.0,
+            "requested_floor_hz": 1000,
+            "selected_floor_hz": 1000,
+            "selected_cap_hz": 2000
+          }
+        },
+        "cpu.little": {
+          "raw_load": 0.1,
+          "observed_frequency_hz": 1000,
+          "legacy": {
+            "min": 1000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 1000,
+            "max": 2000
+          },
+          "minimum_delta_hz": 0,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.1,
+            "ema_load": 0.1,
+            "predicted_load": 0.1,
+            "selected_load": 0.1,
+            "effective_demand": 0.19,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 20.0,
+            "requested_floor_hz": 1000,
+            "selected_floor_hz": 1000,
+            "selected_cap_hz": 2000
+          }
+        }
+      },
+      "diagnostics": {
+        "elapsed_ms": 0,
+        "estimated_package_power_mw": 60.0,
+        "bucket_remaining_mj": 60.0,
+        "enforced_package_budget_mw": 1800.0,
+        "bypassed_power_budget": false,
+        "shared_ramp_progress": 0.0
+      }
+    },
+    {
+      "index": 1,
+      "timestamp_ms": 20,
+      "profile": "balance",
+      "scene": "idle",
+      "integrate_elapsed_time": true,
+      "thermal_degraded": false,
+      "targets": {
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 1000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 2000,
+            "max": 2000
+          },
+          "minimum_delta_hz": -1000,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.7,
+            "ema_load": 0.336082,
+            "predicted_load": 1.0,
+            "selected_load": 1.0,
+            "effective_demand": 1.0,
+            "prediction_bypassed_ramp": true,
+            "estimated_power_mw": 280.0,
+            "requested_floor_hz": 2000,
+            "selected_floor_hz": 2000,
+            "selected_cap_hz": 2000
+          }
+        },
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 1000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 2000,
+            "max": 2000
+          },
+          "minimum_delta_hz": -1000,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.8,
+            "ema_load": 0.375429,
+            "predicted_load": 1.0,
+            "selected_load": 1.0,
+            "effective_demand": 1.0,
+            "prediction_bypassed_ramp": true,
+            "estimated_power_mw": 160.0,
+            "requested_floor_hz": 2000,
+            "selected_floor_hz": 2000,
+            "selected_cap_hz": 2000
+          }
+        }
+      },
+      "diagnostics": {
+        "elapsed_ms": 20,
+        "estimated_package_power_mw": 440.0,
+        "bucket_remaining_mj": 60.0,
+        "enforced_package_budget_mw": 1800.0,
+        "bypassed_power_budget": false,
+        "shared_ramp_progress": 1.0
+      }
+    },
+    {
+      "index": 2,
+      "timestamp_ms": 40,
+      "profile": "balance",
+      "scene": "touch",
+      "integrate_elapsed_time": true,
+      "thermal_degraded": false,
+      "targets": {
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 3000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 1000,
+            "max": 2000
+          },
+          "minimum_delta_hz": -2000,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.7,
+            "ema_load": 0.479272,
+            "predicted_load": 0.7,
+            "selected_load": 0.479272,
+            "effective_demand": 0.583418,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 1400.0,
+            "requested_floor_hz": 2000,
+            "selected_floor_hz": 1000,
+            "selected_cap_hz": 2000
+          }
+        },
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 3000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 1000,
+            "max": 2000
+          },
+          "minimum_delta_hz": -2000,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.8,
+            "ema_load": 0.542484,
+            "predicted_load": 0.8,
+            "selected_load": 0.542484,
+            "effective_demand": 0.633988,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 800.0,
+            "requested_floor_hz": 2000,
+            "selected_floor_hz": 1000,
+            "selected_cap_hz": 2000
+          }
+        }
+      },
+      "diagnostics": {
+        "elapsed_ms": 20,
+        "estimated_package_power_mw": 2200.0,
+        "bucket_remaining_mj": 40.0,
+        "enforced_package_budget_mw": 1800.0,
+        "bypassed_power_budget": false,
+        "shared_ramp_progress": 0.0
+      }
+    },
+    {
+      "index": 3,
+      "timestamp_ms": 140,
+      "profile": "balance",
+      "scene": "idle",
+      "integrate_elapsed_time": true,
+      "thermal_degraded": false,
+      "targets": {
+        "cpu.big": {
+          "raw_load": 0.7,
+          "observed_frequency_hz": 3000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 1000,
+            "max": 1000
+          },
+          "minimum_delta_hz": -2000,
+          "maximum_delta_hz": -2000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.7,
+            "ema_load": 0.681882,
+            "predicted_load": 0.7,
+            "selected_load": 0.681882,
+            "effective_demand": 0.713693,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 1400.0,
+            "requested_floor_hz": 1000,
+            "selected_floor_hz": 1000,
+            "selected_cap_hz": 1000
+          }
+        },
+        "cpu.little": {
+          "raw_load": 0.8,
+          "observed_frequency_hz": 3000,
+          "legacy": {
+            "min": 3000,
+            "max": 3000
+          },
+          "candidate": {
+            "min": 2000,
+            "max": 2000
+          },
+          "minimum_delta_hz": -1000,
+          "maximum_delta_hz": -1000,
+          "changed": true,
+          "governor": {
+            "raw_load": 0.8,
+            "ema_load": 0.778862,
+            "predicted_load": 0.8,
+            "selected_load": 0.778862,
+            "effective_demand": 0.800976,
+            "prediction_bypassed_ramp": false,
+            "estimated_power_mw": 800.0,
+            "requested_floor_hz": 2000,
+            "selected_floor_hz": 2000,
+            "selected_cap_hz": 2000
+          }
+        }
+      },
+      "diagnostics": {
+        "elapsed_ms": 100,
+        "estimated_package_power_mw": 2200.0,
+        "bucket_remaining_mj": -60.0,
+        "enforced_package_budget_mw": 1200.0,
+        "bypassed_power_budget": false,
+        "shared_ramp_progress": 1.0
+      }
+    }
+  ],
+  "summary": {
+    "steps": 4,
+    "target_comparisons": 8,
+    "changed_comparisons": 8,
+    "minimum_delta_direction": {
+      "candidate_lower": 6,
+      "equal": 2,
+      "candidate_higher": 0
+    },
+    "maximum_delta_direction": {
+      "candidate_lower": 8,
+      "equal": 0,
+      "candidate_higher": 0
+    },
+    "maximum_absolute_minimum_delta_hz": 2000,
+    "maximum_absolute_maximum_delta_hz": 2000,
+    "targets": {
+      "cpu.big": {
+        "comparisons": 4,
+        "changed_comparisons": 4,
+        "minimum_delta_direction": {
+          "candidate_lower": 3,
+          "equal": 1,
+          "candidate_higher": 0
+        },
+        "maximum_delta_direction": {
+          "candidate_lower": 4,
+          "equal": 0,
+          "candidate_higher": 0
+        },
+        "maximum_absolute_minimum_delta_hz": 2000,
+        "maximum_absolute_maximum_delta_hz": 2000
+      },
+      "cpu.little": {
+        "comparisons": 4,
+        "changed_comparisons": 4,
+        "minimum_delta_direction": {
+          "candidate_lower": 3,
+          "equal": 1,
+          "candidate_higher": 0
+        },
+        "maximum_delta_direction": {
+          "candidate_lower": 4,
+          "equal": 0,
+          "candidate_higher": 0
+        },
+        "maximum_absolute_minimum_delta_hz": 2000,
+        "maximum_absolute_maximum_delta_hz": 1000
+      }
+    }
+  }
+}

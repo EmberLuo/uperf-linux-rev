@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "default_profile": "balance",
+  "profiles": [
+    {
+      "id": "powersave",
+      "margin": 0.05,
+      "burst": 0.0,
+      "limit_efficiency": true,
+      "power_budget": {
+        "slow_limit_power_mw": 900,
+        "fast_limit_power_mw": 1200,
+        "fast_limit_capacity_mj": 50,
+        "fast_limit_recover_scale": 1.0
+      }
+    },
+    {
+      "id": "balance",
+      "margin": 0.1,
+      "burst": 0.0,
+      "limit_efficiency": false,
+      "power_budget": {
+        "slow_limit_power_mw": 1200,
+        "fast_limit_power_mw": 1800,
+        "fast_limit_capacity_mj": 60,
+        "fast_limit_recover_scale": 1.0
+      },
+      "scenes": {
+        "touch": {
+          "margin": 0.2
+        }
+      }
+    },
+    {
+      "id": "performance",
+      "margin": 0.2,
+      "burst": 0.0,
+      "limit_efficiency": false,
+      "power_budget": {
+        "slow_limit_power_mw": 1800,
+        "fast_limit_power_mw": 2600,
+        "fast_limit_capacity_mj": 100,
+        "fast_limit_recover_scale": 1.0
+      }
+    }
+  ],
+  "governor": {
+    "rollout": "legacy",
+    "active_sample_ms": 20,
+    "idle_sample_ms": 80,
+    "active_load_threshold": 0.3,
+    "idle_load_threshold": 0.15,
+    "ema_time_constant_ms": 40,
+    "predict_threshold": 0.15,
+    "prediction_gain": 1.0,
+    "ramp_latency_ms": 100,
+    "min_opp_residency_ms": 10
+  }
+}

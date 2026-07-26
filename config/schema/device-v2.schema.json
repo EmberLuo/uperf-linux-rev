@@ -39,6 +39,14 @@
         }
       ]
     },
+    "scalar_targets": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ScalarTargetConfig"
+      },
+      "maxItems": 256
+    },
     "schema_version": {
       "type": "integer",
       "format": "uint32",
@@ -59,6 +67,74 @@
     "device_id"
   ],
   "$defs": {
+    "CpuEnergyModelConfig": {
+      "description": "Calibrated energy data for one Linux CPU frequency policy.\n\nModels are deliberately attached to a stable `related_cpus` selector rather\nthan to a kernel `policyN` directory.  `ReferenceCurveV1` preserves the\ndocumented Uperf v3 curve semantics; `MeasuredOppV1` is the preferred\nrepresentation once a device has been measured on Linux.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "free_frequency_hz": {
+              "$ref": "#/$defs/Hertz"
+            },
+            "kind": {
+              "type": "string",
+              "const": "reference-curve-v1"
+            },
+            "plain_frequency_hz": {
+              "$ref": "#/$defs/Hertz"
+            },
+            "relative_performance": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "sweet_frequency_hz": {
+              "$ref": "#/$defs/Hertz"
+            },
+            "typical_frequency_hz": {
+              "$ref": "#/$defs/Hertz"
+            },
+            "typical_power_mw_per_core": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "relative_performance",
+            "typical_power_mw_per_core",
+            "typical_frequency_hz",
+            "sweet_frequency_hz",
+            "plain_frequency_hz",
+            "free_frequency_hz"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "measured-opp-v1"
+            },
+            "points": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MeasuredOppConfig"
+              },
+              "maxItems": 256,
+              "minItems": 2
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "points"
+          ]
+        }
+      ]
+    },
     "CpuPolicyConfig": {
       "type": "object",
       "properties": {
@@ -84,6 +160,17 @@
         },
         "efficient_cap_hz": {
           "$ref": "#/$defs/Hertz"
+        },
+        "energy_model": {
+          "description": "Optional calibrated model.  Absence keeps the legacy governor active.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuEnergyModelConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "floor_hz": {
           "$ref": "#/$defs/Hertz"
@@ -232,10 +319,147 @@
       "format": "uint64",
       "minimum": 0
     },
+    "MeasuredOppConfig": {
+      "type": "object",
+      "properties": {
+        "frequency_hz": {
+          "$ref": "#/$defs/Hertz"
+        },
+        "power_mw_per_core": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "relative_capacity": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "frequency_hz",
+        "relative_capacity",
+        "power_mw_per_core"
+      ]
+    },
     "MilliCelsius": {
       "description": "Temperature in thousandths of one degree Celsius.",
       "type": "integer",
       "format": "int64"
+    },
+    "ScalarTargetConfig": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "$ref": "#/$defs/ScalarTargetDomainConfig"
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "path": {
+          "description": "Absolute logical sysfs path from a root-owned device profile.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "domain"
+      ]
+    },
+    "ScalarTargetDomainConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integer-range"
+            },
+            "maximum": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "minimum": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "minimum",
+            "maximum"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integer-enum"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "string-enum"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_empty": {
+              "type": "boolean",
+              "default": false
+            },
+            "allowed_cpus": {
+              "$ref": "#/$defs/CpuSet"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cpu-list"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "allowed_cpus"
+          ]
+        }
+      ]
     },
     "ThermalZoneConfig": {
       "type": "object",

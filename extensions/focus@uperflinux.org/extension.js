@@ -31,10 +31,14 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const SERVICE_NAME = 'org.uperflinux.Daemon1';
 const OBJECT_PATH = '/org/uperflinux/Daemon1';
 const INTERFACE_NAME = 'org.uperflinux.Daemon1';
+const DISPLAY_CONFIG_NAME = 'org.gnome.Mutter.DisplayConfig';
+const DISPLAY_CONFIG_PATH = '/org/gnome/Mutter/DisplayConfig';
+const PROPERTIES_INTERFACE = 'org.freedesktop.DBus.Properties';
 
 // The daemon debounces as well. This only collapses a burst of alt-tab
 // notifications into one bus message.
@@ -46,6 +50,11 @@ const CALL_TIMEOUT_MS = 5000;
 const RENEWAL_MS = 5000;
 const RETRY_MINIMUM_MS = 500;
 const RETRY_MAXIMUM_MS = 30000;
+// A 50 ms quiet window is longer than one frame at 30 Hz. The daemon applies
+// its own 200 ms render-idle slack after receiving this observation.
+const RENDER_IDLE_MS = 50;
+const DEADLINE_MISS_RATIO = 1.5;
+const DISPLAY_RENEWAL_MS = 5000;
 
 export default class FocusReporterExtension extends Extension {
     enable() {
@@ -57,11 +66,22 @@ export default class FocusReporterExtension extends Extension {
         this._renewalId = 0;
         this._retryDelay = RETRY_MINIMUM_MS;
         this._daemonPresent = false;
+        this._userSession = this._isUserSession();
         this._desiredKnown = false;
         this._desired = null;
         this._forceUpdate = false;
         this._generation = 0;
         this._call = null;
+        this._frameCalls = new Set();
+        this._renderIdleId = 0;
+        this._rendering = false;
+        this._presentations = new Map();
+        this._displayState = null;
+        this._reportedDisplayState = null;
+        this._displayQuery = null;
+        this._displayRetryId = 0;
+        this._displayRetryDelay = RETRY_MINIMUM_MS;
+        this._displayRenewalId = 0;
         // The PID from the most recent successful D-Bus receipt. A receipt
         // acknowledges asynchronous identity resolution, so periodic renewal
         // also retries a transient post-ack rejection.
@@ -78,6 +98,24 @@ export default class FocusReporterExtension extends Extension {
         // A window closing while focused also emits this with a null focus
         // window, which releases the lease instead of boosting a dead PID.
         this._connect(global.display, 'notify::focus-window', () => this._queueUpdate());
+        this._connect(Main.sessionMode, 'updated', () => this._onSessionModeChanged());
+
+        // These are compositor lifecycle signals, not input-event hooks. They
+        // remain connected in unlock-dialog mode so physical display state can
+        // still be reported, while their handlers suppress application frame
+        // hints outside a user session.
+        this._connect(global.stage, 'before-paint', () => this._onBeforePaint());
+        this._connect(global.stage, 'after-paint', () => this._onAfterPaint());
+        this._connect(global.stage, 'presented', (...args) => this._onPresented(...args));
+
+        this._monitorManager = global.backend?.get_monitor_manager?.() ?? null;
+        if (this._monitorManager) {
+            this._connect(
+                this._monitorManager,
+                'power-save-mode-changed',
+                () => this._queryDisplayPowerState(),
+            );
+        }
         this._queueUpdate();
     }
 
@@ -89,6 +127,9 @@ export default class FocusReporterExtension extends Extension {
         this._generation += 1;
         this._clearSources();
         this._cancelCall();
+        this._cancelDisplayQuery();
+        this._cancelFrameCalls();
+        this._resetRenderState();
         for (const [object, id] of this._signals ?? [])
             object.disconnect(id);
         this._signals = [];
@@ -102,6 +143,13 @@ export default class FocusReporterExtension extends Extension {
         this._reported = null;
         this._desired = null;
         this._desiredKnown = false;
+        this._monitorManager = null;
+        this._displayState = null;
+        this._reportedDisplayState = null;
+        // `unlock-dialog` is intentionally supported so the extension can
+        // observe Mutter's physical-display state while locked. No keyboard
+        // or pointer event signal is installed, and focus is cleared as soon
+        // as the session leaves user mode.
         // A Set may already have reached the daemon even when its callback has
         // not run. Send an uncancelled Clear after cancelling local callbacks.
         // The daemon TTL is the final backstop if the peer cannot complete it.
@@ -114,7 +162,15 @@ export default class FocusReporterExtension extends Extension {
     }
 
     _clearSources() {
-        for (const name of ['_idleId', '_debounceId', '_retryId', '_renewalId'])
+        for (const name of [
+            '_idleId',
+            '_debounceId',
+            '_retryId',
+            '_renewalId',
+            '_renderIdleId',
+            '_displayRetryId',
+            '_displayRenewalId',
+        ])
             this._cancelSource(name);
     }
 
@@ -128,6 +184,17 @@ export default class FocusReporterExtension extends Extension {
     _cancelCall() {
         this._call?.cancellable.cancel();
         this._call = null;
+    }
+
+    _cancelFrameCalls() {
+        for (const call of this._frameCalls ?? [])
+            call.cancellable.cancel();
+        this._frameCalls?.clear();
+    }
+
+    _cancelDisplayQuery() {
+        this._displayQuery?.cancellable.cancel();
+        this._displayQuery = null;
     }
 
     _advanceGeneration() {
@@ -144,6 +211,8 @@ export default class FocusReporterExtension extends Extension {
         this._daemonPresent = true;
         this._retryDelay = RETRY_MINIMUM_MS;
         this._reported = null;
+        this._reportedDisplayState = null;
+        this._displayRetryDelay = RETRY_MINIMUM_MS;
         // A restarted daemon holds no lease. Advance the generation so a late
         // callback from the previous owner cannot overwrite the new state.
         this._advanceGeneration();
@@ -155,7 +224,30 @@ export default class FocusReporterExtension extends Extension {
             return;
         this._daemonPresent = false;
         this._reported = null;
+        this._reportedDisplayState = null;
+        this._cancelDisplayQuery();
+        this._cancelSource('_displayRetryId');
+        this._cancelSource('_displayRenewalId');
+        this._cancelFrameCalls();
         this._advanceGeneration();
+    }
+
+    _isUserSession() {
+        return Main.sessionMode.currentMode === 'user' ||
+            Main.sessionMode.parentMode === 'user';
+    }
+
+    _onSessionModeChanged() {
+        const userSession = this._isUserSession();
+        if (userSession === this._userSession)
+            return;
+        this._userSession = userSession;
+        this._resetRenderState();
+        if (userSession)
+            this._queueUpdate(true);
+        else
+            this._setDesired(null, true);
+        this._queryDisplayPowerState();
     }
 
     // The focused window at notification time is not always the final one, so
@@ -174,6 +266,8 @@ export default class FocusReporterExtension extends Extension {
     }
 
     _focusedPid() {
+        if (!this._userSession)
+            return null;
         const focused = global.display.get_focus_window();
         if (!focused)
             return null;
@@ -237,6 +331,7 @@ export default class FocusReporterExtension extends Extension {
                     return;
                 this._reported = pid;
                 this._scheduleRenewal(generation, pid);
+                this._queryDisplayPowerState();
             },
         );
     }
@@ -253,6 +348,7 @@ export default class FocusReporterExtension extends Extension {
             () => {
                 if (this._desired === null)
                     this._reported = null;
+                this._queryDisplayPowerState();
             },
         );
     }
@@ -323,6 +419,258 @@ export default class FocusReporterExtension extends Extension {
                 this._sendDesired();
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _onBeforePaint() {
+        if (!this._enabled || !this._daemonPresent || !this._userSession ||
+            this._displayState === true)
+            return;
+        if (!this._rendering) {
+            this._rendering = true;
+            this._presentations.clear();
+            this._reportFrameHint('render-started');
+        }
+    }
+
+    _onAfterPaint() {
+        if (!this._rendering)
+            return;
+        this._cancelSource('_renderIdleId');
+        this._renderIdleId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            RENDER_IDLE_MS,
+            () => {
+                this._renderIdleId = 0;
+                if (!this._rendering)
+                    return GLib.SOURCE_REMOVE;
+                this._rendering = false;
+                this._presentations.clear();
+                this._reportFrameHint('render-idle');
+                return GLib.SOURCE_REMOVE;
+            },
+        );
+    }
+
+    _onPresented(...args) {
+        if (!this._rendering || !this._userSession || this._displayState === true)
+            return;
+        const infoIndex = args.findIndex(
+            value => typeof value?.get_presentation_time_us === 'function' ||
+                typeof value?.get_presentation_time === 'function' ||
+                value?.presentation_time !== undefined,
+        );
+        if (infoIndex < 0)
+            return;
+        const frameInfo = args[infoIndex];
+        const view = infoIndex > 0 ? args[infoIndex - 1] : global.stage;
+        let presentationUs;
+        if (typeof frameInfo.get_presentation_time_us === 'function')
+            presentationUs = Number(frameInfo.get_presentation_time_us());
+        else if (frameInfo.presentation_time !== undefined)
+            presentationUs = Number(frameInfo.presentation_time);
+        else
+            presentationUs = Number(frameInfo.get_presentation_time()) / 1000;
+        const refreshRate = Number(
+            typeof frameInfo.get_refresh_rate === 'function'
+                ? frameInfo.get_refresh_rate()
+                : frameInfo.refresh_rate,
+        );
+        if (!Number.isFinite(presentationUs) || presentationUs <= 0 ||
+            !Number.isFinite(refreshRate) || refreshRate <= 0)
+            return;
+
+        const previous = this._presentations.get(view);
+        this._presentations.set(view, presentationUs);
+        if (previous === undefined || presentationUs <= previous)
+            return;
+        const expectedUs = 1_000_000 / refreshRate;
+        if (presentationUs - previous > expectedUs * DEADLINE_MISS_RATIO)
+            this._reportFrameHint('deadline-missed');
+    }
+
+    _resetRenderState() {
+        this._cancelSource('_renderIdleId');
+        this._rendering = false;
+        this._presentations?.clear();
+    }
+
+    _reportFrameHint(event, completed = null) {
+        if (!this._enabled || !this._daemonPresent) {
+            completed?.(false);
+            return;
+        }
+        const cancellable = new Gio.Cancellable();
+        const call = {cancellable};
+        this._frameCalls.add(call);
+        Gio.DBus.system.call(
+            SERVICE_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+            'ReportFrameHint',
+            new GLib.Variant('(s)', [event]),
+            null,
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            cancellable,
+            (connection, result) => {
+                let error = null;
+                try {
+                    connection.call_finish(result);
+                } catch (caught) {
+                    error = caught;
+                }
+                const current = this._frameCalls.delete(call);
+                if (error?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                if (!current || !this._enabled)
+                    return;
+                // Frame hints are a compatible extension: an older daemon may
+                // not expose the method. Render events are therefore best
+                // effort; display state has its own bounded retry below.
+                completed?.(error === null);
+            },
+        );
+    }
+
+    _queryDisplayPowerState() {
+        if (!this._enabled || !this._daemonPresent || !this._monitorManager)
+            return;
+        this._cancelDisplayQuery();
+        const cancellable = new Gio.Cancellable();
+        const query = {cancellable};
+        this._displayQuery = query;
+        Gio.DBus.session.call(
+            DISPLAY_CONFIG_NAME,
+            DISPLAY_CONFIG_PATH,
+            PROPERTIES_INTERFACE,
+            'Get',
+            new GLib.Variant(
+                '(ss)',
+                [DISPLAY_CONFIG_NAME, 'PowerSaveMode'],
+            ),
+            null,
+            Gio.DBusCallFlags.NONE,
+            CALL_TIMEOUT_MS,
+            cancellable,
+            (connection, result) => {
+                let reply = null;
+                let error = null;
+                try {
+                    reply = connection.call_finish(result);
+                } catch (caught) {
+                    error = caught;
+                }
+                const current = this._displayQuery === query;
+                if (current)
+                    this._displayQuery = null;
+                if (error?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                if (!current || !this._enabled || error)
+                    return;
+                const mode = this._unpackInteger(reply);
+                // Mutter's DisplayConfig ABI uses 0 for on, 1..3 for
+                // standby/suspend/off, and -1 when power saving is unsupported.
+                if (mode === 0)
+                    this._setDisplayState(false);
+                else if (mode !== null && mode >= 1 && mode <= 3)
+                    this._setDisplayState(true);
+            },
+        );
+    }
+
+    _unpackInteger(reply) {
+        let value = reply;
+        for (let depth = 0; depth < 6; depth += 1) {
+            if (Array.isArray(value) && value.length === 1) {
+                [value] = value;
+                continue;
+            }
+            if (typeof value?.deep_unpack !== 'function')
+                break;
+            const unpacked = value.deep_unpack();
+            if (unpacked === value)
+                break;
+            value = unpacked;
+        }
+        return Number.isInteger(value) ? value : null;
+    }
+
+    _setDisplayState(blanked) {
+        if (this._displayState === blanked &&
+            this._reportedDisplayState === blanked)
+            return;
+        this._displayState = blanked;
+        this._cancelSource('_displayRetryId');
+        this._displayRetryDelay = RETRY_MINIMUM_MS;
+        if (blanked)
+            this._resetRenderState();
+        else
+            this._cancelSource('_displayRenewalId');
+        this._reportDisplayState();
+    }
+
+    _reportDisplayState(force = false) {
+        const blanked = this._displayState;
+        if (blanked === null ||
+            (!force && this._reportedDisplayState === blanked))
+            return;
+        this._reportFrameHint(
+            blanked ? 'display-blanked' : 'display-unblanked',
+            success => {
+                if (this._displayState !== blanked) {
+                    this._reportDisplayState();
+                    return;
+                }
+                if (!success) {
+                    this._retryDisplayState();
+                    return;
+                }
+                this._reportedDisplayState = blanked;
+                this._displayRetryDelay = RETRY_MINIMUM_MS;
+                this._cancelSource('_displayRetryId');
+                if (blanked)
+                    this._renewBlankedDisplayState();
+                else
+                    this._cancelSource('_displayRenewalId');
+            },
+        );
+    }
+
+    _retryDisplayState() {
+        if (this._displayRetryId || !this._daemonPresent)
+            return;
+        const delay = this._displayRetryDelay;
+        this._displayRetryDelay = Math.min(
+            this._displayRetryDelay * 2,
+            RETRY_MAXIMUM_MS,
+        );
+        this._displayRetryId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            delay,
+            () => {
+                this._displayRetryId = 0;
+                this._reportDisplayState(true);
+                return GLib.SOURCE_REMOVE;
+            },
+        );
+    }
+
+    _renewBlankedDisplayState() {
+        this._cancelSource('_displayRenewalId');
+        if (!this._daemonPresent || this._displayState !== true)
+            return;
+        // Repeating an idempotent blanked event keeps the authenticated
+        // compositor-reporter lease alive through a long lock interval.
+        this._displayRenewalId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            DISPLAY_RENEWAL_MS,
+            () => {
+                this._displayRenewalId = 0;
+                if (this._displayState === true)
+                    this._reportDisplayState(true);
+                return GLib.SOURCE_REMOVE;
+            },
+        );
     }
 
     _bestEffortClear() {

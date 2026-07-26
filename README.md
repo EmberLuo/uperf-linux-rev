@@ -1,14 +1,17 @@
 # uperf-linux-rev
 
 `uperf-linux-rev` is a Rust userspace performance scheduler for Ubuntu/Linux
-ARM64. It observes CPU load, thermal sensors, multitouch input, sleep/wake
-events, and an explicitly registered active workload. It then coordinates
-standard Linux controls: CPU/GPU frequency bounds, affinity, nice, uclamp, and
-owned systemd cgroup properties.
+ARM64. It observes CPU load, thermal sensors, keyboard/mouse/touch input,
+sleep/wake and desktop session state, compositor focus, and authenticated frame
+timing. It then coordinates standard Linux controls: CPU/GPU frequency bounds,
+root-reviewed typed scalar resources, affinity, nice, uclamp, and owned systemd
+cgroup properties.
 
 It does **not** replace CFS/EEVDF or implement an Android framework service.
 The policy loop runs in userspace and leaves final scheduling and thermal
-protection to the Linux kernel.
+protection to the Linux kernel. The reference-compatible energy governor is
+available behind `shadow`/explicit rollout; legacy planning remains the default
+until a particular device completes power and performance certification.
 
 The project is pre-release. An SM8550 device profile is bundled as the first
 certification target; the profile being present is not, by itself, proof that
@@ -27,6 +30,10 @@ Other ARM64 systems may be probed read-only but remain uncertified.
   mode, blocking automatic and manual writes.
 - Hardware limits and thermal constraints override profiles, boosts, and
   manual frequency overrides.
+- Experimental `SCHED_FIFO` plans are disabled by default, capped at priority
+  50, require a non-overlapping housekeeping CPU reservation, and additionally
+  require the inactive packaged systemd drop-in to be installed by an
+  administrator. See [packaging](docs/packaging.md#experimental-fifo-scheduling-opt-in).
 - Runtime state distinguishes what was observed, what policy requested, and
   what was actually applied and read back.
 
@@ -91,6 +98,7 @@ its tests or probe evidence, not a Rust or packaging edit.
 ```bash
 cargo run --locked --package uperf-probe -- --pretty
 cargo run --locked --package uperf-probe -- --device-draft
+cargo run --locked --package uperf-probe -- --energy-draft
 ```
 
 Inspect its CPU policy masks, OPPs, devfreq identities, thermal zone types,
@@ -98,7 +106,10 @@ input capabilities, device-tree compatible values, and warnings before
 selecting a device profile. `--device-draft` prints a strict v2 device
 document to standard output, but deliberately omits trusted thermal zones:
 redirect it to a review file, add only verified sensors and safety limits, and
-validate the complete bundle before installation.
+validate the complete bundle before installation. `--energy-draft` emits the
+live OPP table as a measurement worksheet; inferred capacity and null power
+cells are explicitly marked `requires-calibration` and are never accepted as
+measured data.
 
 ## Build and test
 
@@ -149,9 +160,68 @@ event source. Its output is deliberately not activation-ready: review all
 warnings, add trusted thermal sensors, verify hardware limits, and only install
 the files after the complete directory passes `config validate`.
 
+Uperf Game Turbo v3 power data can be converted without trusting its Android
+mutation rules:
+
+```bash
+uperfctl config import-uperf-v3 reference.json --output-dir imported
+# For an offline fixture or a mounted target:
+uperfctl config import-uperf-v3 reference.json --output-dir imported \
+  --sysfs-root /mnt/target-sys
+# If Linux topology/frequency evidence is unavailable or ambiguous:
+uperfctl config import-uperf-v3 reference.json --output-dir imported \
+  --cluster-cpus 0-2 --cluster-cpus 3-6 --cluster-cpus 7
+```
+
+The importer rejects duplicate JSON object keys, performs exact GHz-to-Hz,
+W-to-mW, and second-to-millisecond conversion, and always selects the shadow
+governor rollout. By default it maps clusters only from local
+`policy*/related_cpus`, matching `powerModel[].nr` and immutable maximum
+frequency rank; it stops and requires explicit mappings when that evidence is
+missing or non-unique. Android `sched.cpumask` values are report-only evidence
+and are never authoritative.
+
+It writes only `device.json`, `policy.json`, and a provenance-rich
+`import-report.json`; Android sysfs paths, package/pinned-process rules, and
+FIFO settings remain disabled report candidates. CPU patches for the v3
+`junk` scene are imported. A source `sched.scene` is audited against the fixed
+Linux scene mapping, while mismatches and unknown scene fields are reported
+instead of being silently discarded. The project does not vendor upstream
+configuration files: importer tests use small, independently authored
+fixtures, and users provide any source document they choose to convert.
+
+Recorded load samples can be replayed through both planners without D-Bus or
+hardware access:
+
+```bash
+uperfctl --json config replay-governor trace.json \
+  --policy policy.json --rollout shadow
+```
+
+Replay schema v1 is intentionally a resolved runtime snapshot. Its `targets`
+array supplies each logical ID, CPU set, `FrequencyPolicy` (including immutable
+hardware limits and the discovered OPP table), and calibrated energy model.
+Each strictly increasing step names a profile and scene and supplies every
+target's normalized `raw_load` and `observed_frequency_hz`; optional
+administrator/thermal cap maps and `thermal_degraded` reproduce safety
+envelopes. Set `integrate_elapsed_time` to `false` across a suspend or another
+known non-running interval. The versioned report contains the legacy and
+candidate limits, signed deltas, EMA/prediction/bucket diagnostics, and global
+plus per-target difference counts. `shadow` is the default; `energy` exercises
+the same pure planner with active-rollout fail-closed behavior.
+See the checked-in
+[`governor-replay-trace.json`](crates/uperfctl/tests/fixtures/governor-replay-trace.json)
+for the complete input contract.
+
 Every configuration document is limited to 1 MiB. Collection sizes are also
 bounded in both semantic validation and the published JSON Schemas so malformed
 or hostile rule sets cannot cause unbounded validation work.
+
+The daemon watches the parent directories of `device.json`, `policy.json`, and
+`apps.json`, so editor saves implemented as atomic renames are observed. Changes
+are debounced for 250 ms and then pass through the same complete validation and
+reload barrier as `ReloadConfig`; a rejected generation is logged and the
+previous generation remains active.
 
 ## Service and clients
 
@@ -194,6 +264,11 @@ desktop-ID matchers are not accepted. The v2 configuration model reserves
 `desktop_id` for a future trusted desktop adapter, but semantic validation
 currently rejects it.
 
+At startup the daemon also performs a read-only scan for
+power-profiles-daemon, tuned, TLP, auto-cpufreq, and system76-power. Running
+processes or enabled units are surfaced as health warnings. This diagnostic
+never stops a service, changes its configuration, or writes a sysfs node.
+
 D-Bus API v1.1 also exposes read-only running-workload discovery. The daemon
 checks broad, case-insensitive game and compatibility-layer patterns such as
 Wine, Proton, Steam and common emulators every five seconds. A match is only a
@@ -210,20 +285,50 @@ focused process with `SetForegroundProcess(pid, reason)` and releases it with
 [extensions/focus@uperflinux.org/](extensions/focus@uperflinux.org/). Focus is a
 workload *source*, never a profile tier: the effective workload is the explicit
 one if present, otherwise the focused one, and only that workload is matched
-against scheduler rules. An accepted report installs an expiring lease that is
-released when the reporter stops renewing it, when its bus peer disappears, or
-when the reported process exits. Reports are authorized like any other workload
-selection — same UID, safe ownership, not a protected process — and are refused
-for callers outside an active local session, so a remote or inactive session
-cannot steer scheduling. Rejection is reported through `uperfctl health` rather
-than as a call error, because a compositor cannot act on the failure. The
-feature is off unless `scheduler.focus.enabled` is true.
+against scheduler rules. The compositor identity has an expiring reporter
+lease distinct from the selected focus workload, so locking can clear the
+application while the same peer continues to report physical display state.
+Both leases are revoked by peer disappearance or expiry; process exit/reuse
+also clears focus. Reports require the same UID, safe process ownership, and an
+active local session, so a remote or inactive session cannot steer scheduling.
+Focus rejection is surfaced through `uperfctl health`, because a compositor
+cannot act on the failure. The feature is off unless
+`scheduler.focus.enabled` is true.
 
 ```bash
 uperfctl foreground set 1234
 uperfctl foreground clear
 uperfctl status            # workload: 1234 (source focus)
 ```
+
+D-Bus API v1.3 adds the unprivileged, read-only
+`GetDecisionTrace(after_id, limit)` timeline. The daemon retains the newest
+1024 completed reconciliations in memory, returns at most 512 per call, and
+uses `decision_id` as an exclusive pagination key. Entries expose logical
+target IDs, desired and verified-applied limits, profile, scene, duration and
+failure summaries, but no sysfs paths or process command lines.
+
+```bash
+uperfctl trace --limit 128
+uperfctl --json trace --after 42 --limit 128
+```
+
+D-Bus API v1.4 adds authenticated `ReportFrameHint` events. The GNOME reporter
+uses Mutter paint and presentation data for render start/idle and deadline
+misses, and reads `org.gnome.Mutter.DisplayConfig.PowerSaveMode` for physical
+blank/unblank. logind `IdleHint` and `LockedHint` remain separate session
+signals and cannot claim a display is off. Deadline misses activate `Junk`
+only inside the current interaction generation; render idle ends only that
+generation's interaction hints after the daemon's 200 ms slack.
+
+D-Bus API v1.5 keeps the v1 trace tuple intact and adds
+`GetDecisionTraceV2(after_id, limit)` plus `GetGovernorStatus()`. Extended
+records freeze the triggering event, governor inputs and budgets when work is
+submitted, then combine them with verified actuator readback and scalar
+values. `uperfctl trace --extended` and `uperfctl governor-status` expose the
+same read-only data. Human-readable extended traces also summarize successful
+CPU writes as nearest-rank p50/p95/p99 trigger-to-verified-apply latencies;
+JSON output retains every raw sample for external analysis.
 
 Debian/Ubuntu releases provide two self-contained alternatives:
 `uperf-linux` is the headless edition, while `uperf-linux-gui` contains the

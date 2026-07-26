@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::{OwnedValue, Type, Value};
@@ -15,7 +15,7 @@ pub struct ApiVersion {
 
 impl ApiVersion {
     /// Contract version implemented by this crate.
-    pub const CURRENT: Self = Self { major: 1, minor: 2 };
+    pub const CURRENT: Self = Self { major: 1, minor: 5 };
 
     /// Whether both endpoints can safely exchange version-1 DTOs.
     #[must_use]
@@ -113,6 +113,60 @@ pub struct WorkloadRequest {
     pub mode: String,
     /// Short audit reason supplied by the client.
     pub reason: String,
+}
+
+/// Authenticated compositor lifecycle hints.
+///
+/// The D-Bus method carries the kebab-case spelling as a string so future
+/// compatible event kinds do not change the wire signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FrameHintEvent {
+    /// Rendering associated with the current interaction has begun.
+    RenderStarted,
+    /// Rendering has become idle; interaction hints may end after a slack
+    /// interval.
+    RenderIdle,
+    /// The compositor missed a presentation deadline.
+    DeadlineMissed,
+    /// The compositor confirms that the physical display is blank.
+    DisplayBlanked,
+    /// The compositor confirms that the physical display is visible again.
+    DisplayUnblanked,
+}
+
+impl FrameHintEvent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RenderStarted => "render-started",
+            Self::RenderIdle => "render-idle",
+            Self::DeadlineMissed => "deadline-missed",
+            Self::DisplayBlanked => "display-blanked",
+            Self::DisplayUnblanked => "display-unblanked",
+        }
+    }
+}
+
+impl FromStr for FrameHintEvent {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "render-started" => Ok(Self::RenderStarted),
+            "render-idle" => Ok(Self::RenderIdle),
+            "deadline-missed" => Ok(Self::DeadlineMissed),
+            "display-blanked" => Ok(Self::DisplayBlanked),
+            "display-unblanked" => Ok(Self::DisplayUnblanked),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for FrameHintEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Read-only scheduler and cgroup state associated with a running workload.
@@ -266,6 +320,127 @@ pub struct CpuLoad {
     pub cpu_id: u32,
     /// Utilization in hundredths of one percent (`0..=10_000`).
     pub utilization_basis_points: u16,
+}
+
+/// Desired or verified-applied frequency limits captured in a decision trace.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct DecisionFrequency {
+    /// Stable target ID from [`Capabilities::targets`].
+    pub target_id: String,
+    /// Lower bound in hertz.
+    pub min_hz: u64,
+    /// Upper bound in hertz.
+    pub max_hz: u64,
+}
+
+/// One bounded, process-local policy/reconciliation timeline entry.
+///
+/// `decision_id` and `reconcile_id` are strictly increasing for the lifetime
+/// of one daemon process. An empty `error` means every attempted domain
+/// completed successfully.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct DecisionTraceEntry {
+    /// Exclusive pagination key and monotonic decision sequence.
+    pub decision_id: u64,
+    /// Monotonic reconciliation sequence.
+    pub reconcile_id: u64,
+    /// Start time from the daemon's monotonic clock, in milliseconds.
+    pub monotonic_ms: u64,
+    /// End-to-end blocking-worker duration in microseconds.
+    pub duration_us: u64,
+    /// Desired-state generation submitted to reconciliation.
+    pub generation: u64,
+    /// Effective profile selected by the policy engine.
+    pub profile: String,
+    /// Dominant scene selected by the policy engine.
+    pub scene: String,
+    /// Whether frequency reconciliation was requested.
+    pub frequency_attempted: bool,
+    /// Whether scheduler reconciliation was requested.
+    pub scheduler_attempted: bool,
+    /// Frequency limits submitted to the reconciler.
+    pub desired_frequencies: Vec<DecisionFrequency>,
+    /// Last verified frequency values returned by the reconciler.
+    pub applied_frequencies: Vec<DecisionFrequency>,
+    /// Whether every attempted reconciliation domain succeeded.
+    pub success: bool,
+    /// Stable human-readable failure summary, empty on success.
+    pub error: String,
+}
+
+/// One governor target captured at policy-evaluation time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct GovernorTargetStatus {
+    pub target_id: String,
+    pub raw_load_basis_points: u16,
+    pub ema_load_basis_points: u16,
+    pub predicted_load_basis_points: u16,
+    pub selected_load_basis_points: u16,
+    pub effective_demand_basis_points: u16,
+    pub prediction_bypassed_ramp: bool,
+    pub estimated_power_mw: u64,
+    pub requested_floor_hz: u64,
+    pub selected_floor_hz: u64,
+    pub selected_cap_hz: u64,
+    /// Stable explanation such as `prediction-bypass` or `demand-floor`.
+    pub opp_reason: String,
+}
+
+/// Integer, string, or CPU-list scalar encoded as canonical JSON.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct DecisionScalar {
+    pub target_id: String,
+    pub value_json: String,
+}
+
+/// Unit-stable snapshot of the stateful governor's diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct GovernorDiagnosticsStatus {
+    pub available: bool,
+    pub elapsed_ms: u64,
+    pub estimated_package_power_mw: u64,
+    pub slow_limit_power_mw: u64,
+    pub fast_limit_power_mw: u64,
+    pub effective_budget_mw: u64,
+    pub bucket_remaining_mj: i64,
+    pub bypassed_power_budget: bool,
+    pub shared_ramp_basis_points: u16,
+    pub targets: Vec<GovernorTargetStatus>,
+}
+
+/// Current policy/governor state without changing any actuator resource.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct GovernorStatus {
+    pub generation: u64,
+    pub rollout: String,
+    pub profile: String,
+    pub scene: String,
+    pub trigger_source: String,
+    pub diagnostics: GovernorDiagnosticsStatus,
+    pub desired_scalars: Vec<DecisionScalar>,
+    pub applied_scalars: Vec<DecisionScalar>,
+}
+
+/// Additive diagnostic trace contract. The embedded v1 record preserves all
+/// original timing, desired/applied frequency, and failure fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(crate = "zbus::zvariant")]
+pub struct DecisionTraceEntryV2 {
+    pub base: DecisionTraceEntry,
+    pub trigger_source: String,
+    /// Reducer acceptance timestamp for the event that produced this job.
+    pub trigger_monotonic_ms: u64,
+    /// Trigger acceptance through verified actuator readback.
+    pub verified_apply_latency_us: u64,
+    pub governor: GovernorDiagnosticsStatus,
+    pub desired_scalars: Vec<DecisionScalar>,
+    pub applied_scalars: Vec<DecisionScalar>,
 }
 
 /// Human-readable mode advertised by the daemon.
@@ -423,7 +598,9 @@ pub struct DiagnosticReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiVersion, AppRule, Capabilities, FrequencyOverride, FrequencyStatus, RunningWorkload,
+        ApiVersion, AppRule, Capabilities, DecisionFrequency, DecisionScalar, DecisionTraceEntry,
+        DecisionTraceEntryV2, FrameHintEvent, FrequencyOverride, FrequencyStatus,
+        GovernorDiagnosticsStatus, GovernorStatus, GovernorTargetStatus, RunningWorkload,
         SchedulerStatus, TargetCapability, WorkloadIdentity, WorkloadRequest,
     };
     use crate::feature;
@@ -452,6 +629,27 @@ mod tests {
         assert_eq!(original, decoded);
         assert!(encoded.contains("\"min_hz\":1001"));
         assert!(!encoded.contains("khz"));
+    }
+
+    #[test]
+    fn frame_hint_names_are_exact_and_round_trip() {
+        for event in [
+            FrameHintEvent::RenderStarted,
+            FrameHintEvent::RenderIdle,
+            FrameHintEvent::DeadlineMissed,
+            FrameHintEvent::DisplayBlanked,
+            FrameHintEvent::DisplayUnblanked,
+        ] {
+            assert_eq!(event.as_str().parse::<FrameHintEvent>(), Ok(event));
+            assert_eq!(
+                serde_json::from_str::<FrameHintEvent>(
+                    &serde_json::to_string(&event).expect("serialize event")
+                )
+                .expect("deserialize event"),
+                event
+            );
+        }
+        assert!("render-idle-ish".parse::<FrameHintEvent>().is_err());
     }
 
     #[test]
@@ -490,6 +688,109 @@ mod tests {
         let (decoded, _) = encoded
             .deserialize::<FrequencyStatus>()
             .expect("deserialize status");
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn decision_trace_round_trips_over_dbus_encoding() {
+        let original = DecisionTraceEntry {
+            decision_id: 7,
+            reconcile_id: 6,
+            monotonic_ms: 123,
+            duration_us: 456,
+            generation: 5,
+            profile: "balance".into(),
+            scene: "touch".into(),
+            frequency_attempted: true,
+            scheduler_attempted: false,
+            desired_frequencies: vec![DecisionFrequency {
+                target_id: "cpu.policy0".into(),
+                min_hz: 400_000_000,
+                max_hz: 1_800_000_000,
+            }],
+            applied_frequencies: vec![DecisionFrequency {
+                target_id: "cpu.policy0".into(),
+                min_hz: 400_000_000,
+                max_hz: 1_800_000_000,
+            }],
+            success: true,
+            error: String::new(),
+        };
+        assert_eq!(
+            DecisionTraceEntry::SIGNATURE.to_string(),
+            "(tttttssbba(stt)a(stt)bs)"
+        );
+        let encoded = to_bytes(Context::new_dbus(LE, 0), &original).expect("serialize trace");
+        let (decoded, _) = encoded
+            .deserialize::<DecisionTraceEntry>()
+            .expect("deserialize trace");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn extended_trace_and_governor_status_round_trip_over_dbus_encoding() {
+        let governor = GovernorDiagnosticsStatus {
+            available: true,
+            elapsed_ms: 20,
+            estimated_package_power_mw: 4_200,
+            slow_limit_power_mw: 4_000,
+            fast_limit_power_mw: 6_000,
+            effective_budget_mw: 6_000,
+            bucket_remaining_mj: -50,
+            bypassed_power_budget: false,
+            shared_ramp_basis_points: 7_500,
+            targets: vec![GovernorTargetStatus {
+                target_id: "cpu.policy0".into(),
+                raw_load_basis_points: 8_000,
+                ema_load_basis_points: 7_000,
+                predicted_load_basis_points: 9_000,
+                selected_load_basis_points: 9_000,
+                effective_demand_basis_points: 9_500,
+                prediction_bypassed_ramp: true,
+                estimated_power_mw: 2_100,
+                requested_floor_hz: 1_800_000_000,
+                selected_floor_hz: 1_800_000_000,
+                selected_cap_hz: 2_400_000_000,
+                opp_reason: "prediction-bypass".into(),
+            }],
+        };
+        let scalar = DecisionScalar {
+            target_id: "scalar.ddr".into(),
+            value_json: r#"{"kind":"integer","value":800}"#.into(),
+        };
+        let trace = DecisionTraceEntryV2 {
+            base: DecisionTraceEntry {
+                decision_id: 8,
+                reconcile_id: 7,
+                ..DecisionTraceEntry::default()
+            },
+            trigger_source: "desktop-input".into(),
+            trigger_monotonic_ms: 100,
+            verified_apply_latency_us: 2_500,
+            governor: governor.clone(),
+            desired_scalars: vec![scalar.clone()],
+            applied_scalars: vec![scalar.clone()],
+        };
+        let encoded = to_bytes(Context::new_dbus(LE, 0), &trace).expect("serialize v2 trace");
+        let (decoded, _) = encoded
+            .deserialize::<DecisionTraceEntryV2>()
+            .expect("deserialize v2 trace");
+        assert_eq!(decoded, trace);
+
+        let status = GovernorStatus {
+            generation: 9,
+            rollout: "shadow".into(),
+            profile: "balance".into(),
+            scene: "touch".into(),
+            trigger_source: "desktop-input".into(),
+            diagnostics: governor,
+            desired_scalars: vec![scalar.clone()],
+            applied_scalars: vec![scalar],
+        };
+        let encoded = to_bytes(Context::new_dbus(LE, 0), &status).expect("serialize governor");
+        let (decoded, _) = encoded
+            .deserialize::<GovernorStatus>()
+            .expect("deserialize governor");
         assert_eq!(decoded, status);
     }
 

@@ -1,17 +1,21 @@
 mod args;
 mod config;
+mod replay;
+mod uperf_v3;
 
 use std::{process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use args::{
-    Bus, Cli, Command, ConfigAction, ForegroundAction, FrequencyAction, ModeAction, WorkloadAction,
+    Bus, Cli, Command, ConfigAction, ForegroundAction, FrequencyAction, ModeAction, TraceOptions,
+    WorkloadAction,
 };
 use serde_json::json;
 use tokio::time::timeout;
 use uperf_api::{
-    Capabilities, DaemonClient, DaemonStatus, DiagnosticReport, FrequencyOverride, FrequencyStatus,
-    HealthStatus, MutationReceipt, ReloadReport, TargetCapability, WorkloadRequest,
+    Capabilities, DaemonClient, DaemonStatus, DecisionTraceEntry, DecisionTraceEntryV2,
+    DiagnosticReport, FrequencyOverride, FrequencyStatus, GovernorStatus, HealthStatus,
+    MutationReceipt, ReloadReport, TargetCapability, WorkloadRequest,
 };
 
 const EXIT_UNHEALTHY: u8 = 2;
@@ -82,6 +86,12 @@ async fn run_remote(client: &DaemonClient, command: &Command, json_output: bool)
             print_health(&health, json_output)?;
             Ok(health.state == "healthy")
         }
+        Command::Trace(options) => run_trace(client, options, json_output).await,
+        Command::GovernorStatus => {
+            let status = client.governor_status().await?;
+            print_governor_status(&status, json_output)?;
+            Ok(true)
+        }
         Command::Mode(action) => run_mode(client, action, json_output).await,
         Command::Workload(action) => run_workload(client, action, json_output).await,
         Command::Foreground(action) => run_foreground(client, action, json_output).await,
@@ -105,6 +115,25 @@ async fn run_remote(client: &DaemonClient, command: &Command, json_output: bool)
             unreachable!("non-remote commands are handled before connecting")
         }
     }
+}
+
+async fn run_trace(
+    client: &DaemonClient,
+    options: &TraceOptions,
+    json_output: bool,
+) -> Result<bool> {
+    if options.extended {
+        let entries = client
+            .decision_trace_v2(options.after_id, options.limit)
+            .await?;
+        print_trace_v2(&entries, json_output)?;
+    } else {
+        let entries = client
+            .decision_trace(options.after_id, options.limit)
+            .await?;
+        print_trace(&entries, json_output)?;
+    }
+    Ok(true)
 }
 
 async fn run_mode(client: &DaemonClient, action: &ModeAction, json_output: bool) -> Result<bool> {
@@ -317,6 +346,55 @@ fn run_config(action: &ConfigAction, json_output: bool) -> Result<ExitCode> {
                 for warning in &migration.warnings {
                     eprintln!("warning: {}: {}", warning.path, warning.message);
                 }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ConfigAction::ImportUperfV3 {
+            input,
+            output_dir,
+            cluster_cpus,
+            sysfs_root,
+            force,
+        } => {
+            let import = uperf_v3::import_path(input, cluster_cpus, sysfs_root)?;
+            let outputs = uperf_v3::write_import(output_dir, &import, *force)?;
+            if json_output {
+                print_json(&json!({
+                    "input": input,
+                    "output_directory": output_dir,
+                    "device": outputs.device,
+                    "policy": outputs.policy,
+                    "report": outputs.report,
+                    "schema_version": uperf_core::CONFIG_SCHEMA_VERSION,
+                    "review_only": true,
+                    "items": import.report.items,
+                    "warnings": import.report.warnings,
+                }))?;
+            } else {
+                println!(
+                    "imported {} -> {} (REVIEW ONLY; not activated)",
+                    input.display(),
+                    output_dir.display()
+                );
+                println!("  {}", outputs.device.display());
+                println!("  {}", outputs.policy.display());
+                println!("  {}", outputs.report.display());
+                for warning in &import.report.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ConfigAction::ReplayGovernor {
+            trace,
+            policy,
+            rollout,
+        } => {
+            let report = replay::replay_path(trace, policy, *rollout)?;
+            if json_output {
+                print_json(&report)?;
+            } else {
+                report.print_human();
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -586,6 +664,170 @@ fn print_diagnostics(report: &DiagnosticReport, json_output: bool) -> Result<()>
     Ok(())
 }
 
+fn print_trace(entries: &[DecisionTraceEntry], json_output: bool) -> Result<()> {
+    if json_output {
+        return print_json(&entries);
+    }
+    if entries.is_empty() {
+        println!("no retained decision trace entries");
+        return Ok(());
+    }
+    for entry in entries {
+        println!(
+            "decision={} reconcile={} at={}ms duration={}us generation={} profile={} scene={} {}",
+            entry.decision_id,
+            entry.reconcile_id,
+            entry.monotonic_ms,
+            entry.duration_us,
+            entry.generation,
+            entry.profile,
+            entry.scene,
+            if entry.success { "ok" } else { "failed" }
+        );
+        for desired in &entry.desired_frequencies {
+            let applied = entry
+                .applied_frequencies
+                .iter()
+                .find(|candidate| candidate.target_id == desired.target_id);
+            if let Some(applied) = applied {
+                println!(
+                    "  {} desired={}..{} Hz applied={}..{} Hz",
+                    desired.target_id,
+                    desired.min_hz,
+                    desired.max_hz,
+                    applied.min_hz,
+                    applied.max_hz
+                );
+            } else {
+                println!(
+                    "  {} desired={}..{} Hz applied=unavailable",
+                    desired.target_id, desired.min_hz, desired.max_hz
+                );
+            }
+        }
+        if !entry.error.is_empty() {
+            println!("  error: {}", entry.error);
+        }
+    }
+    Ok(())
+}
+
+fn print_trace_v2(entries: &[DecisionTraceEntryV2], json_output: bool) -> Result<()> {
+    if json_output {
+        return print_json(&entries);
+    }
+    if entries.is_empty() {
+        println!("no retained decision trace entries");
+        return Ok(());
+    }
+    for entry in entries {
+        print_trace(std::slice::from_ref(&entry.base), false)?;
+        println!(
+            "  trigger={} at={}ms verified-apply-latency={}us",
+            display_or_dash(&entry.trigger_source),
+            entry.trigger_monotonic_ms,
+            entry.verified_apply_latency_us
+        );
+        print_governor_diagnostics(&entry.governor, "  ");
+        for scalar in &entry.desired_scalars {
+            let applied = entry
+                .applied_scalars
+                .iter()
+                .find(|candidate| candidate.target_id == scalar.target_id)
+                .map_or("unavailable", |candidate| candidate.value_json.as_str());
+            println!(
+                "  {} desired={} applied={}",
+                scalar.target_id, scalar.value_json, applied
+            );
+        }
+    }
+    let mut verified_apply_latencies = entries
+        .iter()
+        .filter(|entry| entry.base.frequency_attempted && entry.base.success)
+        .map(|entry| entry.verified_apply_latency_us)
+        .collect::<Vec<_>>();
+    verified_apply_latencies.sort_unstable();
+    if !verified_apply_latencies.is_empty() {
+        println!(
+            "verified CPU apply latency: n={} p50={}us p95={}us p99={}us",
+            verified_apply_latencies.len(),
+            nearest_rank_percentile(&verified_apply_latencies, 50),
+            nearest_rank_percentile(&verified_apply_latencies, 95),
+            nearest_rank_percentile(&verified_apply_latencies, 99)
+        );
+    }
+    Ok(())
+}
+
+fn nearest_rank_percentile(sorted_values: &[u64], percentile: usize) -> u64 {
+    debug_assert!(!sorted_values.is_empty());
+    debug_assert!((1..=100).contains(&percentile));
+    let rank = sorted_values.len().saturating_mul(percentile).div_ceil(100);
+    sorted_values[rank.saturating_sub(1)]
+}
+
+fn print_governor_status(status: &GovernorStatus, json_output: bool) -> Result<()> {
+    if json_output {
+        return print_json(status);
+    }
+    println!(
+        "governor: rollout={} generation={} profile={} scene={} trigger={}",
+        status.rollout,
+        status.generation,
+        status.profile,
+        status.scene,
+        display_or_dash(&status.trigger_source)
+    );
+    print_governor_diagnostics(&status.diagnostics, "");
+    for scalar in &status.desired_scalars {
+        let applied = status
+            .applied_scalars
+            .iter()
+            .find(|candidate| candidate.target_id == scalar.target_id)
+            .map_or("unavailable", |candidate| candidate.value_json.as_str());
+        println!(
+            "scalar {} desired={} applied={}",
+            scalar.target_id, scalar.value_json, applied
+        );
+    }
+    Ok(())
+}
+
+fn print_governor_diagnostics(diagnostics: &uperf_api::GovernorDiagnosticsStatus, prefix: &str) {
+    if !diagnostics.available {
+        println!("{prefix}governor diagnostics unavailable");
+        return;
+    }
+    println!(
+        "{prefix}power={}mW budget={}mW slow={}mW fast={}mW bucket={}mJ \
+         ramp={}bp elapsed={}ms bypass={}",
+        diagnostics.estimated_package_power_mw,
+        diagnostics.effective_budget_mw,
+        diagnostics.slow_limit_power_mw,
+        diagnostics.fast_limit_power_mw,
+        diagnostics.bucket_remaining_mj,
+        diagnostics.shared_ramp_basis_points,
+        diagnostics.elapsed_ms,
+        diagnostics.bypassed_power_budget
+    );
+    for target in &diagnostics.targets {
+        println!(
+            "{prefix}{} raw={}bp ema={}bp predicted={}bp demand={}bp \
+             floor={}Hz selected={}Hz cap={}Hz power={}mW reason={}",
+            target.target_id,
+            target.raw_load_basis_points,
+            target.ema_load_basis_points,
+            target.predicted_load_basis_points,
+            target.effective_demand_basis_points,
+            target.requested_floor_hz,
+            target.selected_floor_hz,
+            target.selected_cap_hz,
+            target.estimated_power_mw,
+            target.opp_reason
+        );
+    }
+}
+
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!(
         "{}",
@@ -700,7 +942,8 @@ fn classify_error(error: &anyhow::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXIT_CONFLICT, EXIT_NOT_AUTHORIZED, classify_error, parse_duration_ms, parse_frequency_hz,
+        EXIT_CONFLICT, EXIT_NOT_AUTHORIZED, classify_error, nearest_rank_percentile,
+        parse_duration_ms, parse_frequency_hz,
     };
 
     #[test]
@@ -734,5 +977,15 @@ mod tests {
             message: "stale".into(),
         });
         assert_eq!(classify_error(&conflict), EXIT_CONFLICT);
+    }
+
+    #[test]
+    fn reports_nearest_rank_latency_percentiles() {
+        let values = (1..=100).collect::<Vec<_>>();
+        assert_eq!(nearest_rank_percentile(&values, 50), 50);
+        assert_eq!(nearest_rank_percentile(&values, 95), 95);
+        assert_eq!(nearest_rank_percentile(&values, 99), 99);
+        assert_eq!(nearest_rank_percentile(&[10, 20, 30], 50), 20);
+        assert_eq!(nearest_rank_percentile(&[10, 20, 30], 95), 30);
     }
 }

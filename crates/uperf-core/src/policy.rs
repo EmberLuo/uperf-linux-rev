@@ -13,7 +13,8 @@ use thiserror::Error;
 use crate::{
     AppsConfig, CpuId, CpuSet, DesiredPlan, FrequencyLimits, Hertz, MilliCelsius, MonotonicMillis,
     ObservedState, PolicyConfig, ProcessIdentity, ProcessInfo, ProfileConfig, TargetId, TaskPlan,
-    ThermalReading, ThermalZoneConfig, Validate, ValidationErrors, WorkloadMatcher,
+    ThermalReading, ThermalZoneConfig, ThreadSelector, Validate, ValidationErrors, WorkloadMatcher,
+    effective_demand, merge_task_plan, resolve_power_budget, transition_governor,
 };
 
 #[derive(
@@ -52,6 +53,7 @@ pub enum Scene {
     Touch,
     Trigger,
     Gesture,
+    Junk,
     Boost,
     Switch,
     Wake,
@@ -66,9 +68,10 @@ impl Scene {
             Self::Touch => 1,
             Self::Trigger => 2,
             Self::Gesture => 3,
-            Self::Switch => 4,
-            Self::Boost => 5,
-            Self::Wake => 6,
+            Self::Junk => 4,
+            Self::Switch => 5,
+            Self::Boost => 6,
+            Self::Wake => 7,
         }
     }
 }
@@ -80,10 +83,46 @@ impl fmt::Display for Scene {
             Self::Touch => "touch",
             Self::Trigger => "trigger",
             Self::Gesture => "gesture",
+            Self::Junk => "junk",
             Self::Boost => "boost",
             Self::Switch => "switch",
             Self::Wake => "wake",
         })
+    }
+}
+
+/// Scheduler-side scene vocabulary.  It is intentionally smaller than the
+/// frequency hint vocabulary so task policies remain reviewable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerScene {
+    Background,
+    Foreground,
+    Idle,
+    Touch,
+    Boost,
+}
+
+impl fmt::Display for SchedulerScene {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Background => "background",
+            Self::Foreground => "foreground",
+            Self::Idle => "idle",
+            Self::Touch => "touch",
+            Self::Boost => "boost",
+        })
+    }
+}
+
+#[must_use]
+pub const fn scheduler_scene_for(scene: Scene) -> SchedulerScene {
+    match scene {
+        Scene::Idle => SchedulerScene::Idle,
+        Scene::Touch | Scene::Trigger | Scene::Gesture | Scene::Junk => SchedulerScene::Touch,
+        Scene::Boost | Scene::Switch | Scene::Wake => SchedulerScene::Boost,
     }
 }
 
@@ -278,6 +317,10 @@ pub enum PolicyError {
     InvalidMatcherRegex(String),
     #[error("configuration is invalid: {0}")]
     InvalidConfiguration(#[from] ValidationErrors),
+    #[error("energy governor failed: {0}")]
+    EnergyGovernor(String),
+    #[error("profile `{0}` has no effective power budget")]
+    MissingPowerBudget(ProfileId),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -298,8 +341,8 @@ impl LoadGovernor {
         validate_non_negative_finite("burst", input.burst)?;
         validate_non_negative_finite("margin", input.margin)?;
 
-        let effective_demand = (input.demand + input.burst).clamp(0.0, 1.0);
-        let requested = hertz_as_f64(policy.reference) * effective_demand * (1.0 + input.margin);
+        let effective_demand = effective_demand(input.demand, input.margin, input.burst);
+        let requested = hertz_as_f64(policy.reference) * effective_demand;
         let requested_min = Hertz(float_to_u64_ceil(requested).max(policy.floor.get()));
         let requested_max = if input.limit_efficiency {
             policy.efficient_cap
@@ -654,10 +697,11 @@ pub fn worst_thermal_state(states: impl IntoIterator<Item = ThermalState>) -> Th
         .unwrap_or(ThermalState::Degraded)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CpuTargetPolicy {
     pub cpus: CpuSet,
     pub frequency: FrequencyPolicy,
+    pub energy_model: Option<crate::EnergyModel>,
 }
 
 pub struct PolicyInput<'a> {
@@ -673,6 +717,15 @@ pub struct PolicyInput<'a> {
     pub administrator_caps: &'a BTreeMap<TargetId, Hertz>,
     pub thermal_caps: &'a BTreeMap<TargetId, Hertz>,
     pub thermal_degraded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatefulPolicyEvaluation {
+    pub desired: DesiredPlan,
+    pub next_governor_state: crate::GovernorState,
+    pub governor_diagnostics: Option<crate::GovernorDiagnostics>,
+    pub shadow_frequencies: Option<BTreeMap<TargetId, FrequencyLimits>>,
+    pub governor_error: Option<String>,
 }
 
 /// Diagnostic rule name reported when the focus default plan is used.
@@ -739,23 +792,50 @@ impl CompiledWorkloadMatcher {
 #[derive(Debug, Clone)]
 struct CompiledSchedulerRule {
     matcher: CompiledWorkloadMatcher,
-    thread_patterns: Vec<Regex>,
+    thread_selectors: Vec<CompiledThreadSelector>,
+}
+
+#[derive(Debug, Clone)]
+enum CompiledThreadSelector {
+    Leader,
+    CommRegex(Regex),
+}
+
+impl CompiledThreadSelector {
+    fn is_match(&self, workload: &ProcessInfo, thread: &ProcessInfo) -> bool {
+        match self {
+            Self::Leader => thread.identity.pid == workload.identity.pid,
+            Self::CommRegex(pattern) => pattern.is_match(&thread.comm),
+        }
+    }
 }
 
 impl CompiledSchedulerRule {
     fn new(rule: &crate::ProcessRuleConfig) -> Result<Self, PolicyError> {
         let matcher = CompiledWorkloadMatcher::new(&rule.matcher)?;
-        let thread_patterns = rule
+        let thread_selectors = rule
             .threads
             .iter()
             .map(|thread| {
-                Regex::new(&thread.comm_regex)
-                    .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string()))
+                match (&thread.selector, &thread.comm_regex) {
+                    (Some(ThreadSelector::Leader), None) => Ok(CompiledThreadSelector::Leader),
+                    (Some(ThreadSelector::CommRegex { pattern }), None) => Regex::new(pattern)
+                        .map(CompiledThreadSelector::CommRegex)
+                        .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string())),
+                    (None, Some(pattern)) => Regex::new(pattern)
+                        .map(CompiledThreadSelector::CommRegex)
+                        .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string())),
+                    // PolicyConfig validation rejects both invalid shapes before
+                    // scheduler compilation reaches this branch.
+                    _ => Err(PolicyError::InvalidMatcherRegex(
+                        "thread selector is missing or ambiguous".to_owned(),
+                    )),
+                }
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
             matcher,
-            thread_patterns,
+            thread_selectors,
         })
     }
 }
@@ -959,7 +1039,117 @@ impl PolicyEngine {
             effective_profile,
             dominant_scene,
             frequencies,
+            scalars: parameters.scalar_values,
             tasks: BTreeMap::new(),
+        })
+    }
+
+    /// Evaluate legacy policy and, when configured, advance the stateful energy
+    /// governor for shadow comparison or hardware application.
+    ///
+    /// Shadow failures are diagnostic-only and never disturb the legacy plan.
+    /// Energy rollout fails closed because cross-file validation promises a
+    /// complete model and budget before it can be selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same legacy policy errors as [`Self::evaluate`], plus a
+    /// governor error for an invalid active energy rollout.
+    pub fn evaluate_stateful(
+        &self,
+        input: &PolicyInput<'_>,
+        governor_state: &crate::GovernorState,
+        integrate_elapsed_time: bool,
+    ) -> Result<StatefulPolicyEvaluation, PolicyError> {
+        let mut desired = self.evaluate(input)?;
+        if self.config.governor.rollout == crate::GovernorRollout::Legacy {
+            return Ok(StatefulPolicyEvaluation {
+                desired,
+                next_governor_state: governor_state.clone(),
+                governor_diagnostics: None,
+                shadow_frequencies: None,
+                governor_error: None,
+            });
+        }
+
+        let profile = self
+            .config
+            .profile(desired.effective_profile)
+            .ok_or(PolicyError::MissingProfile(desired.effective_profile))?;
+        let parameters = effective_parameters(profile, desired.dominant_scene);
+        let Some(power_budget) = parameters.power_budget else {
+            let error = PolicyError::MissingPowerBudget(desired.effective_profile);
+            if self.config.governor.rollout == crate::GovernorRollout::Energy {
+                return Err(error);
+            }
+            return Ok(StatefulPolicyEvaluation {
+                desired,
+                next_governor_state: governor_state.clone(),
+                governor_diagnostics: None,
+                shadow_frequencies: None,
+                governor_error: Some(error.to_string()),
+            });
+        };
+        let raw_loads = input
+            .cpu_targets
+            .iter()
+            .map(|(id, target)| {
+                (
+                    id.clone(),
+                    max_cpu_demand(&target.cpus, &input.observed.cpu_loads),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let observed_frequencies = input
+            .observed
+            .frequencies
+            .iter()
+            .filter_map(|(id, observed)| observed.current.map(|current| (id.clone(), current)))
+            .collect::<BTreeMap<_, _>>();
+        let transition = transition_governor(
+            governor_state,
+            &crate::GovernorInput {
+                timestamp: input.observed.timestamp,
+                targets: input.cpu_targets,
+                raw_loads: &raw_loads,
+                observed_frequencies: &observed_frequencies,
+                administrator_caps: input.administrator_caps,
+                thermal_caps: input.thermal_caps,
+                config: &self.config.governor,
+                power_budget,
+                margin: parameters.margin,
+                burst: parameters.burst,
+                limit_efficiency: parameters.limit_efficiency,
+                integrate_elapsed_time,
+            },
+        );
+        let transition = match transition {
+            Ok(transition) => transition,
+            Err(error) if self.config.governor.rollout == crate::GovernorRollout::Shadow => {
+                return Ok(StatefulPolicyEvaluation {
+                    desired,
+                    next_governor_state: governor_state.clone(),
+                    governor_diagnostics: None,
+                    shadow_frequencies: None,
+                    governor_error: Some(error.to_string()),
+                });
+            }
+            Err(error) => return Err(PolicyError::EnergyGovernor(error.to_string())),
+        };
+        let shadow_frequencies = transition.limits.clone();
+        if self.config.governor.rollout == crate::GovernorRollout::Energy {
+            for (id, limits) in &transition.limits {
+                if !input.manual_overrides.contains_key(id) {
+                    desired.frequencies.insert(id.clone(), *limits);
+                }
+            }
+        }
+        Ok(StatefulPolicyEvaluation {
+            desired,
+            next_governor_state: transition.next_state,
+            governor_diagnostics: Some(transition.diagnostics),
+            shadow_frequencies: Some(shadow_frequencies),
+            governor_error: None,
         })
     }
 
@@ -979,6 +1169,7 @@ impl PolicyEngine {
         workload: &ProcessInfo,
         threads: &[ProcessInfo],
         source: WorkloadSource,
+        scheduler_scene: SchedulerScene,
     ) -> Result<SchedulerDecision, PolicyError> {
         let scheduler = &self.config.scheduler;
         if !scheduler.enabled {
@@ -990,7 +1181,7 @@ impl PolicyEngine {
             .zip(&self.scheduler_rules)
             .find(|(_, compiled)| compiled.matcher.is_match(workload))
         else {
-            return self.focus_default_decision(workload, threads, source);
+            return self.focus_default_decision(workload, threads, source, scheduler_scene);
         };
 
         let mut decision = SchedulerDecision {
@@ -1004,20 +1195,25 @@ impl PolicyEngine {
                 .iter()
                 .find(|profile| profile.id == *profile_id)
                 .ok_or_else(|| PolicyError::MissingTaskProfile(profile_id.clone()))?;
-            decision
-                .tasks
-                .insert(workload.identity, profile.plan.clone());
+            decision.tasks.insert(
+                workload.identity,
+                effective_task_plan(profile, scheduler_scene),
+            );
         }
 
-        for thread in threads {
+        for thread in std::iter::once(workload).chain(
+            threads
+                .iter()
+                .filter(|thread| thread.identity != workload.identity),
+        ) {
             if thread.identity.uid != workload.identity.uid {
                 continue;
             }
             let Some((thread_rule, _)) = rule
                 .threads
                 .iter()
-                .zip(&compiled_rule.thread_patterns)
-                .find(|(_, pattern)| pattern.is_match(&thread.comm))
+                .zip(&compiled_rule.thread_selectors)
+                .find(|(_, selector)| selector.is_match(workload, thread))
             else {
                 continue;
             };
@@ -1026,7 +1222,10 @@ impl PolicyEngine {
                 .iter()
                 .find(|profile| profile.id == thread_rule.task_profile)
                 .ok_or_else(|| PolicyError::MissingTaskProfile(thread_rule.task_profile.clone()))?;
-            decision.tasks.insert(thread.identity, profile.plan.clone());
+            decision.tasks.insert(
+                thread.identity,
+                effective_task_plan(profile, scheduler_scene),
+            );
         }
         Ok(decision)
     }
@@ -1040,6 +1239,7 @@ impl PolicyEngine {
         workload: &ProcessInfo,
         threads: &[ProcessInfo],
         source: WorkloadSource,
+        scheduler_scene: SchedulerScene,
     ) -> Result<SchedulerDecision, PolicyError> {
         let focus = &self.config.scheduler.focus;
         if source != WorkloadSource::Focus || !focus.enabled {
@@ -1056,12 +1256,13 @@ impl PolicyEngine {
             .find(|profile| profile.id == *profile_id)
             .ok_or_else(|| PolicyError::MissingTaskProfile(profile_id.clone()))?;
         let mut tasks = BTreeMap::new();
-        tasks.insert(workload.identity, profile.plan.clone());
+        let plan = effective_task_plan(profile, scheduler_scene);
+        tasks.insert(workload.identity, plan.clone());
         for thread in threads {
             if thread.identity.uid != workload.identity.uid {
                 continue;
             }
-            tasks.insert(thread.identity, profile.plan.clone());
+            tasks.insert(thread.identity, plan.clone());
         }
         Ok(SchedulerDecision {
             tasks,
@@ -1071,15 +1272,31 @@ impl PolicyEngine {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+fn effective_task_plan(
+    profile: &crate::TaskProfileConfig,
+    scheduler_scene: SchedulerScene,
+) -> TaskPlan {
+    profile.scenes.get(&scheduler_scene).map_or_else(
+        || profile.plan.clone(),
+        |patch| merge_task_plan(&profile.plan, patch),
+    )
+}
+
+#[derive(Debug, Clone)]
 struct EffectiveParameters {
     margin: f64,
     burst: f64,
     limit_efficiency: bool,
+    power_budget: Option<crate::PowerBudgetConfig>,
+    scalar_values: BTreeMap<TargetId, crate::ScalarSettingValue>,
 }
 
 fn effective_parameters(profile: &ProfileConfig, scene: Scene) -> EffectiveParameters {
     let patch = profile.scenes.get(&scene);
+    let mut scalar_values = profile.scalar_values.clone();
+    if let Some(patch) = patch {
+        scalar_values.extend(patch.scalar_values.clone());
+    }
     EffectiveParameters {
         margin: patch
             .and_then(|value| value.margin)
@@ -1088,6 +1305,12 @@ fn effective_parameters(profile: &ProfileConfig, scene: Scene) -> EffectiveParam
         limit_efficiency: patch
             .and_then(|value| value.limit_efficiency)
             .unwrap_or(profile.limit_efficiency),
+        power_budget: patch
+            .and_then(|value| value.power_budget)
+            .map_or(profile.power_budget, |power_patch| {
+                resolve_power_budget(profile.power_budget, power_patch)
+            }),
+        scalar_values,
     }
 }
 
@@ -1187,6 +1410,8 @@ mod tests {
                     margin: 0.1,
                     burst: 0.0,
                     limit_efficiency: true,
+                    power_budget: None,
+                    scalar_values: BTreeMap::new(),
                     scenes: BTreeMap::new(),
                 },
                 ProfileConfig {
@@ -1194,12 +1419,16 @@ mod tests {
                     margin: 0.2,
                     burst: 0.0,
                     limit_efficiency: false,
+                    power_budget: None,
+                    scalar_values: BTreeMap::new(),
                     scenes: BTreeMap::from([(
                         Scene::Boost,
                         ScenePatch {
                             margin: Some(0.5),
                             burst: Some(0.2),
                             limit_efficiency: None,
+                            power_budget: None,
+                            scalar_values: BTreeMap::new(),
                         },
                     )]),
                 },
@@ -1208,13 +1437,17 @@ mod tests {
                     margin: 0.4,
                     burst: 0.2,
                     limit_efficiency: false,
+                    power_budget: None,
+                    scalar_values: BTreeMap::new(),
                     scenes: BTreeMap::new(),
                 },
             ],
             load: LoadConfig::default(),
+            governor: crate::GovernorConfig::default(),
             thermal: ThermalPolicyConfig::default(),
             input: InputConfig::default(),
             scheduler: SchedulerConfig::default(),
+            session: None,
         }
     }
 
@@ -1297,6 +1530,7 @@ mod tests {
                         scheduling_class: Some(SchedulingClass::Other),
                         ..TaskPlan::default()
                     },
+                    scenes: BTreeMap::new(),
                 },
                 TaskProfileConfig {
                     id: "render".to_owned(),
@@ -1305,6 +1539,7 @@ mod tests {
                         nice: Some(-5),
                         ..TaskPlan::default()
                     },
+                    scenes: BTreeMap::new(),
                 },
                 TaskProfileConfig {
                     id: "later".to_owned(),
@@ -1313,6 +1548,7 @@ mod tests {
                         nice: Some(10),
                         ..TaskPlan::default()
                     },
+                    scenes: BTreeMap::new(),
                 },
             ],
             process_rules: vec![
@@ -1327,11 +1563,13 @@ mod tests {
                     cgroup_class: Some("foreground".to_owned()),
                     threads: vec![
                         ThreadRuleConfig {
-                            comm_regex: "^Render".to_owned(),
+                            selector: None,
+                            comm_regex: Some("^Render".to_owned()),
                             task_profile: "render".to_owned(),
                         },
                         ThreadRuleConfig {
-                            comm_regex: "Worker$".to_owned(),
+                            selector: None,
+                            comm_regex: Some("Worker$".to_owned()),
                             task_profile: "later".to_owned(),
                         },
                     ],
@@ -1355,6 +1593,7 @@ mod tests {
                 cpu_weight: 500,
             }],
             focus: crate::FocusConfig::default(),
+            realtime: crate::RealtimeSchedulerConfig::default(),
         };
         let engine = PolicyEngine::new(config).expect("valid policy");
         let workload = process(10, 100, "game", Some("/usr/bin/game"));
@@ -1366,6 +1605,7 @@ mod tests {
                 &workload,
                 &[render.clone(), unmatched],
                 WorkloadSource::Explicit,
+                SchedulerScene::Idle,
             )
             .expect("scheduler decision");
 
@@ -1374,6 +1614,72 @@ mod tests {
         assert_eq!(decision.tasks[&workload.identity].nice, Some(-2));
         assert_eq!(decision.tasks[&render.identity].nice, Some(-5));
         assert_eq!(decision.tasks.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_scene_patch_and_typed_leader_selector_are_applied() {
+        let mut config = policy_config();
+        config.scheduler = SchedulerConfig {
+            enabled: true,
+            task_profiles: vec![TaskProfileConfig {
+                id: "main-thread".to_owned(),
+                affinity_group: None,
+                plan: TaskPlan {
+                    nice: Some(5),
+                    uclamp_min: Some(100),
+                    ..TaskPlan::default()
+                },
+                scenes: BTreeMap::from([(
+                    SchedulerScene::Touch,
+                    TaskPlan {
+                        nice: Some(-5),
+                        ..TaskPlan::default()
+                    },
+                )]),
+            }],
+            process_rules: vec![ProcessRuleConfig {
+                name: "application".to_owned(),
+                matcher: WorkloadMatcher {
+                    executable: Some("/usr/bin/game".to_owned()),
+                    desktop_id: None,
+                    comm_regex: None,
+                },
+                task_profile: None,
+                cgroup_class: None,
+                threads: vec![ThreadRuleConfig {
+                    selector: Some(crate::ThreadSelector::Leader),
+                    comm_regex: None,
+                    task_profile: "main-thread".to_owned(),
+                }],
+            }],
+            cgroup_classes: Vec::new(),
+            focus: crate::FocusConfig::default(),
+            realtime: crate::RealtimeSchedulerConfig::default(),
+        };
+        let engine = PolicyEngine::new(config).expect("valid scheduler");
+        let workload = process(10, 100, "name-unrelated-to-leader", Some("/usr/bin/game"));
+
+        let idle = engine
+            .evaluate_scheduler(
+                &workload,
+                &[],
+                WorkloadSource::Explicit,
+                SchedulerScene::Idle,
+            )
+            .expect("idle scheduler decision");
+        let touch = engine
+            .evaluate_scheduler(
+                &workload,
+                &[],
+                WorkloadSource::Explicit,
+                SchedulerScene::Touch,
+            )
+            .expect("touch scheduler decision");
+
+        assert_eq!(idle.tasks[&workload.identity].nice, Some(5));
+        assert_eq!(touch.tasks[&workload.identity].nice, Some(-5));
+        // The partial scene patch inherits the base uclamp field.
+        assert_eq!(touch.tasks[&workload.identity].uclamp_min, Some(100));
     }
 
     fn focus_policy(focus: crate::FocusConfig) -> PolicyEngine {
@@ -1387,10 +1693,12 @@ mod tests {
                     uclamp_min: Some(205),
                     ..TaskPlan::default()
                 },
+                scenes: BTreeMap::new(),
             }],
             process_rules: Vec::new(),
             cgroup_classes: Vec::new(),
             focus,
+            realtime: crate::RealtimeSchedulerConfig::default(),
         };
         PolicyEngine::new(config).expect("valid policy")
     }
@@ -1416,6 +1724,7 @@ mod tests {
                 &workload,
                 &[thread.clone(), foreign.clone()],
                 WorkloadSource::Focus,
+                SchedulerScene::Idle,
             )
             .expect("scheduler decision");
 
@@ -1436,7 +1745,12 @@ mod tests {
         let workload = process(10, 100, "app", Some("/usr/bin/app"));
 
         let decision = engine
-            .evaluate_scheduler(&workload, &[], WorkloadSource::Explicit)
+            .evaluate_scheduler(
+                &workload,
+                &[],
+                WorkloadSource::Explicit,
+                SchedulerScene::Idle,
+            )
             .expect("scheduler decision");
 
         assert_eq!(decision, SchedulerDecision::default());
@@ -1451,7 +1765,7 @@ mod tests {
         });
         assert_eq!(
             disabled
-                .evaluate_scheduler(&workload, &[], WorkloadSource::Focus)
+                .evaluate_scheduler(&workload, &[], WorkloadSource::Focus, SchedulerScene::Idle,)
                 .expect("scheduler decision"),
             SchedulerDecision::default()
         );
@@ -1734,6 +2048,7 @@ mod tests {
             CpuTargetPolicy {
                 cpus: CpuSet::from_ids([CpuId(3), CpuId(7)]),
                 frequency: frequency_policy(),
+                energy_model: None,
             },
         )]);
         let plan = engine
@@ -1785,6 +2100,7 @@ mod tests {
             CpuTargetPolicy {
                 cpus: CpuSet::from_ids([CpuId(0)]),
                 frequency: frequency_policy(),
+                energy_model: None,
             },
         )]);
         let plan = engine
@@ -1864,6 +2180,7 @@ mod tests {
             CpuTargetPolicy {
                 cpus: CpuSet::from_ids([CpuId(0)]),
                 frequency: frequency_policy(),
+                energy_model: None,
             },
         )]);
         let error = engine

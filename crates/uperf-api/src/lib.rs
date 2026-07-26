@@ -10,12 +10,14 @@ mod client;
 mod contract;
 mod error;
 
-pub use client::{Daemon1Proxy, DaemonClient};
+pub use client::{Daemon1Proxy, DaemonClient, MAX_DECISION_TRACE_PAGE};
 pub use contract::{
-    ActiveWorkload, ApiVersion, AppRule, Capabilities, CpuLoad, DaemonStatus, DiagnosticCheck,
-    DiagnosticReport, FrequencyOverride, FrequencyStatus, HealthIssue, HealthStatus, ModeInfo,
-    MutationReceipt, ReloadReport, RunningWorkload, SchedulerStatus, TargetCapability,
-    TelemetrySnapshot, ThermalStatus, WorkloadIdentity, WorkloadRequest,
+    ActiveWorkload, ApiVersion, AppRule, Capabilities, CpuLoad, DaemonStatus, DecisionFrequency,
+    DecisionScalar, DecisionTraceEntry, DecisionTraceEntryV2, DiagnosticCheck, DiagnosticReport,
+    FrameHintEvent, FrequencyOverride, FrequencyStatus, GovernorDiagnosticsStatus, GovernorStatus,
+    GovernorTargetStatus, HealthIssue, HealthStatus, ModeInfo, MutationReceipt, ReloadReport,
+    RunningWorkload, SchedulerStatus, TargetCapability, TelemetrySnapshot, ThermalStatus,
+    WorkloadIdentity, WorkloadRequest,
 };
 pub use error::{ClientError, ServiceError};
 
@@ -50,6 +52,8 @@ pub mod feature {
     pub const EVDEV_SCENES: &str = "evdev-scenes";
     /// Per-task affinity, nice, scheduling class, and uclamp are available.
     pub const TASK_SCHEDULER: &str = "task-scheduler";
+    /// Explicitly configured, bounded experimental `SCHED_FIFO` plans are understood.
+    pub const REALTIME_FIFO_V1: &str = "realtime-fifo-v1";
     /// Owned systemd-unit CPU controls are available.
     pub const SYSTEMD_CGROUP: &str = "systemd-cgroup";
     /// Read-only discovery of running game-like processes and scheduler state.
@@ -58,6 +62,20 @@ pub mod feature {
     pub const DEVICE_PROFILE: &str = "device-profile";
     /// Compositor-reported focus can supply the active workload.
     pub const FOREGROUND_FOCUS: &str = "foreground-focus";
+    /// A bounded, read-only policy and reconciliation timeline is available.
+    pub const DECISION_TRACE_V1: &str = "decision-trace-v1";
+    /// Extended decision records include governor and typed-scalar diagnostics.
+    pub const DECISION_TRACE_V2: &str = "decision-trace-v2";
+    /// The reference-compatible energy governor is available.
+    pub const ENERGY_GOVERNOR_V1: &str = "energy-governor-v1";
+    /// Scheduler task plans can vary by dominant scene.
+    pub const SCENE_SCHEDULER_V1: &str = "scene-scheduler-v1";
+    /// Keyboard and pointer activity can generate interaction scenes.
+    pub const DESKTOP_INPUT_V1: &str = "desktop-input-v1";
+    /// Administrator-declared, typed scalar targets are available.
+    pub const SCALAR_TARGETS_V1: &str = "scalar-targets-v1";
+    /// Authenticated compositor frame lifecycle hints are available.
+    pub const FRAME_HINTS_V1: &str = "frame-hints-v1";
 }
 
 /// Oldest configuration schema accepted by this API generation.

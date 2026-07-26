@@ -45,6 +45,9 @@ jobs:
       - name: Test
         run: cargo +1.96.0 test --workspace --all-targets --locked
 
+      - name: Test GNOME compositor reporter
+        run: node extensions/focus@uperflinux.org/extension.test.mjs
+
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo +1.96.0 doc --workspace --no-deps --locked
 
@@ -76,6 +79,11 @@ jobs:
           test -f debian/uperf-linux/usr/share/uperf-linux/schema/device-v2.schema.json
           test -f debian/uperf-linux-gui/usr/share/uperf-linux/schema/device-v2.schema.json
           test -f debian/uperf-linux-gui/usr/lib/systemd/system/uperf-linux.service
+          test -f debian/uperf-linux/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf
+          test -f debian/uperf-linux-gui/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf
+          test ! -e debian/uperf-linux/usr/lib/systemd/system/uperf-linux.service.d
+          grep -qx 'RestrictRealtime=yes' \
+            debian/uperf-linux/usr/lib/systemd/system/uperf-linux.service
           test -f debian/uperf-linux-gui/usr/share/applications/org.uperflinux.Gui.desktop
 
       - name: Validate bundled configuration

@@ -1,12 +1,14 @@
-# uperf-linux focus reporter
+# uperf-linux compositor reporter
 
-Reports the focused window's PID to `org.uperflinux.Daemon1` so the daemon can
-treat the application you are actually using as the active workload.
+Reports the focused window's PID, compositor frame lifecycle, missed
+presentation deadlines, and Mutter's physical display power state to
+`org.uperflinux.Daemon1`.
 
 The extension is only a reporter. It decides nothing: the daemon authorizes
 every report (same UID, active local logind session, not a protected process),
-holds an expiring lease, and releases the boost when the lease is not renewed,
-when this extension's bus peer disappears, or when the reported process exits.
+holds an expiring compositor-reporter lease, and releases the workload when the
+focus lease is not renewed, when this extension's bus peer disappears, or when
+the reported process exits.
 
 ## Install
 
@@ -44,13 +46,28 @@ uperfctl health          # a rejected PID appears here as focus.rejected
 | Focus remains unchanged | renew the same lease every 5 seconds |
 | Focus becomes null | `ClearForegroundProcess` |
 | Modal dialog focused | reports the transient parent, so the lease does not thrash |
+| First compositor paint after ≥50 ms quiet | `render-started` |
+| Compositor becomes quiet for 50 ms | `render-idle`; the daemon adds its own 200 ms slack |
+| Presentation interval exceeds 1.5× the output refresh interval | `deadline-missed`; the daemon accepts it only inside the current interaction generation |
+| Mutter DisplayConfig enters standby/suspend/off | `display-blanked`, renewed every 5 seconds while blank |
+| Mutter DisplayConfig returns to on | `display-unblanked` |
 | Daemon restarts | name-owner watch clears the dedup cache and re-reports |
 | D-Bus error | bounded exponential backoff, 500 ms to 30 s; never permanently disabled |
-| Screen locks | `session-modes` excludes the lock screen, so `disable()` runs and the lease is released |
-| `disable()` | releases the lease, disconnects signals, cancels pending sources |
+| Screen locks | immediately clears focused workload; only physical-display observation remains active |
+| `disable()` | best-effort clears focus, disconnects signals, and cancels pending work; reporter authorization then expires or is revoked with its peer |
 
-`session-modes` is deliberately `["user"]` only. Locking the screen should
-release the boost, and that only happens if the extension is disabled there.
+`session-modes` includes `unlock-dialog` solely so a compositor-trusted source
+can distinguish a real display blank from logind's `LockedHint`. The extension
+does not install keyboard or pointer listeners. It clears application focus as
+soon as the shell leaves user mode, suppresses frame hints while locked, and
+keeps only Mutter's `PowerSaveMode` observer alive.
+
+`render-started`, `render-idle`, and `deadline-missed` are deliberately
+best-effort signals. The daemon ignores them unless the same D-Bus peer owns the
+current reporter lease and an interaction is active; an older daemon that does
+not expose `ReportFrameHint` therefore remains compatible. Display state uses a
+bounded retry and an idempotent keepalive so a long lock interval does not lose
+the authenticated reporter lease.
 
 The bundled reporter assumes `scheduler.focus.lease_ttl_ms` is at least
 15 seconds, matching the packaged policy. Its 5-second renewal interval leaves
@@ -58,9 +75,10 @@ room for one delayed or timed-out D-Bus call. Configurations with a shorter TTL
 must use a correspondingly faster reporter and are not supported by this
 extension.
 
-Reporting requires no root and no polkit action, but the daemon does require the
-caller to be in an active local session, so a remote or inactive session cannot
-steer scheduling.
+Reporting requires no root and no polkit action, but the daemon requires the
+caller to be in an active local session and ties frame/display hints to the
+compositor reporter's D-Bus peer, UID, and expiring lease. A remote or inactive
+session cannot steer scheduling.
 
 The reporter state tests use Node only as a deterministic GLib/D-Bus mock; the
 production extension still runs exclusively inside GNOME Shell:

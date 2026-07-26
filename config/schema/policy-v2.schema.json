@@ -6,6 +6,21 @@
     "default_profile": {
       "$ref": "#/$defs/ProfileId"
     },
+    "governor": {
+      "$ref": "#/$defs/GovernorConfig",
+      "default": {
+        "active_load_threshold": 0.3,
+        "active_sample_ms": 20,
+        "ema_time_constant_ms": 40,
+        "idle_load_threshold": 0.15,
+        "idle_sample_ms": 80,
+        "min_opp_residency_ms": 10,
+        "predict_threshold": 0.15,
+        "prediction_gain": 1.0,
+        "ramp_latency_ms": 100,
+        "rollout": "legacy"
+      }
+    },
     "input": {
       "$ref": "#/$defs/InputConfig",
       "default": {
@@ -48,6 +63,11 @@
           "protected": []
         },
         "process_rules": [],
+        "realtime": {
+          "enabled": false,
+          "housekeeping_cpus": [],
+          "max_priority": 20
+        },
         "task_profiles": []
       }
     },
@@ -55,6 +75,16 @@
       "type": "integer",
       "format": "uint32",
       "minimum": 0
+    },
+    "session": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionProfileConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "thermal": {
       "$ref": "#/$defs/ThermalPolicyConfig",
@@ -129,8 +159,8 @@
           "type": "integer",
           "format": "uint64",
           "default": 15000,
-          "minimum": 15000,
-          "maximum": 600000
+          "maximum": 600000,
+          "minimum": 15000
         },
         "protected": {
           "description": "Processes that may never be leased as a focused workload.",
@@ -150,6 +180,76 @@
         }
       },
       "additionalProperties": false
+    },
+    "GovernorConfig": {
+      "type": "object",
+      "properties": {
+        "active_load_threshold": {
+          "type": "number",
+          "format": "double"
+        },
+        "active_sample_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "ema_time_constant_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "idle_load_threshold": {
+          "type": "number",
+          "format": "double"
+        },
+        "idle_sample_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_opp_residency_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "predict_threshold": {
+          "type": "number",
+          "format": "double"
+        },
+        "prediction_gain": {
+          "type": "number",
+          "format": "double"
+        },
+        "ramp_latency_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rollout": {
+          "$ref": "#/$defs/GovernorRollout",
+          "default": "legacy"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "active_sample_ms",
+        "idle_sample_ms",
+        "active_load_threshold",
+        "idle_load_threshold",
+        "ema_time_constant_ms",
+        "predict_threshold",
+        "prediction_gain",
+        "ramp_latency_ms",
+        "min_opp_residency_ms"
+      ]
+    },
+    "GovernorRollout": {
+      "type": "string",
+      "enum": [
+        "legacy",
+        "shadow",
+        "energy"
+      ]
     },
     "InputConfig": {
       "type": "object",
@@ -239,6 +339,74 @@
         "heavy_dwell_ms"
       ]
     },
+    "PowerBudgetConfig": {
+      "type": "object",
+      "properties": {
+        "fast_limit_capacity_mj": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "fast_limit_power_mw": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "fast_limit_recover_scale": {
+          "type": "number",
+          "format": "double"
+        },
+        "slow_limit_power_mw": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "slow_limit_power_mw",
+        "fast_limit_power_mw",
+        "fast_limit_capacity_mj",
+        "fast_limit_recover_scale"
+      ]
+    },
+    "PowerBudgetPatch": {
+      "type": "object",
+      "properties": {
+        "fast_limit_capacity_mj": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "fast_limit_power_mw": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "fast_limit_recover_scale": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "slow_limit_power_mw": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "ProcessRuleConfig": {
       "type": "object",
       "properties": {
@@ -292,6 +460,26 @@
           "type": "number",
           "format": "double"
         },
+        "power_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PowerBudgetConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scalar_values": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {},
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$": {
+              "$ref": "#/$defs/ScalarSettingValue"
+            }
+          }
+        },
         "scenes": {
           "type": "object",
           "properties": {
@@ -302,6 +490,9 @@
               "$ref": "#/$defs/ScenePatch"
             },
             "idle": {
+              "$ref": "#/$defs/ScenePatch"
+            },
+            "junk": {
               "$ref": "#/$defs/ScenePatch"
             },
             "switch": {
@@ -337,6 +528,83 @@
         "performance"
       ]
     },
+    "RealtimeSchedulerConfig": {
+      "description": "Explicit opt-in envelope for experimental `SCHED_FIFO` task plans.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "housekeeping_cpus": {
+          "description": "CPUs reserved for the daemon, watchdogs, and other housekeeping work.",
+          "$ref": "#/$defs/CpuSet",
+          "default": []
+        },
+        "max_priority": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 20,
+          "maximum": 50,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ScalarSettingValue": {
+      "description": "Typed value for one root-reviewed scalar sysfs resource.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integer"
+            },
+            "value": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cpu-list"
+            },
+            "value": {
+              "$ref": "#/$defs/CpuSet"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
     "ScenePatch": {
       "type": "object",
       "properties": {
@@ -359,6 +627,26 @@
             "null"
           ],
           "format": "double"
+        },
+        "power_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PowerBudgetPatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scalar_values": {
+          "type": "object",
+          "additionalProperties": false,
+          "default": {},
+          "patternProperties": {
+            "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$": {
+              "$ref": "#/$defs/ScalarSettingValue"
+            }
+          }
         }
       },
       "additionalProperties": false
@@ -395,6 +683,14 @@
           },
           "maxItems": 1024
         },
+        "realtime": {
+          "$ref": "#/$defs/RealtimeSchedulerConfig",
+          "default": {
+            "enabled": false,
+            "housekeeping_cpus": [],
+            "max_priority": 20
+          }
+        },
         "task_profiles": {
           "type": "array",
           "default": [],
@@ -411,8 +707,36 @@
       "enum": [
         "other",
         "batch",
-        "idle"
+        "idle",
+        "fifo"
       ]
+    },
+    "SessionProfileConfig": {
+      "description": "Optional profile overrides driven by trusted desktop session state.\n\nThese are policy references only.  Platform observers decide whether a\nsession is locked or its display is blanked; neither state is inferred from\nthe other.",
+      "type": "object",
+      "properties": {
+        "display_blanked_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "locked_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "TaskPlan": {
       "description": "Partial scheduling intent for one process or thread.\n\nEvery absent field preserves the task's current value. In particular,\n`uclamp_min` and `uclamp_max` are independent so a policy can raise a floor\nwithout also widening an administrator-provided ceiling.",
@@ -436,6 +760,16 @@
           "format": "int8",
           "maximum": 127,
           "minimum": -128
+        },
+        "rt_priority": {
+          "description": "Fixed real-time priority used only with `SchedulingClass::Fifo`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 50,
+          "minimum": 1
         },
         "scheduling_class": {
           "anyOf": [
@@ -482,6 +816,29 @@
         },
         "plan": {
           "$ref": "#/$defs/TaskPlan"
+        },
+        "scenes": {
+          "description": "Partial task-plan overrides selected by the current scheduler scene.",
+          "type": "object",
+          "properties": {
+            "background": {
+              "$ref": "#/$defs/TaskPlan"
+            },
+            "boost": {
+              "$ref": "#/$defs/TaskPlan"
+            },
+            "foreground": {
+              "$ref": "#/$defs/TaskPlan"
+            },
+            "idle": {
+              "$ref": "#/$defs/TaskPlan"
+            },
+            "touch": {
+              "$ref": "#/$defs/TaskPlan"
+            }
+          },
+          "additionalProperties": false,
+          "default": {}
         }
       },
       "additionalProperties": false,
@@ -508,7 +865,22 @@
       "type": "object",
       "properties": {
         "comm_regex": {
-          "type": "string"
+          "description": "Deprecated v2 spelling retained for configuration compatibility.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selector": {
+          "description": "Typed selector used by new configurations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "task_profile": {
           "type": "string"
@@ -516,8 +888,41 @@
       },
       "additionalProperties": false,
       "required": [
-        "comm_regex",
         "task_profile"
+      ]
+    },
+    "ThreadSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "leader"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "comm-regex"
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "pattern"
+          ]
+        }
       ]
     },
     "WorkloadMatcher": {

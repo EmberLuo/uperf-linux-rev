@@ -56,6 +56,7 @@ Rust source packages when network-free reproducibility is required.
 | `/usr/share/uperf-linux/devices/` | immutable device profiles |
 | `/usr/share/uperf-linux/defaults/` | immutable policy and app-rule seeds |
 | `/usr/share/uperf-linux/schema/` | JSON Schema v2 documents |
+| `/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf` | inactive experimental FIFO drop-in example |
 | `/usr/share/gnome-shell/extensions/focus@uperflinux.org/` | focus reporter; installed disabled |
 | `/var/lib/uperf-linux/apps.json` | daemon-managed; not owned by dpkg |
 | `/run/uperf-linux/recovery.json` | actuator-owned current-boot journal |
@@ -93,6 +94,36 @@ The service has no arbitrary network access, uses only Unix sockets, and is
 hardened without hiding `/proc`, `/sys`, or input devices that its stated
 function requires. Hardware writes remain constrained by the actuator's
 allowlist and durable journal.
+
+## Experimental FIFO scheduling opt-in
+
+The default unit keeps `RestrictRealtime=yes`; package installation never
+activates real-time scheduling. `SCHED_FIFO` can starve ordinary work,
+including the daemon needed to restore state, so it requires two independent,
+root-reviewed opt-ins:
+
+1. In `policy.json`, set `scheduler.realtime.enabled` to `true`, keep
+   `max_priority` at or below the hard limit of 50, and reserve at least one
+   `housekeeping_cpus` entry. Every effective FIFO task plan must use an
+   explicit `affinity` or `affinity_group` that excludes all housekeeping CPUs,
+   and its `rt_priority` must be in `1..=max_priority`.
+2. Only after `uperfctl config validate` succeeds, install the shipped example
+   as an administrator drop-in:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/uperf-linux.service.d
+sudo install -m 0644 \
+  /usr/share/uperf-linux/systemd/50-realtime-opt-in.conf \
+  /etc/systemd/system/uperf-linux.service.d/50-realtime-opt-in.conf
+sudo systemctl daemon-reload
+sudo systemctl restart uperf-linux.service
+```
+
+The example changes only `RestrictRealtime=no` and `LimitRTPRIO=50`; the policy
+default remains disabled with a configured maximum of 20. FIFO class and exact
+priority are journaled and rolled back as one owned field. `SCHED_RR` is not
+supported. Uperf v3 reference priorities such as 97/98 remain disabled import
+candidates and are never activated automatically.
 
 ## Upgrade and removal safety
 

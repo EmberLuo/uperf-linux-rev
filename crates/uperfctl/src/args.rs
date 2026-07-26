@@ -2,6 +2,8 @@ use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Result, bail};
 
+use crate::replay::CandidateRollout;
+
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +24,8 @@ pub struct Cli {
 pub enum Command {
     Status,
     Health,
+    Trace(TraceOptions),
+    GovernorStatus,
     Mode(ModeAction),
     Workload(WorkloadAction),
     Foreground(ForegroundAction),
@@ -32,6 +36,13 @@ pub enum Command {
     Diagnose,
     Help(Option<String>),
     Version,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraceOptions {
+    pub after_id: u64,
+    pub limit: u32,
+    pub extended: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,6 +89,18 @@ pub enum ConfigAction {
         input: PathBuf,
         output_dir: PathBuf,
         force: bool,
+    },
+    ImportUperfV3 {
+        input: PathBuf,
+        output_dir: PathBuf,
+        cluster_cpus: Vec<String>,
+        sysfs_root: PathBuf,
+        force: bool,
+    },
+    ReplayGovernor {
+        trace: PathBuf,
+        policy: PathBuf,
+        rollout: CandidateRollout,
     },
 }
 
@@ -144,6 +167,11 @@ impl Cli {
                 cursor.finish()?;
                 Command::Health
             }
+            "trace" => Command::Trace(parse_trace(&mut cursor)?),
+            "governor-status" => {
+                cursor.finish()?;
+                Command::GovernorStatus
+            }
             "mode" => Command::Mode(parse_mode(&mut cursor)?),
             "workload" => Command::Workload(parse_workload(&mut cursor)?),
             "foreground" => Command::Foreground(parse_foreground(&mut cursor)?),
@@ -181,6 +209,47 @@ impl Cli {
             command,
         })
     }
+}
+
+fn parse_trace(cursor: &mut Cursor) -> Result<TraceOptions> {
+    let mut after_id = 0;
+    let mut limit = 128;
+    let mut after_seen = false;
+    let mut limit_seen = false;
+    let mut extended = false;
+    while let Some(option) = cursor.next() {
+        match option.as_str() {
+            "--after" => {
+                if after_seen {
+                    bail!("--after was specified more than once");
+                }
+                after_id = parse_number(&cursor.required("decision ID")?, "decision ID")?;
+                after_seen = true;
+            }
+            "--limit" => {
+                if limit_seen {
+                    bail!("--limit was specified more than once");
+                }
+                limit = parse_number(&cursor.required("trace limit")?, "trace limit")?;
+                if limit > uperf_api::MAX_DECISION_TRACE_PAGE {
+                    bail!("trace limit exceeds {}", uperf_api::MAX_DECISION_TRACE_PAGE);
+                }
+                limit_seen = true;
+            }
+            "--extended" => {
+                if extended {
+                    bail!("--extended was specified more than once");
+                }
+                extended = true;
+            }
+            other => bail!("unknown trace option '{other}'"),
+        }
+    }
+    Ok(TraceOptions {
+        after_id,
+        limit,
+        extended,
+    })
 }
 
 fn parse_mode(cursor: &mut Cursor) -> Result<ModeAction> {
@@ -323,8 +392,86 @@ fn parse_config(cursor: &mut Cursor) -> Result<ConfigAction> {
                 force,
             })
         }
-        action => bail!("unknown config action '{action}'; expected validate or migrate"),
+        "import-uperf-v3" => {
+            let input = PathBuf::from(cursor.required("input path")?);
+            let mut output_dir = None;
+            let mut cluster_cpus = Vec::new();
+            let mut sysfs_root = None;
+            let mut force = false;
+            while let Some(argument) = cursor.next() {
+                match argument.as_str() {
+                    "-o" | "--output" | "--output-dir" => {
+                        set_once(
+                            &mut output_dir,
+                            PathBuf::from(cursor.required("output directory")?),
+                            "--output-dir",
+                        )?;
+                    }
+                    "--cluster-cpus" => {
+                        cluster_cpus.push(cursor.required("CPU list after --cluster-cpus")?);
+                    }
+                    "--sysfs-root" => {
+                        set_once(
+                            &mut sysfs_root,
+                            PathBuf::from(cursor.required("sysfs root")?),
+                            "--sysfs-root",
+                        )?;
+                    }
+                    "--force" => force = true,
+                    other if !other.starts_with('-') && output_dir.is_none() => {
+                        output_dir = Some(PathBuf::from(other));
+                    }
+                    other => bail!("unknown config import-uperf-v3 option '{other}'"),
+                }
+            }
+            let output_dir = output_dir.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config import-uperf-v3 requires --output-dir DIR for review drafts"
+                )
+            })?;
+            Ok(ConfigAction::ImportUperfV3 {
+                input,
+                output_dir,
+                cluster_cpus,
+                sysfs_root: sysfs_root.unwrap_or_else(|| PathBuf::from("/sys")),
+                force,
+            })
+        }
+        "replay-governor" | "replay" => parse_governor_replay(cursor),
+        action => bail!(
+            "unknown config action '{action}'; expected validate, migrate-c-v1, import-uperf-v3, or replay-governor"
+        ),
     }
+}
+
+fn parse_governor_replay(cursor: &mut Cursor) -> Result<ConfigAction> {
+    let trace = PathBuf::from(cursor.required("replay trace path")?);
+    let mut policy = None;
+    let mut rollout = None;
+    while let Some(argument) = cursor.next() {
+        match argument.as_str() {
+            "--policy" => {
+                set_once(
+                    &mut policy,
+                    PathBuf::from(cursor.required("policy path")?),
+                    "--policy",
+                )?;
+            }
+            "--rollout" => {
+                let value = cursor.required("candidate rollout")?;
+                let parsed = value.parse().map_err(anyhow::Error::msg)?;
+                set_once(&mut rollout, parsed, "--rollout")?;
+            }
+            other => bail!("unknown config replay-governor option '{other}'"),
+        }
+    }
+    let policy = policy
+        .ok_or_else(|| anyhow::anyhow!("config replay-governor requires --policy POLICY.json"))?;
+    Ok(ConfigAction::ReplayGovernor {
+        trace,
+        policy,
+        rollout: rollout.unwrap_or(CandidateRollout::Shadow),
+    })
 }
 
 fn parse_number<T>(value: &str, name: &str) -> Result<T>
@@ -401,6 +548,8 @@ pub fn help(topic: Option<&str>) -> &'static str {
         Some("workload") => WORKLOAD_HELP,
         Some("foreground") => FOREGROUND_HELP,
         Some("frequency" | "freq") => FREQUENCY_HELP,
+        Some("trace") => TRACE_HELP,
+        Some("governor-status") => GOVERNOR_STATUS_HELP,
         Some("config") => CONFIG_HELP,
         Some("targets") => TARGETS_HELP,
         _ => HELP,
@@ -421,6 +570,8 @@ Global options:
 Commands:
   status                 Show coherent daemon state
   health                 Show health; exits 2 when unhealthy
+  trace                  Show the bounded decision/reconciliation timeline
+  governor-status        Show current governor inputs, budget, and OPP choices
   mode [list|set MODE]   Inspect or change the policy mode
   workload ...           Inspect, select, or clear the active workload
   foreground ...         Report or release the focused process
@@ -429,6 +580,8 @@ Commands:
   reload                 Transactionally reload daemon configuration
   config validate PATH   Validate an offline v2 configuration
   config migrate-c-v1    Migrate a legacy C v1 configuration offline
+  config import-uperf-v3 Import a Uperf v3 configuration as a review draft
+  config replay-governor Compare legacy and energy planners on a JSON trace
   diagnose               Run API, health, recovery, and target checks
 
 Run 'uperfctl help COMMAND' for command-specific syntax.
@@ -440,6 +593,24 @@ Exit status:
   3  daemon unavailable, incompatible, degraded, or timed out
   4  authorization denied
   5  state conflict; refresh status and retry
+";
+
+const TRACE_HELP: &str = "\
+Usage:
+  uperfctl trace [--after DECISION_ID] [--limit COUNT] [--extended]
+
+The pagination key is exclusive. The default page size is 128 and the maximum
+is 512. Trace state is process-local and bounded, so old entries may have
+already expired from the daemon's ring. --extended adds trigger-to-readback
+latency, governor diagnostics, and desired/applied scalar values.
+";
+
+const GOVERNOR_STATUS_HELP: &str = "\
+Usage:
+  uperfctl governor-status
+
+Shows the current rollout, load transform, power budget and energy bucket,
+per-target OPP reasons, and desired/applied scalar resources.
 ";
 
 const MODE_HELP: &str = "\
@@ -489,15 +660,36 @@ const CONFIG_HELP: &str = "\
 Usage:
   uperfctl config validate PATH
   uperfctl config migrate-c-v1 INPUT --output-dir DIR [--force]
+  uperfctl config import-uperf-v3 INPUT --output-dir DIR
+      [--cluster-cpus LIST ...] [--sysfs-root PATH] [--force]
+  uperfctl config replay-governor TRACE --policy POLICY
+      [--rollout shadow|energy]
 
 PATH may be one v2 JSON file or a directory containing device.json, policy.json,
 and apps.json. Directory validation also checks cross-file references.
 Migration is offline and writes those three independent v2 files.
+
+The Uperf v3 importer writes device.json, policy.json, and import-report.json.
+It never enables imported Android sysfs or scheduler rules. Without explicit
+cluster lists it reads policy*/related_cpus plus immutable maximum-frequency
+evidence below /sys and requires a unique nr/frequency-ranked mapping.
+--sysfs-root selects a fixture or mounted target sysfs. Explicit cluster CPU
+lists use Linux list syntax (for example 0-2 or 3-6,8) and must be supplied
+once per power-model cluster when local inference is unavailable or ambiguous.
+
+Governor replay is entirely offline. Its v1 trace contains resolved CPU target
+models plus timestamped raw loads and observed frequencies; POLICY supplies
+profile, scene-patch, budget, and dynamic-governor settings. Shadow is the
+default candidate rollout. Energy uses the same planner but preserves its
+fail-closed active-rollout error behavior.
 ";
 
 #[cfg(test)]
 mod tests {
-    use super::{Bus, Cli, Command, ConfigAction, FrequencyAction, WorkloadAction};
+    use std::path::PathBuf;
+
+    use super::{Bus, Cli, Command, ConfigAction, FrequencyAction, TraceOptions, WorkloadAction};
+    use crate::replay::CandidateRollout;
 
     fn parse(arguments: &[&str]) -> Cli {
         Cli::parse(arguments.iter().map(ToString::to_string)).unwrap()
@@ -537,6 +729,29 @@ mod tests {
     }
 
     #[test]
+    fn trace_pagination_is_bounded_at_parse_time() {
+        assert_eq!(
+            parse(&["trace", "--after", "42", "--limit", "64"]).command,
+            Command::Trace(TraceOptions {
+                after_id: 42,
+                limit: 64,
+                extended: false,
+            })
+        );
+        assert_eq!(
+            parse(&["trace", "--extended"]).command,
+            Command::Trace(TraceOptions {
+                after_id: 0,
+                limit: 128,
+                extended: true,
+            })
+        );
+        assert!(Cli::parse(["trace", "--limit", "513"].map(str::to_owned)).is_err());
+        assert!(Cli::parse(["trace", "--after", "1", "--after", "2"].map(str::to_owned)).is_err());
+        assert!(Cli::parse(["trace", "--extended", "--extended"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
     fn workload_set_contains_only_pid_and_policy_inputs() {
         assert_eq!(
             parse(&[
@@ -572,6 +787,55 @@ mod tests {
             parse(&["config", "migrate-c-v1", "old.json", "new.json"]).command,
             Command::Config(ConfigAction::Migrate { output_dir: _, .. })
         ));
+    }
+
+    #[test]
+    fn config_import_accepts_explicit_cluster_mapping() {
+        assert_eq!(
+            parse(&[
+                "config",
+                "import-uperf-v3",
+                "sdm.json",
+                "--output-dir",
+                "draft",
+                "--cluster-cpus",
+                "0-2",
+                "--cluster-cpus",
+                "3-6",
+                "--cluster-cpus",
+                "7",
+                "--sysfs-root",
+                "fixture-sys",
+            ])
+            .command,
+            Command::Config(ConfigAction::ImportUperfV3 {
+                input: PathBuf::from("sdm.json"),
+                output_dir: PathBuf::from("draft"),
+                cluster_cpus: vec!["0-2".into(), "3-6".into(), "7".into()],
+                sysfs_root: PathBuf::from("fixture-sys"),
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn config_replay_is_offline_and_defaults_to_shadow() {
+        assert_eq!(
+            parse(&[
+                "config",
+                "replay-governor",
+                "trace.json",
+                "--policy",
+                "policy.json",
+            ])
+            .command,
+            Command::Config(ConfigAction::ReplayGovernor {
+                trace: PathBuf::from("trace.json"),
+                policy: PathBuf::from("policy.json"),
+                rollout: CandidateRollout::Shadow,
+            })
+        );
+        assert!(Cli::parse(["config", "replay", "trace.json"].map(str::to_owned)).is_err());
     }
 
     #[test]

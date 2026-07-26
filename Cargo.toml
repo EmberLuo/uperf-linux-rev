@@ -33,6 +33,7 @@ evdev = "0.13.2"
 futures-util = "0.3.32"
 libc = "0.2.186"
 regex = "1.12.4"
+rustix = { version = "1.1.4", features = ["fs"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -40,6 +41,8 @@ sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "rt", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["env-filter", "fmt", "json"] }
 zbus = { version = "5.16.0", default-features = false, features = ["tokio"] }
 zvariant = { version = "5.13.1", features = ["option-as-array"] }
 

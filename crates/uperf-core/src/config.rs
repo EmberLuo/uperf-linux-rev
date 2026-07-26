@@ -11,7 +11,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{CpuSet, Hertz, MilliCelsius, ProfileId, Scene, SchedulingClass, TargetId, TaskPlan};
+use crate::{
+    CpuSet, Hertz, MilliCelsius, ProfileId, ScalarSettingValue, Scene, SchedulerScene,
+    SchedulingClass, TargetId, TaskPlan,
+};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 /// Maximum UTF-8 size of any one v2 configuration document.
@@ -22,6 +25,7 @@ pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 
 pub const MAX_CPU_POLICIES: usize = 256;
 pub const MAX_DEVFREQ_TARGETS: usize = 256;
+pub const MAX_SCALAR_TARGETS: usize = 256;
 pub const MAX_THERMAL_ZONES: usize = 256;
 pub const MAX_DEVFREQ_COMPATIBLE_STRINGS: usize = 64;
 pub const MAX_PROFILE_CONFIGS: usize = 8;
@@ -32,6 +36,8 @@ pub const MAX_TOTAL_THREAD_RULES: usize = 4096;
 pub const MAX_CGROUP_CLASSES: usize = 256;
 pub const MAX_APP_RULES: usize = 4096;
 pub const MAX_FOCUS_PROTECTED: usize = 256;
+/// Hard safety ceiling for the experimental FIFO scheduler capability.
+pub const MAX_FIFO_PRIORITY: u8 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +139,66 @@ pub struct DeviceMatch {
     pub product_name: Option<String>,
 }
 
+/// Calibrated energy data for one Linux CPU frequency policy.
+///
+/// Models are deliberately attached to a stable `related_cpus` selector rather
+/// than to a kernel `policyN` directory.  `ReferenceCurveV1` preserves the
+/// documented Uperf v3 curve semantics; `MeasuredOppV1` is the preferred
+/// representation once a device has been measured on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CpuEnergyModelConfig {
+    ReferenceCurveV1 {
+        relative_performance: u32,
+        typical_power_mw_per_core: u32,
+        typical_frequency_hz: Hertz,
+        sweet_frequency_hz: Hertz,
+        plain_frequency_hz: Hertz,
+        free_frequency_hz: Hertz,
+    },
+    MeasuredOppV1 {
+        #[schemars(length(min = 2, max = 256))]
+        points: Vec<MeasuredOppConfig>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredOppConfig {
+    pub frequency_hz: Hertz,
+    pub relative_capacity: u32,
+    pub power_mw_per_core: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ScalarTargetDomainConfig {
+    IntegerRange {
+        minimum: i64,
+        maximum: i64,
+    },
+    IntegerEnum {
+        values: Vec<i64>,
+    },
+    StringEnum {
+        values: Vec<String>,
+    },
+    CpuList {
+        allowed_cpus: CpuSet,
+        #[serde(default)]
+        allow_empty: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScalarTargetConfig {
+    pub id: TargetId,
+    /// Absolute logical sysfs path from a root-owned device profile.
+    pub path: String,
+    pub domain: ScalarTargetDomainConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CpuPolicyConfig {
@@ -153,6 +219,9 @@ pub struct CpuPolicyConfig {
     pub critical_cap_hz: Option<Hertz>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensor_failure_cap_hz: Option<Hertz>,
+    /// Optional calibrated model.  Absence keeps the legacy governor active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_model: Option<CpuEnergyModelConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -213,6 +282,9 @@ pub struct DeviceConfig {
     #[schemars(length(max = MAX_DEVFREQ_TARGETS))]
     pub devfreq_targets: Vec<DevfreqTargetConfig>,
     #[serde(default)]
+    #[schemars(length(max = MAX_SCALAR_TARGETS))]
+    pub scalar_targets: Vec<ScalarTargetConfig>,
+    #[serde(default)]
     #[schemars(length(max = MAX_THERMAL_ZONES))]
     pub thermal_zones: Vec<ThermalZoneConfig>,
 }
@@ -244,6 +316,12 @@ impl Validate for DeviceConfig {
             "devfreq_targets",
             self.devfreq_targets.len(),
             MAX_DEVFREQ_TARGETS,
+            &mut issues,
+        );
+        validate_collection_len(
+            "scalar_targets",
+            self.scalar_targets.len(),
+            MAX_SCALAR_TARGETS,
             &mut issues,
         );
         validate_collection_len(
@@ -381,6 +459,22 @@ impl Validate for DeviceConfig {
                 ));
             }
         }
+        for (index, target) in self
+            .scalar_targets
+            .iter()
+            .take(MAX_SCALAR_TARGETS)
+            .enumerate()
+        {
+            let base = format!("scalar_targets[{index}]");
+            if !target_ids.insert(target.id.clone()) {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.id"),
+                    "duplicate mutation target id",
+                ));
+            }
+            validate_sysfs_directory(&format!("{base}.path"), &target.path, &mut issues);
+            validate_scalar_domain(&base, &target.domain, &used_cpus, &mut issues);
+        }
 
         let mut zone_ids = BTreeSet::new();
         for (index, zone) in self
@@ -443,7 +537,7 @@ impl Validate for DeviceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +546,32 @@ pub struct ScenePatch {
     pub burst: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_efficiency: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_budget: Option<PowerBudgetPatch>,
+    #[serde(default)]
+    pub scalar_values: BTreeMap<TargetId, ScalarSettingValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PowerBudgetConfig {
+    pub slow_limit_power_mw: u32,
+    pub fast_limit_power_mw: u32,
+    pub fast_limit_capacity_mj: u32,
+    pub fast_limit_recover_scale: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PowerBudgetPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_limit_power_mw: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_limit_power_mw: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_limit_capacity_mj: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_limit_recover_scale: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -461,8 +581,54 @@ pub struct ProfileConfig {
     pub margin: f64,
     pub burst: f64,
     pub limit_efficiency: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_budget: Option<PowerBudgetConfig>,
+    #[serde(default)]
+    pub scalar_values: BTreeMap<TargetId, ScalarSettingValue>,
     #[serde(default)]
     pub scenes: BTreeMap<Scene, ScenePatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GovernorRollout {
+    #[default]
+    Legacy,
+    Shadow,
+    Energy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorConfig {
+    #[serde(default)]
+    pub rollout: GovernorRollout,
+    pub active_sample_ms: u64,
+    pub idle_sample_ms: u64,
+    pub active_load_threshold: f64,
+    pub idle_load_threshold: f64,
+    pub ema_time_constant_ms: u64,
+    pub predict_threshold: f64,
+    pub prediction_gain: f64,
+    pub ramp_latency_ms: u64,
+    pub min_opp_residency_ms: u64,
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            rollout: GovernorRollout::Legacy,
+            active_sample_ms: 20,
+            idle_sample_ms: 80,
+            active_load_threshold: 0.30,
+            idle_load_threshold: 0.15,
+            ema_time_constant_ms: 40,
+            predict_threshold: 0.15,
+            prediction_gain: 1.0,
+            ramp_latency_ms: 100,
+            min_opp_residency_ms: 10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -551,12 +717,27 @@ pub struct TaskProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_group: Option<String>,
     pub plan: TaskPlan,
+    /// Partial task-plan overrides selected by the current scheduler scene.
+    #[serde(default)]
+    pub scenes: BTreeMap<SchedulerScene, TaskPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ThreadSelector {
+    Leader,
+    CommRegex { pattern: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadRuleConfig {
-    pub comm_regex: String,
+    /// Typed selector used by new configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<ThreadSelector>,
+    /// Deprecated v2 spelling retained for configuration compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comm_regex: Option<String>,
     pub task_profile: String,
 }
 
@@ -633,6 +814,48 @@ impl Default for FocusConfig {
     }
 }
 
+/// Explicit opt-in envelope for experimental `SCHED_FIFO` task plans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeSchedulerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_realtime_max_priority")]
+    #[schemars(range(min = 1, max = 50))]
+    pub max_priority: u8,
+    /// CPUs reserved for the daemon, watchdogs, and other housekeeping work.
+    #[serde(default)]
+    pub housekeeping_cpus: CpuSet,
+}
+
+const fn default_realtime_max_priority() -> u8 {
+    20
+}
+
+impl Default for RealtimeSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_priority: default_realtime_max_priority(),
+            housekeeping_cpus: CpuSet::new(),
+        }
+    }
+}
+
+/// Optional profile overrides driven by trusted desktop session state.
+///
+/// These are policy references only.  Platform observers decide whether a
+/// session is locked or its display is blanked; neither state is inferred from
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_blanked_profile: Option<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_profile: Option<ProfileId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
@@ -649,6 +872,8 @@ pub struct SchedulerConfig {
     pub cgroup_classes: Vec<CgroupClassConfig>,
     #[serde(default)]
     pub focus: FocusConfig,
+    #[serde(default)]
+    pub realtime: RealtimeSchedulerConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -661,11 +886,15 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub load: LoadConfig,
     #[serde(default)]
+    pub governor: GovernorConfig,
+    #[serde(default)]
     pub thermal: ThermalPolicyConfig,
     #[serde(default)]
     pub input: InputConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionProfileConfig>,
 }
 
 impl PolicyConfig {
@@ -719,6 +948,15 @@ impl Validate for PolicyConfig {
                 1.0,
                 &mut issues,
             );
+            if let Some(power_budget) = profile.power_budget {
+                validate_power_budget(&format!("{base}.power_budget"), power_budget, &mut issues);
+            }
+            validate_collection_len(
+                &format!("{base}.scalar_values"),
+                profile.scalar_values.len(),
+                MAX_SCALAR_TARGETS,
+                &mut issues,
+            );
             for (scene, patch) in &profile.scenes {
                 let patch_path = format!("{base}.scenes.{scene}");
                 if let Some(margin) = patch.margin {
@@ -733,6 +971,25 @@ impl Validate for PolicyConfig {
                 if let Some(burst) = patch.burst {
                     validate_ratio(&format!("{patch_path}.burst"), burst, 0.0, 1.0, &mut issues);
                 }
+                if let Some(power_patch) = patch.power_budget {
+                    match resolve_power_budget(profile.power_budget, power_patch) {
+                        Some(power_budget) => validate_power_budget(
+                            &format!("{patch_path}.power_budget"),
+                            power_budget,
+                            &mut issues,
+                        ),
+                        None => issues.push(ValidationIssue::new(
+                            format!("{patch_path}.power_budget"),
+                            "a partial scene power budget requires a profile-level power_budget",
+                        )),
+                    }
+                }
+                validate_collection_len(
+                    &format!("{patch_path}.scalar_values"),
+                    patch.scalar_values.len(),
+                    MAX_SCALAR_TARGETS,
+                    &mut issues,
+                );
             }
         }
         if !profiles.contains(&self.default_profile) {
@@ -740,6 +997,19 @@ impl Validate for PolicyConfig {
                 "default_profile",
                 "does not reference a configured profile",
             ));
+        }
+        if let Some(session) = self.session {
+            for (field, profile) in [
+                ("display_blanked_profile", session.display_blanked_profile),
+                ("locked_profile", session.locked_profile),
+            ] {
+                if profile.is_some_and(|profile| !profiles.contains(&profile)) {
+                    issues.push(ValidationIssue::new(
+                        format!("session.{field}"),
+                        "does not reference a configured profile",
+                    ));
+                }
+            }
         }
         for required in [
             ProfileId::Powersave,
@@ -785,6 +1055,7 @@ impl Validate for PolicyConfig {
             ));
         }
         validate_positive_duration("load.heavy_dwell_ms", self.load.heavy_dwell_ms, &mut issues);
+        validate_governor(&self.governor, &mut issues);
         validate_positive_duration(
             "thermal.sample_interval_ms",
             self.thermal.sample_interval_ms,
@@ -910,6 +1181,15 @@ impl ConfigBundle {
     pub fn validate_cross_references(&self) -> Result<(), ValidationErrors> {
         let mut issues = Vec::new();
 
+        self.validate_thermal_references(&mut issues);
+        self.validate_energy_references(&mut issues);
+        self.validate_scalar_references(&mut issues);
+        self.validate_scheduler_references(&mut issues);
+
+        finish_validation(issues)
+    }
+
+    fn validate_thermal_references(&self, issues: &mut Vec<ValidationIssue>) {
         if self.device.thermal_zones.is_empty() {
             issues.push(ValidationIssue::new(
                 "device.thermal_zones",
@@ -924,22 +1204,80 @@ impl ConfigBundle {
                 ));
             }
         }
+    }
 
+    fn validate_energy_references(&self, issues: &mut Vec<ValidationIssue>) {
+        if self.policy.governor.rollout != GovernorRollout::Energy {
+            return;
+        }
+        for (index, cpu_policy) in self.device.cpu_policies.iter().enumerate() {
+            if cpu_policy.energy_model.is_none() {
+                issues.push(ValidationIssue::new(
+                    format!("device.cpu_policies[{index}].energy_model"),
+                    "is required when governor.rollout is energy",
+                ));
+            }
+        }
+        for (index, profile) in self.policy.profiles.iter().enumerate() {
+            if profile.power_budget.is_none() {
+                issues.push(ValidationIssue::new(
+                    format!("policy.profiles[{index}].power_budget"),
+                    "is required when governor.rollout is energy",
+                ));
+            }
+        }
+    }
+
+    fn validate_scalar_references(&self, issues: &mut Vec<ValidationIssue>) {
+        let scalar_domains = self
+            .device
+            .scalar_targets
+            .iter()
+            .map(|target| (target.id.clone(), &target.domain))
+            .collect::<BTreeMap<_, _>>();
+        for (profile_index, profile) in self.policy.profiles.iter().enumerate() {
+            validate_scalar_settings(
+                &format!("policy.profiles[{profile_index}].scalar_values"),
+                &profile.scalar_values,
+                &scalar_domains,
+                issues,
+            );
+            for (scene, patch) in &profile.scenes {
+                validate_scalar_settings(
+                    &format!("policy.profiles[{profile_index}].scenes.{scene}.scalar_values"),
+                    &patch.scalar_values,
+                    &scalar_domains,
+                    issues,
+                );
+            }
+        }
+    }
+
+    fn validate_scheduler_references(&self, issues: &mut Vec<ValidationIssue>) {
         let configured_cpus = self
             .device
             .cpu_policies
             .iter()
             .flat_map(|policy| policy.related_cpus.iter().copied())
             .collect::<CpuSet>();
+        let realtime = &self.policy.scheduler.realtime;
+        if !realtime.housekeeping_cpus.is_subset(&configured_cpus) {
+            issues.push(ValidationIssue::new(
+                "policy.scheduler.realtime.housekeeping_cpus",
+                "references a CPU outside the device CPU policies",
+            ));
+        }
         for (index, profile) in self.policy.scheduler.task_profiles.iter().enumerate() {
-            if let Some(group) = &profile.affinity_group
-                && !self.device.cpu_groups.contains_key(group)
-            {
-                issues.push(ValidationIssue::new(
-                    format!("policy.scheduler.task_profiles[{index}].affinity_group"),
-                    format!("references unknown device CPU group {group:?}"),
-                ));
-            }
+            let group_affinity = profile.affinity_group.as_ref().and_then(|group| {
+                let affinity = self.device.cpu_groups.get(group);
+                if affinity.is_none() {
+                    issues.push(ValidationIssue::new(
+                        format!("policy.scheduler.task_profiles[{index}].affinity_group"),
+                        format!("references unknown device CPU group {group:?}"),
+                    ));
+                }
+                affinity
+            });
             if let Some(affinity) = &profile.plan.affinity
                 && !affinity.is_subset(&configured_cpus)
             {
@@ -947,6 +1285,41 @@ impl ConfigBundle {
                     format!("policy.scheduler.task_profiles[{index}].plan.affinity"),
                     "references a CPU outside the device CPU policies",
                 ));
+            }
+            let plan_group_affinity = if profile.plan.affinity.is_none() {
+                group_affinity
+            } else {
+                None
+            };
+            validate_fifo_affinity_reference(
+                &format!("policy.scheduler.task_profiles[{index}].plan"),
+                &profile.plan,
+                plan_group_affinity,
+                realtime,
+                issues,
+            );
+            for (scene, patch) in &profile.scenes {
+                if let Some(affinity) = &patch.affinity
+                    && !affinity.is_subset(&configured_cpus)
+                {
+                    issues.push(ValidationIssue::new(
+                        format!("policy.scheduler.task_profiles[{index}].scenes.{scene}.affinity"),
+                        "references a CPU outside the device CPU policies",
+                    ));
+                }
+                let effective = merge_task_plan(&profile.plan, patch);
+                let scene_group_affinity = if effective.affinity.is_none() {
+                    group_affinity
+                } else {
+                    None
+                };
+                validate_fifo_affinity_reference(
+                    &format!("policy.scheduler.task_profiles[{index}].scenes.{scene}"),
+                    &effective,
+                    scene_group_affinity,
+                    realtime,
+                    issues,
+                );
             }
         }
         for (index, class) in self.policy.scheduler.cgroup_classes.iter().enumerate() {
@@ -965,8 +1338,6 @@ impl ConfigBundle {
                 ));
             }
         }
-
-        finish_validation(issues)
     }
 
     /// Resolve device-defined logical CPU groups into the concrete scheduler
@@ -995,6 +1366,51 @@ impl ConfigBundle {
             }
         }
         Ok(policy)
+    }
+}
+
+fn validate_fifo_affinity_reference(
+    path: &str,
+    plan: &TaskPlan,
+    affinity: Option<&CpuSet>,
+    realtime: &RealtimeSchedulerConfig,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if plan.scheduling_class != Some(SchedulingClass::Fifo) {
+        return;
+    }
+    let Some(affinity) = affinity else {
+        // The policy-only validator reports the missing explicit affinity.
+        return;
+    };
+    if !affinity.is_disjoint(&realtime.housekeeping_cpus) {
+        issues.push(ValidationIssue::new(
+            format!("{path}.affinity"),
+            "fifo affinity must exclude every housekeeping CPU",
+        ));
+    }
+}
+
+fn validate_scalar_settings(
+    path: &str,
+    settings: &BTreeMap<TargetId, ScalarSettingValue>,
+    domains: &BTreeMap<TargetId, &ScalarTargetDomainConfig>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for (id, value) in settings {
+        let Some(domain) = domains.get(id) else {
+            issues.push(ValidationIssue::new(
+                format!("{path}.{id}"),
+                "references an unknown scalar target",
+            ));
+            continue;
+        };
+        if !scalar_value_matches_domain(value, domain) {
+            issues.push(ValidationIssue::new(
+                format!("{path}.{id}"),
+                "value is outside the configured scalar target domain",
+            ));
+        }
     }
 }
 
@@ -1068,9 +1484,344 @@ fn validate_frequency_model(
             "must not exceed critical_cap_hz",
         ));
     }
+    if let Some(model) = &policy.energy_model {
+        validate_energy_model(model, &format!("{base}.energy_model"), issues);
+    }
 }
 
+fn validate_energy_model(
+    model: &CpuEnergyModelConfig,
+    base: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    match model {
+        CpuEnergyModelConfig::ReferenceCurveV1 {
+            relative_performance,
+            typical_power_mw_per_core,
+            typical_frequency_hz,
+            sweet_frequency_hz,
+            plain_frequency_hz,
+            free_frequency_hz,
+        } => {
+            for (field, value) in [
+                ("relative_performance", u64::from(*relative_performance)),
+                (
+                    "typical_power_mw_per_core",
+                    u64::from(*typical_power_mw_per_core),
+                ),
+                ("typical_frequency_hz", typical_frequency_hz.get()),
+                ("sweet_frequency_hz", sweet_frequency_hz.get()),
+                ("plain_frequency_hz", plain_frequency_hz.get()),
+                ("free_frequency_hz", free_frequency_hz.get()),
+            ] {
+                if value == 0 {
+                    issues.push(ValidationIssue::new(
+                        format!("{base}.{field}"),
+                        "must be greater than zero",
+                    ));
+                }
+            }
+            if !(*plain_frequency_hz <= *sweet_frequency_hz
+                && *sweet_frequency_hz <= *typical_frequency_hz)
+                || *free_frequency_hz > *typical_frequency_hz
+            {
+                issues.push(ValidationIssue::new(
+                    base,
+                    "frequencies must satisfy plain <= sweet <= typical and free <= typical",
+                ));
+            }
+        }
+        CpuEnergyModelConfig::MeasuredOppV1 { points } => {
+            if !(2..=256).contains(&points.len()) {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.points"),
+                    "must contain 2..=256 measured OPPs",
+                ));
+                return;
+            }
+            let mut sorted = points.iter().collect::<Vec<_>>();
+            sorted.sort_unstable_by_key(|point| point.frequency_hz);
+            for (index, point) in sorted.iter().enumerate() {
+                if point.frequency_hz == Hertz::ZERO {
+                    issues.push(ValidationIssue::new(
+                        format!("{base}.points[{index}].frequency_hz"),
+                        "must be greater than zero",
+                    ));
+                }
+                if point.relative_capacity == 0 {
+                    issues.push(ValidationIssue::new(
+                        format!("{base}.points[{index}].relative_capacity"),
+                        "must be greater than zero",
+                    ));
+                }
+                if point.power_mw_per_core == 0 {
+                    issues.push(ValidationIssue::new(
+                        format!("{base}.points[{index}].power_mw_per_core"),
+                        "must be greater than zero",
+                    ));
+                }
+                if let Some(previous) = index.checked_sub(1).map(|value| sorted[value]) {
+                    if previous.frequency_hz == point.frequency_hz {
+                        issues.push(ValidationIssue::new(
+                            format!("{base}.points"),
+                            "contains duplicate frequencies",
+                        ));
+                    }
+                    if previous.relative_capacity > point.relative_capacity {
+                        issues.push(ValidationIssue::new(
+                            format!("{base}.points"),
+                            "relative capacity must be nondecreasing with frequency",
+                        ));
+                    }
+                    if previous.power_mw_per_core > point.power_mw_per_core {
+                        issues.push(ValidationIssue::new(
+                            format!("{base}.points"),
+                            "power must be nondecreasing with frequency",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_scalar_domain(
+    base: &str,
+    domain: &ScalarTargetDomainConfig,
+    configured_cpus: &CpuSet,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    match domain {
+        ScalarTargetDomainConfig::IntegerRange { minimum, maximum } => {
+            if minimum > maximum {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain"),
+                    "integer range minimum must not exceed maximum",
+                ));
+            }
+        }
+        ScalarTargetDomainConfig::IntegerEnum { values } => {
+            if values.is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.values"),
+                    "must not be empty",
+                ));
+            }
+            if values.iter().copied().collect::<BTreeSet<_>>().len() != values.len() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.values"),
+                    "must not contain duplicates",
+                ));
+            }
+        }
+        ScalarTargetDomainConfig::StringEnum { values } => {
+            if values.is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.values"),
+                    "must not be empty",
+                ));
+            }
+            if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.values"),
+                    "must not contain duplicates",
+                ));
+            }
+            for (index, value) in values.iter().enumerate() {
+                if value.is_empty()
+                    || value.len() > 4_096
+                    || value.chars().any(|character| {
+                        character.is_control() || matches!(character, '\n' | '\r' | '\0')
+                    })
+                {
+                    issues.push(ValidationIssue::new(
+                        format!("{base}.domain.values[{index}]"),
+                        "must be 1..=4096 bytes and contain no control characters",
+                    ));
+                }
+            }
+        }
+        ScalarTargetDomainConfig::CpuList { allowed_cpus, .. } => {
+            if allowed_cpus.is_empty() {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.allowed_cpus"),
+                    "must not be empty",
+                ));
+            }
+            if !allowed_cpus.is_subset(configured_cpus) {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.domain.allowed_cpus"),
+                    "references a CPU outside the device CPU policies",
+                ));
+            }
+        }
+    }
+}
+
+fn scalar_value_matches_domain(
+    value: &ScalarSettingValue,
+    domain: &ScalarTargetDomainConfig,
+) -> bool {
+    match (value, domain) {
+        (
+            ScalarSettingValue::Integer(value),
+            ScalarTargetDomainConfig::IntegerRange { minimum, maximum },
+        ) => value >= minimum && value <= maximum,
+        (ScalarSettingValue::Integer(value), ScalarTargetDomainConfig::IntegerEnum { values }) => {
+            values.contains(value)
+        }
+        (ScalarSettingValue::String(value), ScalarTargetDomainConfig::StringEnum { values }) => {
+            values.contains(value)
+        }
+        (
+            ScalarSettingValue::CpuList(value),
+            ScalarTargetDomainConfig::CpuList {
+                allowed_cpus,
+                allow_empty,
+            },
+        ) => (*allow_empty || !value.is_empty()) && value.is_subset(allowed_cpus),
+        _ => false,
+    }
+}
+
+fn validate_governor(config: &GovernorConfig, issues: &mut Vec<ValidationIssue>) {
+    if !(10..=40).contains(&config.active_sample_ms) {
+        issues.push(ValidationIssue::new(
+            "governor.active_sample_ms",
+            "must be in 10..=40",
+        ));
+    }
+    if !(10..=500).contains(&config.idle_sample_ms) {
+        issues.push(ValidationIssue::new(
+            "governor.idle_sample_ms",
+            "must be in 10..=500",
+        ));
+    }
+    if config.active_sample_ms > config.idle_sample_ms {
+        issues.push(ValidationIssue::new(
+            "governor",
+            "active_sample_ms must not exceed idle_sample_ms",
+        ));
+    }
+    validate_ratio(
+        "governor.active_load_threshold",
+        config.active_load_threshold,
+        f64::EPSILON,
+        1.0,
+        issues,
+    );
+    validate_ratio(
+        "governor.idle_load_threshold",
+        config.idle_load_threshold,
+        0.0,
+        1.0,
+        issues,
+    );
+    if config.idle_load_threshold >= config.active_load_threshold {
+        issues.push(ValidationIssue::new(
+            "governor",
+            "idle_load_threshold must be less than active_load_threshold",
+        ));
+    }
+    validate_positive_duration(
+        "governor.ema_time_constant_ms",
+        config.ema_time_constant_ms,
+        issues,
+    );
+    validate_ratio(
+        "governor.predict_threshold",
+        config.predict_threshold,
+        0.0,
+        1.0,
+        issues,
+    );
+    validate_ratio(
+        "governor.prediction_gain",
+        config.prediction_gain,
+        0.0,
+        4.0,
+        issues,
+    );
+    if config.ramp_latency_ms > 10_000 {
+        issues.push(ValidationIssue::new(
+            "governor.ramp_latency_ms",
+            "must not exceed 10000",
+        ));
+    }
+    if config.min_opp_residency_ms > 1_000 {
+        issues.push(ValidationIssue::new(
+            "governor.min_opp_residency_ms",
+            "must not exceed 1000",
+        ));
+    }
+}
+
+fn validate_power_budget(path: &str, budget: PowerBudgetConfig, issues: &mut Vec<ValidationIssue>) {
+    if budget.slow_limit_power_mw == 0 {
+        issues.push(ValidationIssue::new(
+            format!("{path}.slow_limit_power_mw"),
+            "must be greater than zero",
+        ));
+    }
+    if budget.fast_limit_power_mw < budget.slow_limit_power_mw {
+        issues.push(ValidationIssue::new(
+            format!("{path}.fast_limit_power_mw"),
+            "must not be lower than slow_limit_power_mw",
+        ));
+    }
+    validate_ratio(
+        &format!("{path}.fast_limit_recover_scale"),
+        budget.fast_limit_recover_scale,
+        0.1,
+        10.0,
+        issues,
+    );
+}
+
+#[must_use]
+pub fn resolve_power_budget(
+    base: Option<PowerBudgetConfig>,
+    patch: PowerBudgetPatch,
+) -> Option<PowerBudgetConfig> {
+    Some(PowerBudgetConfig {
+        slow_limit_power_mw: patch
+            .slow_limit_power_mw
+            .or_else(|| base.map(|value| value.slow_limit_power_mw))?,
+        fast_limit_power_mw: patch
+            .fast_limit_power_mw
+            .or_else(|| base.map(|value| value.fast_limit_power_mw))?,
+        fast_limit_capacity_mj: patch
+            .fast_limit_capacity_mj
+            .or_else(|| base.map(|value| value.fast_limit_capacity_mj))?,
+        fast_limit_recover_scale: patch
+            .fast_limit_recover_scale
+            .or_else(|| base.map(|value| value.fast_limit_recover_scale))?,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "scheduler validation keeps profile, scene, and realtime cross-field rules together"
+)]
 fn validate_scheduler(config: &SchedulerConfig, issues: &mut Vec<ValidationIssue>) {
+    if config.realtime.enabled && !config.enabled {
+        issues.push(ValidationIssue::new(
+            "scheduler.realtime.enabled",
+            "requires scheduler.enabled",
+        ));
+    }
+    if !(1..=MAX_FIFO_PRIORITY).contains(&config.realtime.max_priority) {
+        issues.push(ValidationIssue::new(
+            "scheduler.realtime.max_priority",
+            format!("must be in 1..={MAX_FIFO_PRIORITY}"),
+        ));
+    }
+    if config.realtime.enabled && config.realtime.housekeeping_cpus.is_empty() {
+        issues.push(ValidationIssue::new(
+            "scheduler.realtime.housekeeping_cpus",
+            "must reserve at least one CPU when realtime is enabled",
+        ));
+    }
     validate_collection_len(
         "scheduler.task_profiles",
         config.task_profiles.len(),
@@ -1113,7 +1864,24 @@ fn validate_scheduler(config: &SchedulerConfig, issues: &mut Vec<ValidationIssue
                 ));
             }
         }
-        validate_task_plan(&format!("{base}.plan"), &profile.plan, issues);
+        validate_effective_task_plan(
+            &format!("{base}.plan"),
+            &profile.plan,
+            profile.affinity_group.is_some(),
+            &config.realtime,
+            issues,
+        );
+        for (scene, patch) in &profile.scenes {
+            let path = format!("{base}.scenes.{scene}");
+            validate_task_plan(&path, patch, issues);
+            validate_effective_task_plan(
+                &path,
+                &merge_task_plan(&profile.plan, patch),
+                profile.affinity_group.is_some(),
+                &config.realtime,
+                issues,
+            );
+        }
     }
 
     let mut cgroups = BTreeSet::new();
@@ -1267,11 +2035,23 @@ fn validate_process_rules(
         let thread_limit = MAX_THREAD_RULES_PER_PROCESS.min(remaining_thread_budget);
         for (thread_index, thread) in rule.threads.iter().take(thread_limit).enumerate() {
             let thread_base = format!("{base}.threads[{thread_index}]");
-            validate_regex(
-                &format!("{thread_base}.comm_regex"),
-                &thread.comm_regex,
-                issues,
-            );
+            match (&thread.selector, &thread.comm_regex) {
+                (Some(_), Some(_)) => issues.push(ValidationIssue::new(
+                    thread_base.clone(),
+                    "selector and deprecated comm_regex are mutually exclusive",
+                )),
+                (None, None) => issues.push(ValidationIssue::new(
+                    thread_base.clone(),
+                    "one selector is required",
+                )),
+                (Some(ThreadSelector::CommRegex { pattern }), None) => {
+                    validate_regex(&format!("{thread_base}.selector.pattern"), pattern, issues);
+                }
+                (Some(ThreadSelector::Leader), None) => {}
+                (None, Some(pattern)) => {
+                    validate_regex(&format!("{thread_base}.comm_regex"), pattern, issues);
+                }
+            }
             if !task_profiles.contains(thread.task_profile.as_str()) {
                 issues.push(ValidationIssue::new(
                     format!("{thread_base}.task_profile"),
@@ -1297,13 +2077,13 @@ fn validate_task_plan(path: &str, plan: &TaskPlan, issues: &mut Vec<ValidationIs
             "must be in -20..=19",
         ));
     }
-    if !matches!(
-        plan.scheduling_class,
-        None | Some(SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle)
-    ) {
+    if plan
+        .rt_priority
+        .is_some_and(|priority| !(1..=MAX_FIFO_PRIORITY).contains(&priority))
+    {
         issues.push(ValidationIssue::new(
-            format!("{path}.scheduling_class"),
-            "unsupported scheduling class",
+            format!("{path}.rt_priority"),
+            format!("must be in 1..={MAX_FIFO_PRIORITY}"),
         ));
     }
     if plan.uclamp_min.is_some_and(|minimum| minimum > 1_024) {
@@ -1325,6 +2105,78 @@ fn validate_task_plan(path: &str, plan: &TaskPlan, issues: &mut Vec<ValidationIs
             path,
             "uclamp_min must not exceed uclamp_max when both are set",
         ));
+    }
+}
+
+fn validate_effective_task_plan(
+    path: &str,
+    plan: &TaskPlan,
+    has_affinity_group: bool,
+    realtime: &RealtimeSchedulerConfig,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_task_plan(path, plan, issues);
+    match (plan.scheduling_class, plan.rt_priority) {
+        (Some(SchedulingClass::Fifo), priority) => {
+            if !realtime.enabled {
+                issues.push(ValidationIssue::new(
+                    format!("{path}.scheduling_class"),
+                    "fifo requires scheduler.realtime.enabled",
+                ));
+            }
+            match priority {
+                Some(priority) if priority > realtime.max_priority => {
+                    issues.push(ValidationIssue::new(
+                        format!("{path}.rt_priority"),
+                        format!(
+                            "must not exceed scheduler.realtime.max_priority ({})",
+                            realtime.max_priority
+                        ),
+                    ));
+                }
+                None => issues.push(ValidationIssue::new(
+                    format!("{path}.rt_priority"),
+                    "is required for fifo",
+                )),
+                _ => {}
+            }
+            if plan.affinity.is_none() && !has_affinity_group {
+                issues.push(ValidationIssue::new(
+                    format!("{path}.affinity"),
+                    "fifo requires an explicit affinity or affinity_group",
+                ));
+            }
+            if plan
+                .affinity
+                .as_ref()
+                .is_some_and(|affinity| !affinity.is_disjoint(&realtime.housekeeping_cpus))
+            {
+                issues.push(ValidationIssue::new(
+                    format!("{path}.affinity"),
+                    "fifo affinity must exclude every housekeeping CPU",
+                ));
+            }
+        }
+        (
+            Some(SchedulingClass::Other | SchedulingClass::Batch | SchedulingClass::Idle) | None,
+            Some(_),
+        ) => issues.push(ValidationIssue::new(
+            format!("{path}.rt_priority"),
+            "is valid only when scheduling_class is fifo",
+        )),
+        _ => {}
+    }
+}
+
+#[must_use]
+pub fn merge_task_plan(base: &TaskPlan, patch: &TaskPlan) -> TaskPlan {
+    TaskPlan {
+        affinity: patch.affinity.clone().or_else(|| base.affinity.clone()),
+        nice: patch.nice.or(base.nice),
+        scheduling_class: patch.scheduling_class.or(base.scheduling_class),
+        rt_priority: patch.rt_priority.or(base.rt_priority),
+        uclamp_min: patch.uclamp_min.or(base.uclamp_min),
+        uclamp_max: patch.uclamp_max.or(base.uclamp_max),
     }
 }
 
@@ -1484,6 +2336,7 @@ mod tests {
                     admin_cap_hz: None,
                     critical_cap_hz: Some(Hertz(600_000_000)),
                     sensor_failure_cap_hz: Some(Hertz(600_000_000)),
+                    energy_model: None,
                 },
                 CpuPolicyConfig {
                     id: target("cpu.prime"),
@@ -1495,9 +2348,11 @@ mod tests {
                     admin_cap_hz: None,
                     critical_cap_hz: Some(Hertz(739_000_000)),
                     sensor_failure_cap_hz: Some(Hertz(739_000_000)),
+                    energy_model: None,
                 },
             ],
             devfreq_targets: Vec::new(),
+            scalar_targets: Vec::new(),
             thermal_zones: Vec::new(),
         }
     }
@@ -1517,13 +2372,17 @@ mod tests {
                 margin: 0.2,
                 burst: 0.0,
                 limit_efficiency: id == ProfileId::Powersave,
+                power_budget: None,
+                scalar_values: BTreeMap::new(),
                 scenes: BTreeMap::new(),
             })
             .collect(),
             load: LoadConfig::default(),
+            governor: GovernorConfig::default(),
             thermal: ThermalPolicyConfig::default(),
             input: InputConfig::default(),
             scheduler: SchedulerConfig::default(),
+            session: None,
         }
     }
 
@@ -1703,6 +2562,7 @@ mod tests {
                     uclamp_min: Some(205),
                     ..TaskPlan::default()
                 },
+                scenes: BTreeMap::new(),
             },
             TaskProfileConfig {
                 id: "maximum-only".into(),
@@ -1711,6 +2571,7 @@ mod tests {
                     uclamp_max: Some(768),
                     ..TaskPlan::default()
                 },
+                scenes: BTreeMap::new(),
             },
         ];
         config.validate().expect("independent uclamp fields");
@@ -1743,6 +2604,7 @@ mod tests {
                 uclamp_max: Some(512),
                 ..TaskPlan::default()
             },
+            scenes: BTreeMap::new(),
         });
 
         let error = config.validate().expect_err("uclamp pair must be ordered");
@@ -1755,12 +2617,140 @@ mod tests {
     }
 
     #[test]
+    fn fifo_scheduler_is_explicitly_opted_in_and_bounded() {
+        let mut config = valid_policy();
+        config.scheduler.enabled = true;
+        config.scheduler.realtime = RealtimeSchedulerConfig {
+            enabled: true,
+            max_priority: 20,
+            housekeeping_cpus: CpuSet::from_ids([CpuId(0)]),
+        };
+        config.scheduler.task_profiles.push(TaskProfileConfig {
+            id: "fifo-render".into(),
+            affinity_group: None,
+            plan: TaskPlan {
+                affinity: Some(CpuSet::from_ids([CpuId(1)])),
+                scheduling_class: Some(SchedulingClass::Fifo),
+                rt_priority: Some(10),
+                ..TaskPlan::default()
+            },
+            scenes: BTreeMap::from([(
+                SchedulerScene::Boost,
+                TaskPlan {
+                    rt_priority: Some(20),
+                    ..TaskPlan::default()
+                },
+            )]),
+        });
+        config.validate().expect("bounded FIFO plan");
+        assert_eq!(
+            merge_task_plan(
+                &config.scheduler.task_profiles[0].plan,
+                &config.scheduler.task_profiles[0].scenes[&SchedulerScene::Boost],
+            )
+            .rt_priority,
+            Some(20)
+        );
+
+        config.scheduler.task_profiles[0].plan.rt_priority = Some(21);
+        let error = config
+            .validate()
+            .expect_err("priority exceeds configured maximum");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path.ends_with(".plan.rt_priority") && issue.message.contains("max_priority")
+        }));
+
+        config.scheduler.task_profiles[0].plan.rt_priority = Some(10);
+        config.scheduler.task_profiles[0].plan.affinity =
+            Some(CpuSet::from_ids([CpuId(0), CpuId(1)]));
+        let error = config
+            .validate()
+            .expect_err("FIFO affinity must preserve housekeeping");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path.ends_with(".plan.affinity") && issue.message.contains("housekeeping")
+        }));
+
+        config.scheduler.realtime.enabled = false;
+        let error = config.validate().expect_err("FIFO capability is opt-in");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path.ends_with(".scheduling_class") && issue.message.contains("realtime.enabled")
+        }));
+    }
+
+    #[test]
+    fn non_fifo_plans_reject_realtime_priority() {
+        let mut config = valid_policy();
+        config.scheduler.task_profiles.push(TaskProfileConfig {
+            id: "invalid-priority".into(),
+            affinity_group: None,
+            plan: TaskPlan {
+                scheduling_class: Some(SchedulingClass::Other),
+                rt_priority: Some(1),
+                ..TaskPlan::default()
+            },
+            scenes: BTreeMap::new(),
+        });
+
+        let error = config
+            .validate()
+            .expect_err("priority is meaningful only for FIFO");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path.ends_with(".rt_priority")
+                && issue.message.contains("only when scheduling_class is fifo")
+        }));
+    }
+
+    #[test]
+    fn session_profile_overrides_must_reference_configured_profiles() {
+        let mut config = valid_policy();
+        config.session = Some(SessionProfileConfig {
+            display_blanked_profile: Some(ProfileId::Powersave),
+            locked_profile: Some(ProfileId::Performance),
+        });
+        config.validate().expect("configured session profiles");
+
+        config
+            .profiles
+            .retain(|profile| profile.id != ProfileId::Performance);
+        let error = config
+            .validate()
+            .expect_err("session profile reference must remain valid");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path == "session.locked_profile" && issue.message.contains("configured profile")
+        }));
+    }
+
+    #[test]
     fn valid_policy_round_trips_and_validates() {
         let policy = valid_policy();
         policy.validate().expect("valid policy");
         let json = serde_json::to_string(&policy).expect("serialize");
         let decoded = PolicyConfig::from_json(&json).expect("deserialize");
         assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn older_v2_policy_defaults_new_session_and_realtime_fields() {
+        let mut value = serde_json::to_value(valid_policy()).expect("serialize policy");
+        value
+            .as_object_mut()
+            .expect("policy object")
+            .remove("session");
+        value["scheduler"]
+            .as_object_mut()
+            .expect("scheduler object")
+            .remove("realtime");
+
+        let decoded = PolicyConfig::from_json(
+            &serde_json::to_string(&value).expect("serialize older v2 policy"),
+        )
+        .expect("new fields are backward-compatible");
+
+        assert_eq!(decoded.session, None);
+        assert_eq!(
+            decoded.scheduler.realtime,
+            RealtimeSchedulerConfig::default()
+        );
     }
 
     #[test]
@@ -1775,6 +2765,7 @@ mod tests {
                 affinity: Some(CpuSet::from_ids([CpuId(99)])),
                 ..TaskPlan::default()
             },
+            scenes: BTreeMap::new(),
         });
         let bundle = ConfigBundle { device, policy };
         let error = bundle
@@ -1792,6 +2783,41 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.contains("outside the device"))
         );
+    }
+
+    #[test]
+    fn bundle_resolves_fifo_affinity_groups_against_housekeeping_cpus() {
+        let mut device = valid_device();
+        device
+            .cpu_groups
+            .insert("performance".into(), CpuSet::from_ids([CpuId(7)]));
+        let mut policy = valid_policy();
+        policy.scheduler.enabled = true;
+        policy.scheduler.realtime = RealtimeSchedulerConfig {
+            enabled: true,
+            max_priority: 20,
+            housekeeping_cpus: CpuSet::from_ids([CpuId(7)]),
+        };
+        policy.scheduler.task_profiles.push(TaskProfileConfig {
+            id: "fifo-group".into(),
+            affinity_group: Some("performance".into()),
+            plan: TaskPlan {
+                scheduling_class: Some(SchedulingClass::Fifo),
+                rt_priority: Some(10),
+                ..TaskPlan::default()
+            },
+            scenes: BTreeMap::new(),
+        });
+        policy
+            .validate()
+            .expect("policy-only validation cannot resolve device group");
+
+        let error = ConfigBundle { device, policy }
+            .validate_cross_references()
+            .expect_err("resolved FIFO group overlaps housekeeping");
+        assert!(error.issues().iter().any(|issue| {
+            issue.path.ends_with(".plan.affinity") && issue.message.contains("housekeeping")
+        }));
     }
 
     #[test]
@@ -1820,6 +2846,7 @@ mod tests {
             id: "grouped".into(),
             affinity_group: Some("all".into()),
             plan: TaskPlan::default(),
+            scenes: BTreeMap::new(),
         });
         policy.scheduler.cgroup_classes.push(CgroupClassConfig {
             id: "grouped".into(),

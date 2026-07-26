@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 use uperf_api::{
-    ApiVersion, AppRule, Capabilities, DaemonStatus, FrequencyOverride, HealthStatus,
-    MutationReceipt, ReloadReport, RunningWorkload, SchedulerStatus, ServiceError,
-    TelemetrySnapshot, WorkloadIdentity, WorkloadRequest,
+    ApiVersion, AppRule, Capabilities, DaemonStatus, DecisionTraceEntry, DecisionTraceEntryV2,
+    FrameHintEvent, FrequencyOverride, GovernorStatus, HealthStatus, MutationReceipt, ReloadReport,
+    RunningWorkload, SchedulerStatus, ServiceError, TelemetrySnapshot, WorkloadIdentity,
+    WorkloadRequest,
 };
 use uperf_core::ProcessInfo;
 use uperf_platform::{PlatformError, ProcReader};
@@ -14,6 +15,7 @@ use zbus::{Connection, message::Header, object_server::SignalEmitter};
 
 use crate::{
     auth::{ADMIN_ACTION, Authorizer, CONTROL_ACTION},
+    decision_trace::MAX_TRACE_PAGE,
     runtime::{RuntimeError, RuntimeEvent, RuntimeHandle, TELEMETRY_INTERVAL},
 };
 
@@ -188,6 +190,41 @@ impl DaemonService {
         Ok(self.running_workloads.snapshot(&self.runtime, caller_uid))
     }
 
+    /// Return a read-only, process-local reconciliation timeline.
+    ///
+    /// Trace entries contain logical target IDs and policy state, never sysfs
+    /// paths or process command lines, so this observational method does not
+    /// require a privileged authorization round trip.
+    fn get_decision_trace(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<Vec<DecisionTraceEntry>, ServiceError> {
+        if limit > MAX_TRACE_PAGE {
+            return Err(ServiceError::InvalidArgument(format!(
+                "decision trace limit {limit} exceeds {MAX_TRACE_PAGE}"
+            )));
+        }
+        Ok(self.runtime.decision_trace(after_id, limit))
+    }
+
+    fn get_decision_trace_v2(
+        &self,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<Vec<DecisionTraceEntryV2>, ServiceError> {
+        if limit > MAX_TRACE_PAGE {
+            return Err(ServiceError::InvalidArgument(format!(
+                "decision trace limit {limit} exceeds {MAX_TRACE_PAGE}"
+            )));
+        }
+        Ok(self.runtime.decision_trace_v2(after_id, limit))
+    }
+
+    fn get_governor_status(&self) -> GovernorStatus {
+        self.runtime.snapshot().governor.clone()
+    }
+
     async fn set_mode(
         &self,
         mode: &str,
@@ -256,9 +293,36 @@ impl DaemonService {
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<MutationReceipt, ServiceError> {
-        let caller = self.authorizer.caller_uid(connection, &header).await?;
+        let caller = self
+            .authorizer
+            .require_active_local_session(connection, &header)
+            .await?;
+        let peer = header.sender().map(ToString::to_string);
         self.runtime
-            .clear_foreground_process(caller)
+            .clear_foreground_process(caller, peer)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn report_frame_hint(
+        &self,
+        event: &str,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<MutationReceipt, ServiceError> {
+        let event = event.parse::<FrameHintEvent>().map_err(|()| {
+            ServiceError::InvalidArgument(format!(
+                "unknown frame hint '{event}'; expected render-started, render-idle, \
+                 deadline-missed, display-blanked, or display-unblanked"
+            ))
+        })?;
+        let caller = self
+            .authorizer
+            .require_active_local_session(connection, &header)
+            .await?;
+        let peer = header.sender().map(ToString::to_string);
+        self.runtime
+            .report_frame_hint(event, caller, peer)
             .await
             .map_err(map_runtime_error)
     }
@@ -563,7 +627,12 @@ pub async fn run_signal_pump(
                         // The cache was cleared before this notification. Keep
                         // a human-readable journal record in addition to
                         // structured daemon health.
-                        eprintln!("uperf-linux: running-workload observer degraded: {error}");
+                        tracing::warn!(
+                            source = "running-workload-observer",
+                            event = "degraded",
+                            error = %error,
+                            "running-workload observer degraded"
+                        );
                     }
                     let _ = runtime.report_running_workload_health(result).await;
                 }
@@ -697,6 +766,37 @@ mod tests {
         );
 
         assert!(service.list_app_rules().is_empty());
+    }
+
+    #[test]
+    fn decision_trace_is_read_only_and_enforces_the_advertised_page_limit() {
+        let service = DaemonService::new(
+            RuntimeHandle::snapshot_only(),
+            Authorizer::new(AuthorizationMode::PolicyKit),
+            Arc::new(RunningWorkloadScanner::unavailable()),
+        );
+
+        assert!(
+            service
+                .get_decision_trace(0, MAX_TRACE_PAGE)
+                .expect("read-only trace query")
+                .is_empty()
+        );
+        assert!(matches!(
+            service.get_decision_trace(0, MAX_TRACE_PAGE + 1),
+            Err(ServiceError::InvalidArgument(_))
+        ));
+        assert!(
+            service
+                .get_decision_trace_v2(0, MAX_TRACE_PAGE)
+                .expect("read-only extended trace query")
+                .is_empty()
+        );
+        assert!(matches!(
+            service.get_decision_trace_v2(0, MAX_TRACE_PAGE + 1),
+            Err(ServiceError::InvalidArgument(_))
+        ));
+        assert_eq!(service.get_governor_status(), GovernorStatus::default());
     }
 
     fn process(pid: u32, uid: u32, comm: &str, executable: &str) -> ProcessInfo {

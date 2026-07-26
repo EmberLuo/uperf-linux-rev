@@ -1,9 +1,10 @@
-//! Read-only Linux evdev touch observation.
+//! Read-only Linux evdev interaction observation.
 //!
 //! The low-level [`TouchStateMachine`] is independent of device files and is
 //! intentionally public so event traces can be replayed without root or
 //! `/dev/input`. [`EvdevInputSource`] adds conservative hotplug discovery and
-//! multiplexes supported type-B multitouch devices.
+//! multiplexes supported type-B multitouch, keyboard and relative-pointer
+//! devices.
 //!
 //! The daemon runs its cancellation-aware blocking API on a dedicated
 //! operating-system thread and forwards normalized events into a bounded
@@ -25,7 +26,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use evdev::{AbsoluteAxisCode, EventSummary, SynchronizationCode, raw_stream::RawDevice};
+use evdev::{
+    AbsoluteAxisCode, EventSummary, KeyCode, RelativeAxisCode, SynchronizationCode,
+    raw_stream::RawDevice,
+};
 use uperf_core::InputConfig;
 use uperf_platform::{InputDeviceId, InputEvent, PlatformError, PlatformResult, TouchContactId};
 
@@ -33,6 +37,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const DEFAULT_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(32);
 const MAX_DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const INTERACTION_COALESCE_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EventNodeIdentity {
@@ -208,6 +213,74 @@ pub enum RawTouchEvent {
     PositionY(i32),
     SyncReport,
     SyncDropped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawInteractionEvent {
+    Key { code: KeyCode, value: i32 },
+    Relative { axis: RelativeAxisCode, value: i32 },
+    SyncReport,
+    SyncDropped,
+}
+
+/// Per-device frame and rate coalescing for stateless desktop activity.
+///
+/// Key and relative-axis events become visible only at `SYN_REPORT`, so one
+/// kernel frame produces at most one interaction. Repeated frames inside the
+/// coalescing interval are discarded rather than deferred: a quiet device
+/// therefore never needs a timer to flush stale activity.
+#[derive(Clone, Debug)]
+struct InteractionStateMachine {
+    device_id: InputDeviceId,
+    pending: bool,
+    last_emitted: Option<Instant>,
+    coalesce_interval: Duration,
+}
+
+impl InteractionStateMachine {
+    fn new(device_id: InputDeviceId, coalesce_interval: Duration) -> Self {
+        Self {
+            device_id,
+            pending: false,
+            last_emitted: None,
+            coalesce_interval,
+        }
+    }
+
+    fn handle(&mut self, event: RawInteractionEvent, now: Instant) -> Option<InputEvent> {
+        match event {
+            RawInteractionEvent::Key { code, value } => {
+                if value == 1 && is_interaction_key(code) {
+                    self.pending = true;
+                }
+                None
+            }
+            RawInteractionEvent::Relative { axis, value } => {
+                if value != 0 && is_interaction_relative_axis(axis) {
+                    self.pending = true;
+                }
+                None
+            }
+            RawInteractionEvent::SyncDropped => {
+                self.pending = false;
+                None
+            }
+            RawInteractionEvent::SyncReport => {
+                let had_activity = std::mem::take(&mut self.pending);
+                if !had_activity
+                    || self.last_emitted.is_some_and(|last| {
+                        now.saturating_duration_since(last) < self.coalesce_interval
+                    })
+                {
+                    return None;
+                }
+                self.last_emitted = Some(now);
+                Some(InputEvent::Interaction {
+                    device: self.device_id,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -525,13 +598,26 @@ fn edge_inward_distance(start: Point, current: Point, edge_width: f64) -> f64 {
     maximum.max(0.0)
 }
 
-#[derive(Debug)]
-struct OpenTouchDevice {
-    device: RawDevice,
-    machine: TouchStateMachine,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedDeviceKind {
+    Touch(TouchAxes),
+    Interaction,
 }
 
-impl OpenTouchDevice {
+#[derive(Debug)]
+enum InputDeviceMode {
+    Touch(TouchStateMachine),
+    Interaction(InteractionStateMachine),
+}
+
+#[derive(Debug)]
+struct OpenInputDevice {
+    device: RawDevice,
+    device_id: InputDeviceId,
+    mode: InputDeviceMode,
+}
+
+impl OpenInputDevice {
     fn open(
         path: &Path,
         device_id: InputDeviceId,
@@ -546,83 +632,113 @@ impl OpenTouchDevice {
             .open(path)?;
         let descriptor: OwnedFd = file.into();
         let device = RawDevice::from_fd(descriptor)?;
-        let Some(axes) = touch_axes(&device)? else {
+        let Some(kind) = observed_device_kind(touch_axes(&device)?, supports_interaction(&device))
+        else {
             return Ok(None);
+        };
+        let mode = match kind {
+            ObservedDeviceKind::Touch(axes) => {
+                InputDeviceMode::Touch(TouchStateMachine::new(device_id, axes, config))
+            }
+            ObservedDeviceKind::Interaction => InputDeviceMode::Interaction(
+                InteractionStateMachine::new(device_id, INTERACTION_COALESCE_INTERVAL),
+            ),
         };
         Ok(Some(Self {
             device,
-            machine: TouchStateMachine::new(device_id, axes, config),
+            device_id,
+            mode,
         }))
+    }
+
+    #[must_use]
+    const fn is_touch(&self) -> bool {
+        matches!(&self.mode, InputDeviceMode::Touch(_))
     }
 
     fn read_available(&mut self, output: &mut VecDeque<InputEvent>) -> io::Result<()> {
         let events = self.device.fetch_events()?.collect::<Vec<_>>();
         for event in events {
-            let Some(event) = map_evdev_event(event) else {
-                continue;
-            };
-            let was_desynchronized = self.machine.is_desynchronized();
-            output.extend(self.machine.handle(event));
-            if was_desynchronized
-                && matches!(event, RawTouchEvent::SyncReport)
-                && !self.machine.is_desynchronized()
-                && let Some((tracking_id, raw_x, raw_y)) = self.single_slot_kernel_snapshot()?
-            {
-                output.extend(self.machine.rebuild_single_slot(tracking_id, raw_x, raw_y));
+            match &mut self.mode {
+                InputDeviceMode::Touch(machine) => {
+                    let Some(event) = map_touch_event(event) else {
+                        continue;
+                    };
+                    let was_desynchronized = machine.is_desynchronized();
+                    output.extend(machine.handle(event));
+                    if was_desynchronized
+                        && matches!(event, RawTouchEvent::SyncReport)
+                        && !machine.is_desynchronized()
+                        && let Some((tracking_id, raw_x, raw_y)) =
+                            single_slot_kernel_snapshot(&self.device, machine.axes)?
+                    {
+                        output.extend(machine.rebuild_single_slot(tracking_id, raw_x, raw_y));
+                    }
+                }
+                InputDeviceMode::Interaction(machine) => {
+                    let Some(event) = map_interaction_event(event) else {
+                        continue;
+                    };
+                    if let Some(event) = machine.handle(event, Instant::now()) {
+                        output.push_back(event);
+                    }
+                }
             }
         }
         Ok(())
     }
-
-    /// Query enough current state to safely rebuild a single-slot device.
-    ///
-    /// Linux exposes complete multi-slot state through `EVIOCGMTSLOTS`, but
-    /// evdev 0.13 does not expose that ioctl through its safe API and this
-    /// workspace forbids unsafe code. For a multi-slot device we therefore
-    /// deliberately keep the device-scoped reset and wait for fresh tracking
-    /// events instead of fabricating an incomplete contact set. For a
-    /// single-slot device, `EVIOCGABS` is complete and evdev exposes it safely.
-    fn single_slot_kernel_snapshot(&self) -> io::Result<Option<(i32, i32, i32)>> {
-        let axes = self.machine.axes;
-        if axes.slots.minimum != axes.slots.maximum {
-            return Ok(None);
-        }
-        let mut tracking_id = None;
-        let mut raw_x = None;
-        let mut raw_y = None;
-        for (axis, info) in self.device.get_absinfo()? {
-            match axis {
-                AbsoluteAxisCode::ABS_MT_TRACKING_ID => tracking_id = Some(info.value()),
-                AbsoluteAxisCode::ABS_MT_POSITION_X => raw_x = Some(info.value()),
-                AbsoluteAxisCode::ABS_MT_POSITION_Y => raw_y = Some(info.value()),
-                _ => {}
-            }
-        }
-        tracking_id
-            .zip(raw_x)
-            .zip(raw_y)
-            .map(|((tracking_id, raw_x), raw_y)| (tracking_id, raw_x, raw_y))
-            .map(Some)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "single-slot touch device omitted required absolute-axis state",
-                )
-            })
-    }
 }
 
-/// Multiplexed, read-only source for dynamically discovered touch devices.
+/// Query enough current state to safely rebuild a single-slot device.
+///
+/// Linux exposes complete multi-slot state through `EVIOCGMTSLOTS`, but evdev
+/// 0.13 does not expose that ioctl through its safe API and this workspace
+/// forbids unsafe code. For a multi-slot device we therefore deliberately keep
+/// the device-scoped reset and wait for fresh tracking events instead of
+/// fabricating an incomplete contact set. For a single-slot device,
+/// `EVIOCGABS` is complete and evdev exposes it safely.
+fn single_slot_kernel_snapshot(
+    device: &RawDevice,
+    axes: TouchAxes,
+) -> io::Result<Option<(i32, i32, i32)>> {
+    if axes.slots.minimum != axes.slots.maximum {
+        return Ok(None);
+    }
+    let mut tracking_id = None;
+    let mut raw_x = None;
+    let mut raw_y = None;
+    for (axis, info) in device.get_absinfo()? {
+        match axis {
+            AbsoluteAxisCode::ABS_MT_TRACKING_ID => tracking_id = Some(info.value()),
+            AbsoluteAxisCode::ABS_MT_POSITION_X => raw_x = Some(info.value()),
+            AbsoluteAxisCode::ABS_MT_POSITION_Y => raw_y = Some(info.value()),
+            _ => {}
+        }
+    }
+    tracking_id
+        .zip(raw_x)
+        .zip(raw_y)
+        .map(|((tracking_id, raw_x), raw_y)| (tracking_id, raw_x, raw_y))
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "single-slot touch device omitted required absolute-axis state",
+            )
+        })
+}
+
+/// Multiplexed, read-only source for dynamically discovered input devices.
 ///
 /// The source periodically scans `eventN` nodes below its root. Supported
-/// devices can appear and disappear at runtime. Removal emits a device-scoped
-/// `Resync`; addition receives a fresh opaque identity and cannot disturb
-/// contacts belonging to other devices.
+/// devices can appear and disappear at runtime. Removing a touch device emits
+/// a device-scoped `Resync`; every addition receives a fresh opaque identity
+/// and cannot disturb contacts belonging to other devices.
 #[derive(Debug)]
 pub struct EvdevInputSource {
     root: PathBuf,
     config: GestureConfig,
-    devices: BTreeMap<PathBuf, OpenTouchDevice>,
+    devices: BTreeMap<PathBuf, OpenInputDevice>,
     device_identities: BTreeMap<PathBuf, EventNodeIdentity>,
     ignored_nodes: BTreeMap<PathBuf, EventNodeIdentity>,
     failed_nodes: BTreeMap<PathBuf, FailedEventNode>,
@@ -689,7 +805,7 @@ impl EvdevInputSource {
         Ok(source)
     }
 
-    /// Number of currently open type-B multitouch devices.
+    /// Number of currently open supported input devices.
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.len()
@@ -780,9 +896,11 @@ impl EvdevInputSource {
             .into_iter()
             .collect::<Vec<_>>();
         for path in removed {
-            if let Some(device) = self.devices.remove(&path) {
+            if let Some(device) = self.devices.remove(&path)
+                && device.is_touch()
+            {
                 self.pending.push_back(InputEvent::Resync {
-                    device: Some(device.machine.device_id),
+                    device: Some(device.device_id),
                 });
             }
             self.device_identities.remove(&path);
@@ -802,9 +920,10 @@ impl EvdevInputSource {
             }
             if self.device_identities.remove(&path).is_some()
                 && let Some(device) = self.devices.remove(&path)
+                && device.is_touch()
             {
                 self.pending.push_back(InputEvent::Resync {
-                    device: Some(device.machine.device_id),
+                    device: Some(device.device_id),
                 });
             }
             if self
@@ -827,7 +946,7 @@ impl EvdevInputSource {
                 .filter(|failure| failure.identity == identity)
                 .map_or(self.scan_interval, |failure| failure.next_delay);
             let device_id = InputDeviceId::new(self.next_device_id);
-            match OpenTouchDevice::open(&path, device_id, self.config) {
+            match OpenInputDevice::open(&path, device_id, self.config) {
                 Ok(Some(device)) => {
                     self.next_device_id = self.next_device_id.checked_add(1).ok_or_else(|| {
                         PlatformError::invalid(
@@ -887,9 +1006,11 @@ impl EvdevInputSource {
         let had_disconnected = !disconnected.is_empty();
         if had_disconnected {
             for path in disconnected {
-                if let Some(device) = self.devices.remove(&path) {
+                if let Some(device) = self.devices.remove(&path)
+                    && device.is_touch()
+                {
                     self.pending.push_back(InputEvent::Resync {
-                        device: Some(device.machine.device_id),
+                        device: Some(device.device_id),
                     });
                 }
                 if let Some(identity) = self.device_identities.remove(&path) {
@@ -944,7 +1065,58 @@ fn touch_axes(device: &RawDevice) -> io::Result<Option<TouchAxes>> {
 }
 
 #[must_use]
-fn map_evdev_event(event: evdev::InputEvent) -> Option<RawTouchEvent> {
+const fn observed_device_kind(
+    touch_axes: Option<TouchAxes>,
+    supports_interaction: bool,
+) -> Option<ObservedDeviceKind> {
+    match touch_axes {
+        Some(axes) => Some(ObservedDeviceKind::Touch(axes)),
+        None if supports_interaction => Some(ObservedDeviceKind::Interaction),
+        None => None,
+    }
+}
+
+#[must_use]
+fn supports_interaction(device: &RawDevice) -> bool {
+    device
+        .supported_keys()
+        .is_some_and(|keys| keys.iter().any(is_interaction_key))
+        || device
+            .supported_relative_axes()
+            .is_some_and(|axes| axes.iter().any(is_interaction_relative_axis))
+}
+
+#[must_use]
+const fn is_interaction_key(code: KeyCode) -> bool {
+    !matches!(
+        code,
+        KeyCode::KEY_POWER
+            | KeyCode::KEY_POWER2
+            | KeyCode::KEY_SLEEP
+            | KeyCode::KEY_WAKEUP
+            | KeyCode::KEY_SUSPEND
+            | KeyCode::KEY_RESTART
+            | KeyCode::KEY_COFFEE
+            | KeyCode::KEY_DISPLAY_OFF
+            | KeyCode::KEY_SCREENSAVER
+    )
+}
+
+#[must_use]
+const fn is_interaction_relative_axis(axis: RelativeAxisCode) -> bool {
+    matches!(
+        axis,
+        RelativeAxisCode::REL_X
+            | RelativeAxisCode::REL_Y
+            | RelativeAxisCode::REL_WHEEL
+            | RelativeAxisCode::REL_HWHEEL
+            | RelativeAxisCode::REL_WHEEL_HI_RES
+            | RelativeAxisCode::REL_HWHEEL_HI_RES
+    )
+}
+
+#[must_use]
+fn map_touch_event(event: evdev::InputEvent) -> Option<RawTouchEvent> {
     match event.destructure() {
         EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, value) => {
             Some(RawTouchEvent::Slot(value))
@@ -963,6 +1135,23 @@ fn map_evdev_event(event: evdev::InputEvent) -> Option<RawTouchEvent> {
         }
         EventSummary::Synchronization(_, SynchronizationCode::SYN_DROPPED, _) => {
             Some(RawTouchEvent::SyncDropped)
+        }
+        _ => None,
+    }
+}
+
+#[must_use]
+fn map_interaction_event(event: evdev::InputEvent) -> Option<RawInteractionEvent> {
+    match event.destructure() {
+        EventSummary::Key(_, code, value) => Some(RawInteractionEvent::Key { code, value }),
+        EventSummary::RelativeAxis(_, axis, value) => {
+            Some(RawInteractionEvent::Relative { axis, value })
+        }
+        EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
+            Some(RawInteractionEvent::SyncReport)
+        }
+        EventSummary::Synchronization(_, SynchronizationCode::SYN_DROPPED, _) => {
+            Some(RawInteractionEvent::SyncDropped)
         }
         _ => None,
     }
@@ -1046,6 +1235,245 @@ mod tests {
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1.0e-9, "{actual} != {expected}");
+    }
+
+    fn interaction_frame(
+        machine: &mut InteractionStateMachine,
+        event: RawInteractionEvent,
+        now: Instant,
+    ) -> Option<InputEvent> {
+        assert!(machine.handle(event, now).is_none());
+        machine.handle(RawInteractionEvent::SyncReport, now)
+    }
+
+    #[test]
+    fn key_press_is_committed_once_at_report_boundary() {
+        let now = Instant::now();
+        let mut machine = InteractionStateMachine::new(DEVICE, INTERACTION_COALESCE_INTERVAL);
+        assert!(
+            machine
+                .handle(
+                    RawInteractionEvent::Key {
+                        code: KeyCode::KEY_A,
+                        value: 1,
+                    },
+                    now,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            machine.handle(RawInteractionEvent::SyncReport, now),
+            Some(InputEvent::Interaction { device: DEVICE })
+        );
+        assert!(
+            machine
+                .handle(RawInteractionEvent::SyncReport, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn key_release_repeat_and_system_controls_are_ignored() {
+        let now = Instant::now();
+        let mut machine = InteractionStateMachine::new(DEVICE, INTERACTION_COALESCE_INTERVAL);
+        for event in [
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_A,
+                value: 0,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_A,
+                value: 2,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_POWER,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_POWER2,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_SLEEP,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_WAKEUP,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_SUSPEND,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_RESTART,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_COFFEE,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_DISPLAY_OFF,
+                value: 1,
+            },
+            RawInteractionEvent::Key {
+                code: KeyCode::KEY_SCREENSAVER,
+                value: 1,
+            },
+        ] {
+            assert!(machine.handle(event, now).is_none());
+        }
+        assert!(
+            machine
+                .handle(RawInteractionEvent::SyncReport, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn relative_motion_and_wheel_are_coalesced_per_frame() {
+        let now = Instant::now();
+        let mut machine = InteractionStateMachine::new(DEVICE, INTERACTION_COALESCE_INTERVAL);
+        for axis in [
+            RelativeAxisCode::REL_X,
+            RelativeAxisCode::REL_Y,
+            RelativeAxisCode::REL_WHEEL,
+        ] {
+            assert!(
+                machine
+                    .handle(RawInteractionEvent::Relative { axis, value: 1 }, now,)
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            machine.handle(RawInteractionEvent::SyncReport, now),
+            Some(InputEvent::Interaction { device: DEVICE })
+        );
+
+        assert!(
+            interaction_frame(
+                &mut machine,
+                RawInteractionEvent::Relative {
+                    axis: RelativeAxisCode::REL_Z,
+                    value: 1,
+                },
+                now + INTERACTION_COALESCE_INTERVAL,
+            )
+            .is_none()
+        );
+        assert!(
+            interaction_frame(
+                &mut machine,
+                RawInteractionEvent::Relative {
+                    axis: RelativeAxisCode::REL_X,
+                    value: 0,
+                },
+                now + INTERACTION_COALESCE_INTERVAL,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn interaction_frames_are_rate_limited_per_device() {
+        let now = Instant::now();
+        let mut machine = InteractionStateMachine::new(DEVICE, INTERACTION_COALESCE_INTERVAL);
+        let press = RawInteractionEvent::Key {
+            code: KeyCode::KEY_ENTER,
+            value: 1,
+        };
+        assert_eq!(
+            interaction_frame(&mut machine, press, now),
+            Some(InputEvent::Interaction { device: DEVICE })
+        );
+        assert!(interaction_frame(&mut machine, press, now + Duration::from_millis(15),).is_none());
+        assert_eq!(
+            interaction_frame(&mut machine, press, now + INTERACTION_COALESCE_INTERVAL,),
+            Some(InputEvent::Interaction { device: DEVICE })
+        );
+    }
+
+    #[test]
+    fn dropped_frame_discards_partial_interaction() {
+        let now = Instant::now();
+        let mut machine = InteractionStateMachine::new(DEVICE, INTERACTION_COALESCE_INTERVAL);
+        assert!(
+            machine
+                .handle(
+                    RawInteractionEvent::Relative {
+                        axis: RelativeAxisCode::REL_X,
+                        value: 1,
+                    },
+                    now,
+                )
+                .is_none()
+        );
+        assert!(
+            machine
+                .handle(RawInteractionEvent::SyncDropped, now)
+                .is_none()
+        );
+        assert!(
+            machine
+                .handle(RawInteractionEvent::SyncReport, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multitouch_capability_takes_precedence_over_desktop_activity() {
+        assert!(matches!(
+            observed_device_kind(Some(axes()), true),
+            Some(ObservedDeviceKind::Touch(_))
+        ));
+        assert_eq!(
+            observed_device_kind(None, true),
+            Some(ObservedDeviceKind::Interaction)
+        );
+        assert_eq!(observed_device_kind(None, false), None);
+    }
+
+    #[test]
+    fn maps_key_relative_and_report_events_for_interaction_devices() {
+        assert_eq!(
+            map_interaction_event(evdev::InputEvent::new(
+                evdev::EventType::KEY.0,
+                KeyCode::KEY_A.0,
+                1,
+            )),
+            Some(RawInteractionEvent::Key {
+                code: KeyCode::KEY_A,
+                value: 1,
+            })
+        );
+        assert_eq!(
+            map_interaction_event(evdev::InputEvent::new(
+                evdev::EventType::RELATIVE.0,
+                RelativeAxisCode::REL_WHEEL.0,
+                -1,
+            )),
+            Some(RawInteractionEvent::Relative {
+                axis: RelativeAxisCode::REL_WHEEL,
+                value: -1,
+            })
+        );
+        assert_eq!(
+            map_interaction_event(evdev::InputEvent::new(
+                evdev::EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            )),
+            Some(RawInteractionEvent::SyncReport)
+        );
+        assert_eq!(
+            map_interaction_event(evdev::InputEvent::new(
+                evdev::EventType::SWITCH.0,
+                evdev::SwitchCode::SW_LID.0,
+                1,
+            )),
+            None
+        );
     }
 
     #[test]

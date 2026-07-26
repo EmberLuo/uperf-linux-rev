@@ -29,6 +29,12 @@ After inspection and successful validation, an administrator may run:
 
   systemctl enable --now uperf-linux.service
 
+Experimental SCHED_FIFO plans remain blocked by RestrictRealtime=yes. The
+inactive example at
+/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf must be reviewed and
+copied into /etc/systemd/system/uperf-linux.service.d/ explicitly, in addition
+to enabling scheduler.realtime in the validated policy.
+
 The package removal script stops the daemon and refuses to continue when
 /run/uperf-linux/recovery.json remains. Do not delete that file manually:
 it is the evidence needed to restore mutations made during the current boot.

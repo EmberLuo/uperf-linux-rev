@@ -1,0 +1,66 @@
+{
+  "meta": {
+    "name": "synthetic-two-cluster",
+    "author": "uperf-linux-rev"
+  },
+  "modules": {
+    "cpu": {
+      "powerModel": [
+        {
+          "efficiency": 100,
+          "nr": 2,
+          "typicalPower": 0.5,
+          "typicalFreq": 1.8,
+          "sweetFreq": 1.4,
+          "plainFreq": 1.0,
+          "freeFreq": 0.8
+        },
+        {
+          "efficiency": 250,
+          "nr": 1,
+          "typicalPower": 1.5,
+          "typicalFreq": 2.6,
+          "sweetFreq": 1.8,
+          "plainFreq": 1.2,
+          "freeFreq": 1.0
+        }
+      ]
+    }
+  },
+  "initials": {
+    "cpu": {
+      "baseSampleTime": 0.02,
+      "latencyTime": 0.3,
+      "predictThd": 0.2,
+      "margin": 0.15,
+      "burst": 0,
+      "limitEfficiency": false,
+      "slowLimitPower": 2.0,
+      "fastLimitPower": 4.0,
+      "fastLimitCapacity": 8.0,
+      "fastLimitRecoverScale": 0.5
+    }
+  },
+  "presets": {
+    "powersave": {
+      "*": {
+        "cpu.margin": 0.1,
+        "cpu.slowLimitPower": 1.0,
+        "cpu.fastLimitPower": 2.0
+      }
+    },
+    "balance": {
+      "*": {},
+      "idle": {
+        "cpu.baseSlackTime": 0.08
+      }
+    },
+    "performance": {
+      "*": {
+        "cpu.burst": 0.2,
+        "cpu.slowLimitPower": 4.0,
+        "cpu.fastLimitPower": 6.0
+      }
+    }
+  }
+}
