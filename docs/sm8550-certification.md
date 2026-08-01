@@ -26,8 +26,8 @@ certification run.
 - `uperf-probe --energy-draft` records the live OPP tables and marks every
   unmeasured power value as requiring calibration.
 - Every calibration input was produced from the target board or an explicitly
-  documented laboratory measurement; imported reference values are never
-  described as measured hardware data.
+  documented laboratory measurement; reference estimates are never described
+  as measured hardware data.
 - The complete three-file v2 configuration passes semantic validation.
 
 Any mismatch fails certification; do not substitute a similarly named node
@@ -66,8 +66,8 @@ Stop any installed daemon first and capture every original value independently.
   `sweet_frequency_hz`; its typical point reproduces configured typical power.
 - The measured model contains every live OPP used by planning, with monotonic
   capacity and power values and documented measurement conditions.
-- Fixed replay traces are deterministic under sampling jitter and agree with a
-  small brute-force multi-cluster allocation oracle.
+- Fixed governor vectors are deterministic under sampling jitter and agree
+  with a small brute-force multi-cluster allocation oracle.
 - The active/idle sampler moves only within 10–40 ms and 80 ms respectively;
   the thermal observer remains independent.
 - Prediction and nonzero burst bypass ramp latency; downscaling and a newly
@@ -75,13 +75,10 @@ Stop any installed daemon first and capture every original value independently.
 - A short workload uses the fast budget, exhausts its energy bucket, and
   settles under the slow budget. Suspend time does not charge or refill the
   bucket.
-- `shadow` applies the exact legacy limits while recording candidate limits.
-  `energy` is root opt-in and automatically refuses an incomplete model or
-  power budget.
-- On the certified workload suite, energy rollout either lowers mean energy at
+- The governor automatically refuses an incomplete model or power budget.
+- On the certified workload suite, the energy governor either lowers mean energy at
   equal frame time or improves p95 frame time at equal energy without a
-  regression outside the agreed confidence interval. Otherwise legacy remains
-  the default.
+  regression outside the agreed confidence interval.
 
 ## Focus reporting gate
 
@@ -119,9 +116,9 @@ defocused process must return to its captured values, not to a default.
 - Newly created threads receive their matching plan within 500 ms. Exited or
   reused TIDs are never restored from another task's snapshot.
 - Independent `uclamp_min` and `uclamp_max` patches preserve an omitted bound.
-- A compositor paint starts only the current interaction generation. A
-  presentation interval over 1.5 times the live output interval produces a
-  rate-limited `Junk` hint only in that generation.
+- A compositor paint starts only the current interaction generation. The
+  bundled GJS reporter does not subscribe to Mutter's untyped presentation
+  pointer; enabling it must not produce GJS marshalling errors.
 - After 50 ms without a paint the reporter emits render idle; after the
   daemon's 200 ms slack, only touch/trigger/gesture/junk hints from the same
   interaction end. Boost and Wake remain untouched.
@@ -146,7 +143,7 @@ feature.
   requires a reviewed priority no greater than the configured maximum, an
   affinity disjoint from at least one housekeeping CPU, and the separate
   systemd drop-in. Exact class/priority rollback is fault-injected; reference
-  priorities 97/98 are never imported.
+  priorities 97/98 are rejected.
 
 ## Release gate
 

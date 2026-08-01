@@ -1,8 +1,7 @@
 # uperf-linux compositor reporter
 
-Reports the focused window's PID, compositor frame lifecycle, missed
-presentation deadlines, and Mutter's physical display power state to
-`org.uperflinux.Daemon1`.
+Reports the focused window's PID, compositor render lifecycle, and Mutter's
+physical display power state to `org.uperflinux.Daemon2`.
 
 The extension is only a reporter. It decides nothing: the daemon authorizes
 every report (same UID, active local logind session, not a protected process),
@@ -48,7 +47,6 @@ uperfctl health          # a rejected PID appears here as focus.rejected
 | Modal dialog focused | reports the transient parent, so the lease does not thrash |
 | First compositor paint after ≥50 ms quiet | `render-started` |
 | Compositor becomes quiet for 50 ms | `render-idle`; the daemon adds its own 200 ms slack |
-| Presentation interval exceeds 1.5× the output refresh interval | `deadline-missed`; the daemon accepts it only inside the current interaction generation |
 | Mutter DisplayConfig enters standby/suspend/off | `display-blanked`, renewed every 5 seconds while blank |
 | Mutter DisplayConfig returns to on | `display-unblanked` |
 | Daemon restarts | name-owner watch clears the dedup cache and re-reports |
@@ -62,12 +60,12 @@ does not install keyboard or pointer listeners. It clears application focus as
 soon as the shell leaves user mode, suppresses frame hints while locked, and
 keeps only Mutter's `PowerSaveMode` observer alive.
 
-`render-started`, `render-idle`, and `deadline-missed` are deliberately
-best-effort signals. The daemon ignores them unless the same D-Bus peer owns the
-current reporter lease and an interaction is active; an older daemon that does
-not expose `ReportFrameHint` therefore remains compatible. Display state uses a
-bounded retry and an idempotent keepalive so a long lock interval does not lose
-the authenticated reporter lease.
+`render-started` and `render-idle` are deliberately best-effort signals. The
+daemon ignores them unless the same D-Bus peer owns the current reporter lease
+and an interaction is active. Mutter's `ClutterStage::presented` carries a raw
+frame-info pointer that GJS cannot safely marshal, so this extension does not
+subscribe to it. Display state uses a bounded retry and an idempotent keepalive
+so a long lock interval does not lose the authenticated reporter lease.
 
 The bundled reporter assumes `scheduler.focus.lease_ttl_ms` is at least
 15 seconds, matching the packaged policy. Its 5-second renewal interval leaves

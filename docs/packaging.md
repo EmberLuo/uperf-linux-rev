@@ -48,7 +48,7 @@ Rust source packages when network-free reproducibility is required.
 | Path | Package behavior |
 | --- | --- |
 | `/usr/bin/uperf-linux` | root daemon |
-| `/usr/bin/uperfctl` | D-Bus client and offline migration/validation |
+| `/usr/bin/uperfctl` | D-Bus client and offline configuration validation |
 | `/usr/bin/uperf-probe` | read-only discovery |
 | `/usr/bin/uperf-gui` | GUI edition only |
 | `/etc/uperf-linux/device.json` | optional administrator profile override |
@@ -122,8 +122,7 @@ sudo systemctl restart uperf-linux.service
 The example changes only `RestrictRealtime=no` and `LimitRTPRIO=50`; the policy
 default remains disabled with a configured maximum of 20. FIFO class and exact
 priority are journaled and rolled back as one owned field. `SCHED_RR` is not
-supported. Uperf v3 reference priorities such as 97/98 remain disabled import
-candidates and are never activated automatically.
+supported. Out-of-policy priorities such as 97/98 are rejected.
 
 ## Upgrade and removal safety
 
@@ -141,7 +140,7 @@ daemon-managed app rules in `/var/lib` are also retained.
 
 ## Policy files
 
-The D-Bus policy lets root own `org.uperflinux.Daemon1` and lets local clients
+The D-Bus policy lets root own `org.uperflinux.Daemon2` and lets local clients
 send requests and receive signals. Authorization decisions stay in the daemon:
 active-workload clients submit only a PID, then the daemon reads the stable
 identity and verifies ownership before accepting it. Global profile control

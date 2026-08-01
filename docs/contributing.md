@@ -8,7 +8,7 @@ all mutation in `uperf-actuator`. API clients must never acquire a second
 hardware-write path.
 
 Changes to public configuration or D-Bus contracts require an explicit
-versioning decision, contract tests, migration impact, and documentation.
+versioning decision, contract tests, contract impact, and documentation.
 Configuration-type changes must regenerate all committed JSON schemas.
 Dependency and Rust toolchain upgrades are reviewed as explicit pull requests;
 they are not rolled silently into unrelated work.

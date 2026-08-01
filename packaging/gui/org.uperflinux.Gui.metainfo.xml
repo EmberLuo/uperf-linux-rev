@@ -25,6 +25,7 @@
     <binary>uperf-gui</binary>
   </provides>
   <releases>
+    <release version="0.1.4" date="2026-08-01" type="development"/>
     <release version="0.1.1" date="2026-07-24" type="development"/>
     <release version="0.1.0" date="2026-07-23" type="development"/>
   </releases>

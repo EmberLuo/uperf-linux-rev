@@ -3,7 +3,7 @@
 This directory documents the first-party measurement workflow for
 `uperf-linux`. Calibration worksheets and reports are review artifacts, not
 runtime configuration. Do not copy an unfinished artifact into
-`/etc/uperf-linux` or enable the `energy` rollout from unmeasured data.
+`/etc/uperf-linux` or activate an unmeasured energy model.
 
 ## 1. Capture the target
 
@@ -73,15 +73,11 @@ Validate the complete configuration bundle:
 uperfctl config validate /path/to/review-bundle
 ```
 
-## 4. Roll out safely
+## 4. Certify before installation
 
-Begin with `policy.governor.rollout = "shadow"`. Replay recorded traces and
-compare candidate limits, predicted power, budget selection, and bucket state
-against the legacy result without applying the energy decision.
-
-Only a root-reviewed, hardware-specific profile may opt into `energy`. Before
-promotion, complete the relevant hardware certification checklist, including
-fault-injection recovery, event-to-verified-apply latency, a long soak, and an
-A/B result showing either lower energy at equivalent performance or better
-performance at equivalent energy. If that evidence is absent or inconclusive,
-keep `legacy` as the default.
+Only install a root-reviewed, hardware-specific profile after completing the
+relevant hardware certification checklist, including fault-injection recovery,
+event-to-verified-apply latency, a long soak, and an A/B result showing either
+lower energy at equivalent performance or better performance at equivalent
+energy. An incomplete model is rejected instead of falling back to another
+planner.

@@ -16,17 +16,16 @@ The control loop is explicitly:
 ```text
 authenticated scene and workload events
 → observed load, thermal and session state
-→ deterministic legacy/shadow/energy transition
+→ deterministic energy-governor transition
 → latest-wins frequency worker + independent scheduler worker
 → verified applied state
-→ bounded decision timeline and offline replay
+→ bounded decision timeline
 ```
 
 Frequency planning is stateful but pure: `GovernorInput` plus
 `GovernorState` produces a `GovernorTransition`, its next state, limits, and
 diagnostics. Wall-clock reads, sampling, sysfs writes, journaling, and D-Bus
-do not occur inside the planner. This makes recorded traces deterministic and
-allows the new algorithm to run in shadow before it can control hardware.
+do not occur inside the planner.
 
 The first mutation of a frequency target durably records its full hardware
 range and ownership manifest. Later OPP updates to an already owned target use
@@ -50,29 +49,44 @@ hardware/admin/thermal cap
 > default profile
 ```
 
-Burst and prediction may bypass ramp latency and power budget, but never a
-hardware, administrator, thermal, recovery, or degraded-state constraint.
+Burst bypasses ramp latency and the package power budget; prediction bypasses
+ramp latency only. Neither can bypass a hardware, administrator, thermal,
+recovery, or degraded-state constraint.
 
 Some configuration vocabulary and curve semantics were informed by the public
 [Uperf v3 reference](https://github.com/yinwanxi/Uperf-Game-Turbo). No upstream
-configuration corpus, binary, injection library, script, or derived device
-calibration is embedded in this repository. The optional importer operates on
-a document supplied by its user; algorithms are independently implemented and
-tested with project-authored synthetic fixtures and locally measured data.
+configuration corpus, binary, injection library, or script is embedded in this
+repository. The SM8550 device profile contains an audited transcription of the
+`sdm8g2` CPU reference curve and preset power budgets from commit
+`b2f10bbf0a3f192387e48b0abc929cb93f4eee43`. The energy governor independently
+reconstructs the reference sparse control-OPP construction,
+absolute-cost ordering, capacity-scaled demand, asymmetric predictor, bounded
+normal/burst growth, per-core load power estimate, energy-bucket sign switch,
+and stateful 0.9/1.1 package-cap feedback. Binary-guided behavior is covered by
+independent golden tests, but the wider control path is not claimed to be an
+instruction-for-instruction clone. Linux observed-frequency readback, hard
+safety caps and ownership remain deliberate integration choices.
+The shipped sampler and ramp timing are a shared, balance-oriented Linux
+setting rather than a scene-by-scene clone of every Android preset override.
+
+`measured-opp-v1` remains calibration-required. The bundled
+`reference-curve-v1` uses Android-derived model values, not Linux rail-power
+measurements, and is not rail-power certification; Linux thermal and ownership
+safeguards remain authoritative.
 
 The first release uses one systemd-hardened root daemon. The actuator boundary
 is intentionally suitable for a future minimal privileged helper without
 changing policy or public API.
 
-The public API and configuration start at new major versions. Legacy C
-configuration is migrated offline rather than supported as a second runtime
-contract.
+Only the current configuration and recovery-journal contracts are accepted.
 
 ## Consequences
 
 - A device JSON existing in the tree does not certify its energy model or
-  writable nodes. Active energy rollout requires a calibrated model, while
-  scalar/interconnect targets require exact live-node review.
+  writable nodes. CPU planning requires either a calibrated `measured-opp-v1`
+  model or a root-reviewed `reference-curve-v1`; the latter is not measured
+  rail-power certification. Scalar/interconnect targets require exact
+  live-node review.
 - Hardware certification, latency percentiles, energy/frame-time A/B results,
   and 24-hour soak evidence remain release artifacts; the implementation does
   not manufacture a passing result.
@@ -80,5 +94,5 @@ contract.
   `IdleHint`/`LockedHint` cannot claim that a physical display is blank.
 - Competing power daemons are detected and reported, never killed or
   reconfigured automatically.
-- Experimental FIFO requires independent policy and systemd opt-ins and is not
-  a compatibility promise for reference priorities.
+- Experimental FIFO requires independent policy and systemd opt-ins and does
+  not accept the reference priorities unchanged.

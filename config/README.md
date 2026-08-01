@@ -8,8 +8,8 @@ packaging:
 - `policy.json`: device-neutral profiles, scene patches, observers, and
   scheduler policy using logical CPU groups;
 - `apps.json`: an empty seed for daemon-managed application rules;
-- `calibration/*.json`: non-installable, provenance-rich measurement/import
-  seeds that remain `requires-calibration`;
+- `calibration/*.json`: non-installable, provenance-rich measurement seeds
+  that remain `requires-calibration`;
 - `schema/*-v2.schema.json`: Draft 2020-12 schemas generated from the public
   `uperf-core` configuration types.
 
@@ -51,11 +51,11 @@ configuration type must run
 `cargo run --package uperf-core --example generate_schemas` and review the
 resulting contract diff.
 
-## Energy models and rollout
+## Energy models
 
 An energy model belongs to a CPU policy selected by its exact
-`related_cpus`, never by a transient `policyN` directory. Imported Uperf v3
-data uses the reference curve:
+`related_cpus`, never by a transient `policyN` directory. Reference estimates
+use this curve shape:
 
 ```json
 {
@@ -72,25 +72,9 @@ data uses the reference curve:
 ```
 
 Those numbers illustrate the wire shape; copying them does not calibrate a
-machine. `relative_performance` is Uperf v3's `efficiency` field under a name
-that reflects how the curve uses it. Core count is derived from live
-`related_cpus`; imported `nr` never controls Linux topology. Reference curves
-must satisfy `plain <= sweet <= typical` and `free <= typical`; `free` is not
-required to be below `plain`.
-
-The v3 importer resolves an omitted `--cluster-cpus` mapping from
-`/sys/devices/system/cpu/cpufreq/policy*/related_cpus` plus `cpuinfo_max_freq`
-(or the maximum advertised OPP), using `nr` and frequency rank. Use
-`--sysfs-root` for a fixture or mounted target. Missing, tied, or conflicting
-evidence is a hard error that requires explicit cluster lists. Android
-`modules.sched.cpumask` is retained only as comparison evidence in
-`import-report.json`; it is never used as Linux topology.
-
-Frequency and budget patches for `idle`, `touch`, `trigger`, `gesture`, `junk`,
-and `switch` are imported when present. `sched.scene` is not emitted as a
-mutable policy field: the importer records agreement with the fixed Linux
-scene mapping as inferred evidence and records mismatches or unknown scene
-fields as unsupported.
+machine. Core count is derived from live `related_cpus`. Reference curves must
+satisfy `free <= plain <= sweet <= typical`, matching the ordering required by
+the sparse control-OPP table.
 
 Linux measurements should use an explicit OPP table:
 
@@ -118,22 +102,18 @@ Every value must come from a documented measurement run; a two-row example is
 not a production calibration. `uperf-probe --energy-draft` supplies the live
 frequency rows but deliberately leaves power null.
 
-`policy.governor.rollout` is `legacy`, `shadow`, or `energy`. Omitted means
-`legacy`. `shadow` computes the candidate transition and diagnostics while
-applying legacy limits. `energy` requires every automatic CPU policy to have a
-model and every profile to have a complete power budget:
+Every automatic CPU policy requires an energy model, and every profile requires
+a complete power budget. Governor timing and prediction thresholds are shared
+policy:
 
 ```json
 {
   "governor": {
-    "rollout": "shadow",
     "active_sample_ms": 20,
     "idle_sample_ms": 80,
     "active_load_threshold": 0.30,
     "idle_load_threshold": 0.15,
-    "ema_time_constant_ms": 40,
     "predict_threshold": 0.15,
-    "prediction_gain": 1.0,
     "ramp_latency_ms": 100,
     "min_opp_residency_ms": 10
   }
@@ -144,7 +124,29 @@ The active cadence must be 10–40 ms. Load above the active threshold enters
 that cadence, load below the idle threshold enters the 80 ms cadence, and the
 region between them preserves the current state. This sampler is separate from
 `load.*`, whose longer EMA/dwell drives the heavy-load scene, and from the
-independent thermal sampler.
+independent thermal sampler. The governor uses fixed 0.98/0.97 asymmetric
+predictor coefficients in previous-final-OPP performance units;
+`predict_threshold` controls the raw-load delta bypass.
+
+The shipped SM8550 policy uses the reference balance-oriented 40 ms active and
+80 ms slack cadence as one shared Linux timing. Desktop input and compositor
+events still cause immediate evaluation; they do not wait for the next load
+sample. This is not a scene-by-scene reproduction of every Android preset's
+timing overrides.
+
+For `reference-curve-v1`, the runtime mirrors Uperf v3's sparse control table:
+`free`, `plain`, thirds from `plain` to `sweet`, then quarters from `sweet` to
+the hardware maximum, each snapped to a real OPP and deduplicated. Package
+power uses summed per-CPU load with the reference multi-core correction.
+Frequency demand is capacity-scaled by the previous final OPP, then applies the
+reference asymmetric predictor and bounded margin/burst growth. Burst leaves
+the lowest-performance cluster on normal demand and overrides only the higher
+clusters, as in the reference guide-slot path. A shared persistent cursor moves
+by at most one absolute-cost-ordered transition when modeled power leaves the
+0.9–1.1 budget band; it does not turn a 1W/2W budget directly into a fixed
+frequency cap. Linux readback power estimation, safety caps, and ownership
+remain deliberate integration differences rather than a byte-for-byte Android
+daemon clone.
 
 Each profile-level budget uses exact milliwatts and millijoules:
 
@@ -160,9 +162,9 @@ Each profile-level budget uses exact milliwatts and millijoules:
 ```
 
 A scene may partially override that budget, but a partial scene budget
-requires a complete profile-level base. Nonzero burst bypasses the ramp and
-power budget only; hardware, administrator, thermal, recovery, and degraded
-caps remain absolute.
+requires a complete profile-level base. As in Uperf v3, nonzero burst bypasses
+the ramp and power budget; hardware, administrator, thermal, recovery, and
+degraded caps always remain absolute.
 
 ## Scene-aware task plans
 
@@ -219,8 +221,7 @@ or:
 ```
 
 `leader` means exactly `tid == pid`; it does not guess from a truncated process
-name. The old `comm_regex` sibling field remains decode-compatible but should
-not be used in new files.
+name.
 
 ## Typed scalar resources
 
@@ -254,8 +255,7 @@ tagged `scalar_values`; they cannot supply a path or extend its domain:
 ```
 
 Scalar writes use exact original-value capture, domain validation, readback,
-reverse-order rollback, and the backward-compatible v6 recovery journal
-(tagged frequency/scalar resources were introduced in v5). Do not add a scalar
+reverse-order rollback, and the current v6 recovery journal. Do not add a scalar
 target until its live path, accepted values, units, permissions, and behavior
 have been probed on the exact board. GPU remains `manual_only` unless a future
 profile has a separately trusted utilization source.

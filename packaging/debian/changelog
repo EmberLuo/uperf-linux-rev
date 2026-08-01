@@ -1,3 +1,24 @@
+uperf-linux-rev (0.1.4) unstable; urgency=medium
+
+  * Ship an audited SM8550 reference energy curve and power budgets derived
+    from Uperf v3's sdm8g2 configuration.
+  * Reproduce the reference sparse control OPPs, absolute energy-cost path,
+    load-aware energy bucket, and one-step 0.9/1.1 package-cap feedback.
+  * Preserve Android burst and dynamic cross-cluster efficiency semantics.
+  * Enable the energy governor on the exact 3+4+1 SM8550 CPU topology while
+    retaining Linux hardware, administrator, thermal, and recovery caps.
+  * Drop the incomplete SM8750 profile, which has no current energy model.
+  * Remove legacy planners, old configuration importers, and recovery-journal
+    upgrade paths; accept only the current contracts.
+  * Replace the version-1 D-Bus compatibility surface with the exact-match
+    `org.uperflinux.Daemon2` API and one current decision-trace contract.
+  * Keep the GNOME reporter off Mutter's untyped presentation signal while
+    retaining focus, render-lifecycle, and display-power reporting.
+  * Keep Android-derived values explicitly classified as reference data, not
+    Linux rail measurements.
+
+ -- uperf-linux contributors <noreply@example.invalid>  Sat, 01 Aug 2026 00:00:00 +0800
+
 uperf-linux-rev (0.1.1) unstable; urgency=medium
 
   * Add PolicyKit-authorized service enable and start controls to the GUI.
