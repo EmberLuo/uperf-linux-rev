@@ -9,10 +9,7 @@ use std::{
     time::Duration,
 };
 
-use uperf_api::{
-    DecisionFrequency, DecisionScalar, DecisionTraceEntry, DecisionTraceEntryV2,
-    GovernorDiagnosticsStatus,
-};
+use uperf_api::{DecisionFrequency, DecisionScalar, DecisionTraceEntry, GovernorDiagnosticsStatus};
 use uperf_core::{AppliedState, DesiredPlan, FrequencyLimits, ScalarSettingValue, TargetId};
 
 pub(crate) const TRACE_CAPACITY: usize = 1_024;
@@ -23,7 +20,6 @@ struct TraceState {
     next_decision_id: u64,
     next_reconcile_id: u64,
     entries: VecDeque<DecisionTraceEntry>,
-    entries_v2: VecDeque<DecisionTraceEntryV2>,
 }
 
 /// Diagnostics frozen when a worker job is submitted. The reconciler combines
@@ -78,9 +74,6 @@ impl DecisionTraceStore {
             applied_frequencies: frequency_snapshot(&applied.frequencies),
             success: error.is_empty(),
             error,
-        };
-        let entry_v2 = DecisionTraceEntryV2 {
-            base: entry.clone(),
             trigger_source: context.trigger_source.clone(),
             trigger_monotonic_ms: context.trigger_monotonic_ms,
             verified_apply_latency_us: monotonic_ms
@@ -114,10 +107,6 @@ impl DecisionTraceStore {
             state.entries.pop_front();
         }
         state.entries.push_back(entry);
-        if state.entries_v2.len() == TRACE_CAPACITY {
-            state.entries_v2.pop_front();
-        }
-        state.entries_v2.push_back(entry_v2);
     }
 
     /// Return entries with IDs strictly greater than `after_id`, oldest first.
@@ -130,21 +119,6 @@ impl DecisionTraceStore {
             .entries
             .iter()
             .filter(|entry| entry.decision_id > after_id)
-            .take(limit as usize)
-            .cloned()
-            .collect()
-    }
-
-    /// Return extended entries with the same IDs and retention as v1.
-    pub(crate) fn page_v2(&self, after_id: u64, limit: u32) -> Vec<DecisionTraceEntryV2> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .entries_v2
-            .iter()
-            .filter(|entry| entry.base.decision_id > after_id)
             .take(limit as usize)
             .cloned()
             .collect()
@@ -276,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_trace_freezes_trigger_diagnostics_and_verified_latency() {
+    fn trace_freezes_trigger_diagnostics_and_verified_latency() {
         let store = DecisionTraceStore::default();
         let mut desired = plan(7);
         desired.scalars.insert(
@@ -311,10 +285,10 @@ mod tests {
             &context,
         );
 
-        let page = store.page_v2(0, MAX_TRACE_PAGE);
+        let page = store.page(0, MAX_TRACE_PAGE);
         assert_eq!(page.len(), 1);
         let entry = &page[0];
-        assert_eq!(entry.base.decision_id, store.page(0, 1)[0].decision_id);
+        assert_eq!(entry.decision_id, store.page(0, 1)[0].decision_id);
         assert_eq!(entry.trigger_source, "desktop-input");
         assert_eq!(entry.trigger_monotonic_ms, 10);
         assert_eq!(entry.verified_apply_latency_us, 16_500);

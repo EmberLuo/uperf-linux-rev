@@ -10,25 +10,25 @@ mod client;
 mod contract;
 mod error;
 
-pub use client::{Daemon1Proxy, DaemonClient, MAX_DECISION_TRACE_PAGE};
+pub use client::{Daemon2Proxy, DaemonClient, MAX_DECISION_TRACE_PAGE};
 pub use contract::{
     ActiveWorkload, ApiVersion, AppRule, Capabilities, CpuLoad, DaemonStatus, DecisionFrequency,
-    DecisionScalar, DecisionTraceEntry, DecisionTraceEntryV2, DiagnosticCheck, DiagnosticReport,
-    FrameHintEvent, FrequencyOverride, FrequencyStatus, GovernorDiagnosticsStatus, GovernorStatus,
+    DecisionScalar, DecisionTraceEntry, DiagnosticCheck, DiagnosticReport, FrameHintEvent,
+    FrequencyOverride, FrequencyStatus, GovernorDiagnosticsStatus, GovernorStatus,
     GovernorTargetStatus, HealthIssue, HealthStatus, ModeInfo, MutationReceipt, ReloadReport,
     RunningWorkload, SchedulerStatus, TargetCapability, TelemetrySnapshot, ThermalStatus,
     WorkloadIdentity, WorkloadRequest,
 };
 pub use error::{ClientError, ServiceError};
 
-/// Well-known name for API major version 1.
-pub const SERVICE_NAME: &str = "org.uperflinux.Daemon1";
-/// Object path for API major version 1.
-pub const OBJECT_PATH: &str = "/org/uperflinux/Daemon1";
-/// Interface name for API major version 1.
-pub const INTERFACE_NAME: &str = "org.uperflinux.Daemon1";
+/// Well-known name for the current API.
+pub const SERVICE_NAME: &str = "org.uperflinux.Daemon2";
+/// Object path for the current API.
+pub const OBJECT_PATH: &str = "/org/uperflinux/Daemon2";
+/// Interface name for the current API.
+pub const INTERFACE_NAME: &str = "org.uperflinux.Daemon2";
 /// Prefix used by stable service-side D-Bus errors.
-pub const ERROR_PREFIX: &str = "org.uperflinux.Daemon1.Error";
+pub const ERROR_PREFIX: &str = "org.uperflinux.Daemon2.Error";
 
 /// Stable identifiers returned in [`Capabilities::features`].
 ///
@@ -36,8 +36,6 @@ pub const ERROR_PREFIX: &str = "org.uperflinux.Daemon1.Error";
 /// substring matching can incorrectly enable controls for an unrelated future
 /// capability.
 pub mod feature {
-    /// Automatic CPU demand policy is configured.
-    pub const LOAD_GOVERNOR: &str = "load-governor";
     /// Trusted thermal sensors constrain all mutations.
     pub const THERMAL_GUARD: &str = "thermal-guard";
     /// Explicit active-workload registration is available.
@@ -62,10 +60,8 @@ pub mod feature {
     pub const DEVICE_PROFILE: &str = "device-profile";
     /// Compositor-reported focus can supply the active workload.
     pub const FOREGROUND_FOCUS: &str = "foreground-focus";
-    /// A bounded, read-only policy and reconciliation timeline is available.
-    pub const DECISION_TRACE_V1: &str = "decision-trace-v1";
-    /// Extended decision records include governor and typed-scalar diagnostics.
-    pub const DECISION_TRACE_V2: &str = "decision-trace-v2";
+    /// A bounded policy/reconciliation timeline with governor diagnostics is available.
+    pub const DECISION_TRACE: &str = "decision-trace";
     /// The reference-compatible energy governor is available.
     pub const ENERGY_GOVERNOR_V1: &str = "energy-governor-v1";
     /// Scheduler task plans can vary by dominant scene.
@@ -78,9 +74,7 @@ pub mod feature {
     pub const FRAME_HINTS_V1: &str = "frame-hints-v1";
 }
 
-/// Oldest configuration schema accepted by this API generation.
-pub const MIN_CONFIG_SCHEMA_VERSION: u32 = 2;
-/// Newest configuration schema accepted by this API generation.
+/// Configuration schema accepted by this API generation.
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 /// Canonical built-in balanced profile name.

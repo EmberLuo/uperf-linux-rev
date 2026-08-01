@@ -33,9 +33,9 @@ import GLib from 'gi://GLib';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const SERVICE_NAME = 'org.uperflinux.Daemon1';
-const OBJECT_PATH = '/org/uperflinux/Daemon1';
-const INTERFACE_NAME = 'org.uperflinux.Daemon1';
+const SERVICE_NAME = 'org.uperflinux.Daemon2';
+const OBJECT_PATH = '/org/uperflinux/Daemon2';
+const INTERFACE_NAME = 'org.uperflinux.Daemon2';
 const DISPLAY_CONFIG_NAME = 'org.gnome.Mutter.DisplayConfig';
 const DISPLAY_CONFIG_PATH = '/org/gnome/Mutter/DisplayConfig';
 const PROPERTIES_INTERFACE = 'org.freedesktop.DBus.Properties';
@@ -524,9 +524,8 @@ export default class FocusReporterExtension extends Extension {
                     return;
                 if (!current || !this._enabled)
                     return;
-                // Frame hints are a compatible extension: an older daemon may
-                // not expose the method. Render events are therefore best
-                // effort; display state has its own bounded retry below.
+                // Render events are best effort; display state has its own
+                // bounded retry below.
                 completed?.(error === null);
             },
         );

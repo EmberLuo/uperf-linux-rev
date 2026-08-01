@@ -23,8 +23,8 @@ override_dh_auto_install:
 		debian/uperf-linux/usr/lib/systemd/system/uperf-linux.service
 	install -Dm0644 packaging/systemd/50-realtime-opt-in.conf \
 		debian/uperf-linux/usr/share/uperf-linux/systemd/50-realtime-opt-in.conf
-	install -Dm0644 packaging/dbus/org.uperflinux.Daemon1.conf \
-		debian/uperf-linux/usr/share/dbus-1/system.d/org.uperflinux.Daemon1.conf
+	install -Dm0644 packaging/dbus/org.uperflinux.Daemon2.conf \
+		debian/uperf-linux/usr/share/dbus-1/system.d/org.uperflinux.Daemon2.conf
 	install -Dm0644 packaging/polkit/org.uperflinux.policy \
 		debian/uperf-linux/usr/share/polkit-1/actions/org.uperflinux.policy
 	install -d debian/uperf-linux/usr/share/uperf-linux/devices

@@ -14,7 +14,7 @@ use crate::{
     AppsConfig, CpuId, CpuSet, DesiredPlan, FrequencyLimits, Hertz, MilliCelsius, MonotonicMillis,
     ObservedState, PolicyConfig, ProcessIdentity, ProcessInfo, ProfileConfig, TargetId, TaskPlan,
     ThermalReading, ThermalZoneConfig, ThreadSelector, Validate, ValidationErrors, WorkloadMatcher,
-    effective_demand, merge_task_plan, resolve_power_budget, transition_governor,
+    merge_task_plan, resolve_power_budget, transition_governor,
 };
 
 #[derive(
@@ -65,12 +65,15 @@ impl Scene {
     pub const fn priority(self) -> u8 {
         match self {
             Self::Idle => 0,
-            Self::Touch => 1,
-            Self::Trigger => 2,
-            Self::Gesture => 3,
-            Self::Junk => 4,
-            Self::Switch => 5,
-            Self::Boost => 6,
+            // Heavy-load Boost is a Linux fallback scene. Reference input,
+            // render, and switch hints must remain observable while a game is
+            // continuously busy.
+            Self::Boost => 1,
+            Self::Touch => 2,
+            Self::Trigger => 3,
+            Self::Gesture => 4,
+            Self::Junk => 5,
+            Self::Switch => 6,
             Self::Wake => 7,
         }
     }
@@ -281,16 +284,6 @@ impl FrequencyPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LoadGovernorInput {
-    pub demand: f64,
-    pub burst: f64,
-    pub margin: f64,
-    pub limit_efficiency: bool,
-    pub administrator_cap: Option<Hertz>,
-    pub thermal_cap: Option<Hertz>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PolicyError {
     #[error("hardware frequency limits are invalid: {0:?}")]
@@ -321,47 +314,6 @@ pub enum PolicyError {
     EnergyGovernor(String),
     #[error("profile `{0}` has no effective power budget")]
     MissingPowerBudget(ProfileId),
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LoadGovernor;
-
-impl LoadGovernor {
-    /// Convert normalized demand and scene parameters into a safe OPP pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyError`] for invalid model bounds or non-finite inputs.
-    pub fn compute(
-        policy: &FrequencyPolicy,
-        input: LoadGovernorInput,
-    ) -> Result<FrequencyLimits, PolicyError> {
-        policy.validate()?;
-        validate_non_negative_finite("demand", input.demand)?;
-        validate_non_negative_finite("burst", input.burst)?;
-        validate_non_negative_finite("margin", input.margin)?;
-
-        let effective_demand = effective_demand(input.demand, input.margin, input.burst);
-        let requested = hertz_as_f64(policy.reference) * effective_demand;
-        let requested_min = Hertz(float_to_u64_ceil(requested).max(policy.floor.get()));
-        let requested_max = if input.limit_efficiency {
-            policy.efficient_cap
-        } else {
-            policy.hardware_limits.max
-        };
-
-        constrain_frequency_limits(
-            FrequencyLimits {
-                min: requested_min,
-                max: requested_max,
-            },
-            policy.hardware_limits,
-            input.administrator_cap,
-            input.thermal_cap,
-            &policy.available_frequencies,
-            policy.hertz_per_unit,
-        )
-    }
 }
 
 /// Apply hardware/admin/thermal caps and snap the pair to supported OPPs.
@@ -724,8 +676,6 @@ pub struct StatefulPolicyEvaluation {
     pub desired: DesiredPlan,
     pub next_governor_state: crate::GovernorState,
     pub governor_diagnostics: Option<crate::GovernorDiagnostics>,
-    pub shadow_frequencies: Option<BTreeMap<TargetId, FrequencyLimits>>,
-    pub governor_error: Option<String>,
 }
 
 /// Diagnostic rule name reported when the focus default plan is used.
@@ -816,21 +766,11 @@ impl CompiledSchedulerRule {
         let thread_selectors = rule
             .threads
             .iter()
-            .map(|thread| {
-                match (&thread.selector, &thread.comm_regex) {
-                    (Some(ThreadSelector::Leader), None) => Ok(CompiledThreadSelector::Leader),
-                    (Some(ThreadSelector::CommRegex { pattern }), None) => Regex::new(pattern)
-                        .map(CompiledThreadSelector::CommRegex)
-                        .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string())),
-                    (None, Some(pattern)) => Regex::new(pattern)
-                        .map(CompiledThreadSelector::CommRegex)
-                        .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string())),
-                    // PolicyConfig validation rejects both invalid shapes before
-                    // scheduler compilation reaches this branch.
-                    _ => Err(PolicyError::InvalidMatcherRegex(
-                        "thread selector is missing or ambiguous".to_owned(),
-                    )),
-                }
+            .map(|thread| match &thread.selector {
+                ThreadSelector::Leader => Ok(CompiledThreadSelector::Leader),
+                ThreadSelector::CommRegex { pattern } => Regex::new(pattern)
+                    .map(CompiledThreadSelector::CommRegex)
+                    .map_err(|error| PolicyError::InvalidMatcherRegex(error.to_string())),
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
@@ -955,7 +895,7 @@ impl PolicyEngine {
         clippy::too_many_lines,
         reason = "the two target classes share one ordered safety-precedence evaluation"
     )]
-    pub fn evaluate(&self, input: &PolicyInput<'_>) -> Result<DesiredPlan, PolicyError> {
+    fn evaluate_base(&self, input: &PolicyInput<'_>) -> Result<DesiredPlan, PolicyError> {
         let effective_profile =
             resolve_effective_profile(input.mode, input.app_profile, self.config.default_profile);
         let profile = self
@@ -974,31 +914,17 @@ impl PolicyEngine {
 
         for (id, target) in input.cpu_targets {
             let thermal_cap = required_thermal_cap(input, id)?;
-            let demand = max_cpu_demand(&target.cpus, &input.observed.cpu_loads);
-            let automatic = LoadGovernor::compute(
-                &target.frequency,
-                LoadGovernorInput {
-                    demand,
-                    burst: parameters.burst,
-                    margin: parameters.margin,
-                    limit_efficiency: parameters.limit_efficiency,
-                    administrator_cap: input.administrator_caps.get(id).copied(),
-                    thermal_cap,
-                },
-            )?;
-            let limits = if let Some(manual) = input.manual_overrides.get(id) {
-                constrain_frequency_limits(
+            if let Some(manual) = input.manual_overrides.get(id) {
+                let limits = constrain_frequency_limits(
                     *manual,
                     target.frequency.hardware_limits,
                     input.administrator_caps.get(id).copied(),
                     thermal_cap,
                     &target.frequency.available_frequencies,
                     target.frequency.hertz_per_unit,
-                )?
-            } else {
-                automatic
-            };
-            frequencies.insert(id.clone(), limits);
+                )?;
+                frequencies.insert(id.clone(), limits);
+            }
         }
 
         for (id, target) in input.manual_target_policies {
@@ -1044,62 +970,27 @@ impl PolicyEngine {
         })
     }
 
-    /// Evaluate legacy policy and, when configured, advance the stateful energy
-    /// governor for shadow comparison or hardware application.
-    ///
-    /// Shadow failures are diagnostic-only and never disturb the legacy plan.
-    /// Energy rollout fails closed because cross-file validation promises a
-    /// complete model and budget before it can be selected.
+    /// Evaluate policy and advance the stateful energy governor.
     ///
     /// # Errors
     ///
-    /// Returns the same legacy policy errors as [`Self::evaluate`], plus a
-    /// governor error for an invalid active energy rollout.
+    /// Returns policy or energy-governor validation errors.
     pub fn evaluate_stateful(
         &self,
         input: &PolicyInput<'_>,
         governor_state: &crate::GovernorState,
         integrate_elapsed_time: bool,
     ) -> Result<StatefulPolicyEvaluation, PolicyError> {
-        let mut desired = self.evaluate(input)?;
-        if self.config.governor.rollout == crate::GovernorRollout::Legacy {
-            return Ok(StatefulPolicyEvaluation {
-                desired,
-                next_governor_state: governor_state.clone(),
-                governor_diagnostics: None,
-                shadow_frequencies: None,
-                governor_error: None,
-            });
-        }
-
+        let mut desired = self.evaluate_base(input)?;
         let profile = self
             .config
             .profile(desired.effective_profile)
             .ok_or(PolicyError::MissingProfile(desired.effective_profile))?;
         let parameters = effective_parameters(profile, desired.dominant_scene);
-        let Some(power_budget) = parameters.power_budget else {
-            let error = PolicyError::MissingPowerBudget(desired.effective_profile);
-            if self.config.governor.rollout == crate::GovernorRollout::Energy {
-                return Err(error);
-            }
-            return Ok(StatefulPolicyEvaluation {
-                desired,
-                next_governor_state: governor_state.clone(),
-                governor_diagnostics: None,
-                shadow_frequencies: None,
-                governor_error: Some(error.to_string()),
-            });
-        };
-        let raw_loads = input
-            .cpu_targets
-            .iter()
-            .map(|(id, target)| {
-                (
-                    id.clone(),
-                    max_cpu_demand(&target.cpus, &input.observed.cpu_loads),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let power_budget = parameters
+            .power_budget
+            .ok_or(PolicyError::MissingPowerBudget(desired.effective_profile))?;
+        let (raw_loads, active_load_sums) = cluster_load_views(input);
         let observed_frequencies = input
             .observed
             .frequencies
@@ -1112,6 +1003,7 @@ impl PolicyEngine {
                 timestamp: input.observed.timestamp,
                 targets: input.cpu_targets,
                 raw_loads: &raw_loads,
+                active_load_sums: &active_load_sums,
                 observed_frequencies: &observed_frequencies,
                 administrator_caps: input.administrator_caps,
                 thermal_caps: input.thermal_caps,
@@ -1123,33 +1015,17 @@ impl PolicyEngine {
                 integrate_elapsed_time,
             },
         );
-        let transition = match transition {
-            Ok(transition) => transition,
-            Err(error) if self.config.governor.rollout == crate::GovernorRollout::Shadow => {
-                return Ok(StatefulPolicyEvaluation {
-                    desired,
-                    next_governor_state: governor_state.clone(),
-                    governor_diagnostics: None,
-                    shadow_frequencies: None,
-                    governor_error: Some(error.to_string()),
-                });
-            }
-            Err(error) => return Err(PolicyError::EnergyGovernor(error.to_string())),
-        };
-        let shadow_frequencies = transition.limits.clone();
-        if self.config.governor.rollout == crate::GovernorRollout::Energy {
-            for (id, limits) in &transition.limits {
-                if !input.manual_overrides.contains_key(id) {
-                    desired.frequencies.insert(id.clone(), *limits);
-                }
+        let transition =
+            transition.map_err(|error| PolicyError::EnergyGovernor(error.to_string()))?;
+        for (id, limits) in &transition.limits {
+            if !input.manual_overrides.contains_key(id) {
+                desired.frequencies.insert(id.clone(), *limits);
             }
         }
         Ok(StatefulPolicyEvaluation {
             desired,
             next_governor_state: transition.next_state,
             governor_diagnostics: Some(transition.diagnostics),
-            shadow_frequencies: Some(shadow_frequencies),
-            governor_error: None,
         })
     }
 
@@ -1322,6 +1198,34 @@ fn max_cpu_demand(cpus: &CpuSet, loads: &BTreeMap<CpuId, f64>) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Busy cores in a cluster, in units of cores.
+///
+/// Frequency demand uses [`max_cpu_demand`] because one saturated CPU needs a
+/// high OPP regardless of its siblings. Power integration uses this sum instead,
+/// so a single busy thread on a four-core cluster is not charged as four.
+fn summed_cpu_demand(cpus: &CpuSet, loads: &BTreeMap<CpuId, f64>) -> f64 {
+    cpus.iter()
+        .filter_map(|cpu| loads.get(cpu).copied())
+        .filter(|load| load.is_finite())
+        .map(|load| load.clamp(0.0, 1.0))
+        .sum()
+}
+
+/// Per-cluster maxima for frequency demand and per-cluster sums for power
+/// integration, derived from the same observed per-CPU loads.
+fn cluster_load_views(
+    input: &PolicyInput<'_>,
+) -> (BTreeMap<TargetId, f64>, BTreeMap<TargetId, f64>) {
+    let loads = &input.observed.cpu_loads;
+    let mut maxima = BTreeMap::new();
+    let mut sums = BTreeMap::new();
+    for (id, target) in input.cpu_targets {
+        maxima.insert(id.clone(), max_cpu_demand(&target.cpus, loads));
+        sums.insert(id.clone(), summed_cpu_demand(&target.cpus, loads));
+    }
+    (maxima, sums)
+}
+
 fn required_thermal_cap(
     input: &PolicyInput<'_>,
     id: &TargetId,
@@ -1340,26 +1244,6 @@ fn validate_non_negative_finite(field: &'static str, value: f64) -> Result<(), P
     } else {
         Err(PolicyError::InvalidLoadInput { field })
     }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn float_to_u64_ceil(value: f64) -> u64 {
-    if value >= u64::MAX as f64 {
-        u64::MAX
-    } else {
-        value.ceil() as u64
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn hertz_as_f64(value: Hertz) -> f64 {
-    // Linux cpufreq/devfreq values are several orders of magnitude below 2^53,
-    // so conversion is exact for every supported target.
-    value.get() as f64
 }
 
 #[cfg(test)]
@@ -1563,13 +1447,15 @@ mod tests {
                     cgroup_class: Some("foreground".to_owned()),
                     threads: vec![
                         ThreadRuleConfig {
-                            selector: None,
-                            comm_regex: Some("^Render".to_owned()),
+                            selector: ThreadSelector::CommRegex {
+                                pattern: "^Render".to_owned(),
+                            },
                             task_profile: "render".to_owned(),
                         },
                         ThreadRuleConfig {
-                            selector: None,
-                            comm_regex: Some("Worker$".to_owned()),
+                            selector: ThreadSelector::CommRegex {
+                                pattern: "Worker$".to_owned(),
+                            },
                             task_profile: "later".to_owned(),
                         },
                     ],
@@ -1647,8 +1533,7 @@ mod tests {
                 task_profile: None,
                 cgroup_class: None,
                 threads: vec![ThreadRuleConfig {
-                    selector: Some(crate::ThreadSelector::Leader),
-                    comm_regex: None,
+                    selector: crate::ThreadSelector::Leader,
                     task_profile: "main-thread".to_owned(),
                 }],
             }],
@@ -1838,26 +1723,16 @@ mod tests {
     }
 
     #[test]
-    fn governor_snaps_min_up_max_down_and_respects_thermal() {
-        let result = LoadGovernor::compute(
-            &frequency_policy(),
-            LoadGovernorInput {
-                demand: 0.75,
-                burst: 0.0,
-                margin: 0.2,
-                limit_efficiency: false,
-                administrator_cap: None,
-                thermal_cap: Some(Hertz(2_100)),
-            },
-        )
-        .expect("governor");
-        assert_eq!(
-            result,
-            FrequencyLimits {
-                min: Hertz(2_000),
-                max: Hertz(2_000)
-            }
-        );
+    fn persistent_heavy_load_is_only_a_fallback_to_reference_ttl_scenes() {
+        let mut hints = HintSet::new();
+        hints.activate(Hint::persistent(Scene::Boost, MonotonicMillis(0)));
+        hints.activate(Hint::with_ttl(Scene::Junk, MonotonicMillis(10), 60));
+        assert_eq!(hints.dominant_at(MonotonicMillis(20)), Scene::Junk);
+        assert_eq!(hints.dominant_at(MonotonicMillis(70)), Scene::Boost);
+
+        hints.activate(Hint::with_ttl(Scene::Switch, MonotonicMillis(80), 400));
+        assert_eq!(hints.dominant_at(MonotonicMillis(100)), Scene::Switch);
+        assert_eq!(hints.dominant_at(MonotonicMillis(480)), Scene::Boost);
     }
 
     #[test]
@@ -2052,7 +1927,7 @@ mod tests {
             },
         )]);
         let plan = engine
-            .evaluate(&PolicyInput {
+            .evaluate_base(&PolicyInput {
                 generation: 7,
                 observed: &observed,
                 mode: ModeSelection::Auto,
@@ -2104,7 +1979,7 @@ mod tests {
             },
         )]);
         let plan = engine
-            .evaluate(&PolicyInput {
+            .evaluate_base(&PolicyInput {
                 generation: 1,
                 observed: &observed,
                 mode: ModeSelection::Auto,
@@ -2142,7 +2017,7 @@ mod tests {
         };
         let manual_targets = BTreeMap::from([(id.clone(), frequency_policy())]);
         let plan = engine
-            .evaluate(&PolicyInput {
+            .evaluate_base(&PolicyInput {
                 generation: 1,
                 observed: &observed,
                 mode: ModeSelection::Auto,
@@ -2184,7 +2059,7 @@ mod tests {
             },
         )]);
         let error = engine
-            .evaluate(&PolicyInput {
+            .evaluate_base(&PolicyInput {
                 generation: 1,
                 observed: &observed,
                 mode: ModeSelection::Auto,

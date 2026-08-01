@@ -1,9 +1,9 @@
-<interface name="org.uperflinux.Daemon1">
+<interface name="org.uperflinux.Daemon2">
   <method name="GetStatus">
     <arg type="((uu)ss(sbbsa(ssss))sss(b(utu)ssss)(sibb)a(sbttttbttbbb)tt)" direction="out"/>
   </method>
   <method name="GetCapabilities">
-    <arg type="((uu)asa(sss)a(sssauttatb)uu)" direction="out"/>
+    <arg type="((uu)asa(sss)a(sssauttatb)u)" direction="out"/>
   </method>
   <method name="ListRunningWorkloads">
     <arg type="a((utu)ssb(bsuussbs))" direction="out"/>
@@ -11,15 +11,10 @@
   <method name="GetDecisionTrace">
     <arg name="after_id" type="t" direction="in"/>
     <arg name="limit" type="u" direction="in"/>
-    <arg type="a(tttttssbba(stt)a(stt)bs)" direction="out"/>
-  </method>
-  <method name="GetDecisionTraceV2">
-    <arg name="after_id" type="t" direction="in"/>
-    <arg name="limit" type="u" direction="in"/>
-    <arg type="a((tttttssbba(stt)a(stt)bs)stt(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
+    <arg type="a(tttttssbba(stt)a(stt)bsstt(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
   </method>
   <method name="GetGovernorStatus">
-    <arg type="(tssss(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
+    <arg type="(tsss(btttttxbqa(sqqqqqbtttts))a(ss)a(ss))" direction="out"/>
   </method>
   <method name="SetMode">
     <arg name="mode" type="s" direction="in"/>

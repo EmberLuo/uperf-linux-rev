@@ -19,7 +19,16 @@
       "efficient_cap_hz": 1785600000,
       "admin_cap_hz": 2016000000,
       "critical_cap_hz": 307200000,
-      "sensor_failure_cap_hz": 307200000
+      "sensor_failure_cap_hz": 307200000,
+      "energy_model": {
+        "kind": "reference-curve-v1",
+        "relative_performance": 140,
+        "typical_power_mw_per_core": 500,
+        "typical_frequency_hz": 1900000000,
+        "sweet_frequency_hz": 1600000000,
+        "plain_frequency_hz": 1400000000,
+        "free_frequency_hz": 600000000
+      }
     },
     {
       "id": "cpu.performance",
@@ -29,7 +38,16 @@
       "efficient_cap_hz": 2457600000,
       "admin_cap_hz": 2803200000,
       "critical_cap_hz": 499200000,
-      "sensor_failure_cap_hz": 499200000
+      "sensor_failure_cap_hz": 499200000,
+      "energy_model": {
+        "kind": "reference-curve-v1",
+        "relative_performance": 320,
+        "typical_power_mw_per_core": 1900,
+        "typical_frequency_hz": 2800000000,
+        "sweet_frequency_hz": 1800000000,
+        "plain_frequency_hz": 1000000000,
+        "free_frequency_hz": 700000000
+      }
     },
     {
       "id": "cpu.prime",
@@ -39,7 +57,16 @@
       "efficient_cap_hz": 2726400000,
       "admin_cap_hz": 2956800000,
       "critical_cap_hz": 595200000,
-      "sensor_failure_cap_hz": 595200000
+      "sensor_failure_cap_hz": 595200000,
+      "energy_model": {
+        "kind": "reference-curve-v1",
+        "relative_performance": 450,
+        "typical_power_mw_per_core": 3600,
+        "typical_frequency_hz": 3200000000,
+        "sweet_frequency_hz": 2200000000,
+        "plain_frequency_hz": 1600000000,
+        "free_frequency_hz": 800000000
+      }
     }
   ],
   "devfreq_targets": [

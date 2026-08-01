@@ -40,7 +40,6 @@ pub enum Command {
 pub struct TraceOptions {
     pub after_id: u64,
     pub limit: u32,
-    pub extended: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -197,7 +196,6 @@ fn parse_trace(cursor: &mut Cursor) -> Result<TraceOptions> {
     let mut limit = 128;
     let mut after_seen = false;
     let mut limit_seen = false;
-    let mut extended = false;
     while let Some(option) = cursor.next() {
         match option.as_str() {
             "--after" => {
@@ -217,20 +215,10 @@ fn parse_trace(cursor: &mut Cursor) -> Result<TraceOptions> {
                 }
                 limit_seen = true;
             }
-            "--extended" => {
-                if extended {
-                    bail!("--extended was specified more than once");
-                }
-                extended = true;
-            }
             other => bail!("unknown trace option '{other}'"),
         }
     }
-    Ok(TraceOptions {
-        after_id,
-        limit,
-        extended,
-    })
+    Ok(TraceOptions { after_id, limit })
 }
 
 fn parse_mode(cursor: &mut Cursor) -> Result<ModeAction> {
@@ -466,11 +454,11 @@ Exit status:
 
 const TRACE_HELP: &str = "\
 Usage:
-  uperfctl trace [--after DECISION_ID] [--limit COUNT] [--extended]
+  uperfctl trace [--after DECISION_ID] [--limit COUNT]
 
 The pagination key is exclusive. The default page size is 128 and the maximum
 is 512. Trace state is process-local and bounded, so old entries may have
-already expired from the daemon's ring. --extended adds trigger-to-readback
+already expired from the daemon's ring. Each entry includes trigger-to-readback
 latency, governor diagnostics, and desired/applied scalar values.
 ";
 
@@ -478,7 +466,7 @@ const GOVERNOR_STATUS_HELP: &str = "\
 Usage:
   uperfctl governor-status
 
-Shows the current rollout, load transform, power budget and energy bucket,
+Shows the current load transform, power budget and energy bucket,
 per-target OPP reasons, and desired/applied scalar resources.
 ";
 
@@ -581,20 +569,11 @@ mod tests {
             Command::Trace(TraceOptions {
                 after_id: 42,
                 limit: 64,
-                extended: false,
-            })
-        );
-        assert_eq!(
-            parse(&["trace", "--extended"]).command,
-            Command::Trace(TraceOptions {
-                after_id: 0,
-                limit: 128,
-                extended: true,
             })
         );
         assert!(Cli::parse(["trace", "--limit", "513"].map(str::to_owned)).is_err());
         assert!(Cli::parse(["trace", "--after", "1", "--after", "2"].map(str::to_owned)).is_err());
-        assert!(Cli::parse(["trace", "--extended", "--extended"].map(str::to_owned)).is_err());
+        assert!(Cli::parse(["trace", "--extended"].map(str::to_owned)).is_err());
     }
 
     #[test]

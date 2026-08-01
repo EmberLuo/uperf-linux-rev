@@ -4,120 +4,128 @@
   "profiles": [
     {
       "id": "powersave",
-      "margin": 0.05,
+      "margin": 0.1,
       "burst": 0.0,
-      "limit_efficiency": true,
+      "limit_efficiency": false,
+      "power_budget": {
+        "slow_limit_power_mw": 1000,
+        "fast_limit_power_mw": 1000,
+        "fast_limit_capacity_mj": 1000,
+        "fast_limit_recover_scale": 0.3
+      },
       "scenes": {
-        "touch": {
-          "margin": 0.1,
-          "burst": 0.02
+        "idle": {
+          "limit_efficiency": true
         },
         "trigger": {
-          "margin": 0.12,
-          "burst": 0.04
+          "margin": 0.1
         },
         "gesture": {
-          "margin": 0.15,
-          "burst": 0.06
+          "margin": 0.1
         },
         "junk": {
-          "margin": 0.2,
-          "burst": 0.1,
-          "limit_efficiency": false
+          "burst": 0.08
+        },
+        "switch": {
+          "margin": 0.1,
+          "power_budget": {
+            "slow_limit_power_mw": 1000,
+            "fast_limit_power_mw": 2000,
+            "fast_limit_recover_scale": 0.1
+          }
         },
         "wake": {
-          "margin": 0.15,
-          "burst": 0.08
+          "margin": 0.1,
+          "power_budget": {
+            "slow_limit_power_mw": 1000,
+            "fast_limit_power_mw": 2000,
+            "fast_limit_recover_scale": 0.1
+          }
         }
       }
     },
     {
       "id": "balance",
-      "margin": 0.15,
-      "burst": 0.02,
-      "limit_efficiency": true,
+      "margin": 0.21,
+      "burst": 0.0,
+      "limit_efficiency": false,
+      "power_budget": {
+        "slow_limit_power_mw": 2000,
+        "fast_limit_power_mw": 2000,
+        "fast_limit_capacity_mj": 16000,
+        "fast_limit_recover_scale": 0.3
+      },
       "scenes": {
-        "touch": {
-          "margin": 0.2,
-          "burst": 0.08
+        "idle": {
+          "limit_efficiency": true
         },
         "trigger": {
-          "margin": 0.22,
-          "burst": 0.12
+          "margin": 0.3
         },
         "gesture": {
-          "margin": 0.25,
-          "burst": 0.16
+          "margin": 0.4
         },
         "junk": {
-          "margin": 0.35,
-          "burst": 0.25,
-          "limit_efficiency": false
+          "burst": 0.6
         },
         "switch": {
-          "margin": 0.25,
-          "burst": 0.15,
-          "limit_efficiency": false
-        },
-        "boost": {
-          "margin": 0.3,
-          "burst": 0.2,
-          "limit_efficiency": false
+          "margin": 0.5,
+          "power_budget": {
+            "slow_limit_power_mw": 4000,
+            "fast_limit_power_mw": 6000,
+            "fast_limit_recover_scale": 0.1
+          }
         },
         "wake": {
-          "margin": 0.3,
-          "burst": 0.2,
-          "limit_efficiency": false
+          "margin": 0.5,
+          "power_budget": {
+            "slow_limit_power_mw": 4000,
+            "fast_limit_power_mw": 6000,
+            "fast_limit_recover_scale": 0.1
+          }
         }
       }
     },
     {
       "id": "performance",
-      "margin": 0.25,
-      "burst": 0.08,
+      "margin": 0.2,
+      "burst": 0.22,
       "limit_efficiency": false,
+      "power_budget": {
+        "slow_limit_power_mw": 999000,
+        "fast_limit_power_mw": 999000,
+        "fast_limit_capacity_mj": 999000,
+        "fast_limit_recover_scale": 0.3
+      },
       "scenes": {
         "touch": {
-          "margin": 0.3,
-          "burst": 0.15
+          "margin": 0.4
         },
         "trigger": {
-          "margin": 0.32,
-          "burst": 0.2
+          "margin": 0.5
         },
         "gesture": {
-          "margin": 0.35,
-          "burst": 0.25
+          "margin": 0.45
         },
         "junk": {
-          "margin": 0.45,
-          "burst": 0.35
+          "burst": 0.55
         },
         "switch": {
-          "margin": 0.35,
           "burst": 0.25
         },
-        "boost": {
-          "margin": 0.4,
-          "burst": 0.3
-        },
         "wake": {
-          "margin": 0.4,
-          "burst": 0.3
+          "burst": 0.25
         }
       }
     }
   ],
   "governor": {
-    "rollout": "legacy",
-    "active_sample_ms": 20,
+    "active_sample_ms": 40,
     "idle_sample_ms": 80,
     "active_load_threshold": 0.3,
     "idle_load_threshold": 0.15,
-    "ema_time_constant_ms": 40,
-    "predict_threshold": 0.15,
-    "prediction_gain": 1.0,
-    "ramp_latency_ms": 100,
+    "predict_threshold": 0.2,
+    "ramp_latency_ms": 200,
     "min_opp_residency_ms": 10
   },
   "load": {

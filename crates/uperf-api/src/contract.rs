@@ -9,18 +9,18 @@ use zbus::zvariant::{OwnedValue, Type, Value};
 pub struct ApiVersion {
     /// Breaking contract generation.
     pub major: u32,
-    /// Backward-compatible feature generation.
+    /// Exact contract revision within the generation.
     pub minor: u32,
 }
 
 impl ApiVersion {
     /// Contract version implemented by this crate.
-    pub const CURRENT: Self = Self { major: 1, minor: 5 };
+    pub const CURRENT: Self = Self { major: 2, minor: 0 };
 
-    /// Whether both endpoints can safely exchange version-1 DTOs.
+    /// Whether this is exactly the contract implemented by this crate.
     #[must_use]
-    pub const fn is_compatible_with(self, other: Self) -> bool {
-        self.major == other.major
+    pub const fn is_current(self) -> bool {
+        self.major == Self::CURRENT.major && self.minor == Self::CURRENT.minor
     }
 }
 
@@ -172,8 +172,7 @@ impl fmt::Display for FrameHintEvent {
 /// Read-only scheduler and cgroup state associated with a running workload.
 ///
 /// Empty strings mean that no process rule, cgroup class, unit, or warning is
-/// currently associated with the workload. Keeping this as a separate v1.1
-/// DTO lets older v1 clients continue decoding [`DaemonStatus`] unchanged.
+/// currently associated with the workload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(crate = "zbus::zvariant")]
 pub struct SchedulerStatus {
@@ -368,6 +367,14 @@ pub struct DecisionTraceEntry {
     pub success: bool,
     /// Stable human-readable failure summary, empty on success.
     pub error: String,
+    pub trigger_source: String,
+    /// Reducer acceptance timestamp for the event that produced this job.
+    pub trigger_monotonic_ms: u64,
+    /// Trigger acceptance through verified actuator readback.
+    pub verified_apply_latency_us: u64,
+    pub governor: GovernorDiagnosticsStatus,
+    pub desired_scalars: Vec<DecisionScalar>,
+    pub applied_scalars: Vec<DecisionScalar>,
 }
 
 /// One governor target captured at policy-evaluation time.
@@ -418,27 +425,10 @@ pub struct GovernorDiagnosticsStatus {
 #[zvariant(crate = "zbus::zvariant")]
 pub struct GovernorStatus {
     pub generation: u64,
-    pub rollout: String,
     pub profile: String,
     pub scene: String,
     pub trigger_source: String,
     pub diagnostics: GovernorDiagnosticsStatus,
-    pub desired_scalars: Vec<DecisionScalar>,
-    pub applied_scalars: Vec<DecisionScalar>,
-}
-
-/// Additive diagnostic trace contract. The embedded v1 record preserves all
-/// original timing, desired/applied frequency, and failure fields.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
-#[zvariant(crate = "zbus::zvariant")]
-pub struct DecisionTraceEntryV2 {
-    pub base: DecisionTraceEntry,
-    pub trigger_source: String,
-    /// Reducer acceptance timestamp for the event that produced this job.
-    pub trigger_monotonic_ms: u64,
-    /// Trigger acceptance through verified actuator readback.
-    pub verified_apply_latency_us: u64,
-    pub governor: GovernorDiagnosticsStatus,
     pub desired_scalars: Vec<DecisionScalar>,
     pub applied_scalars: Vec<DecisionScalar>,
 }
@@ -490,10 +480,8 @@ pub struct Capabilities {
     pub modes: Vec<ModeInfo>,
     /// Dynamically discovered actuator targets.
     pub targets: Vec<TargetCapability>,
-    /// Oldest accepted configuration schema.
-    pub config_schema_min: u32,
-    /// Newest accepted configuration schema.
-    pub config_schema_max: u32,
+    /// Exact accepted configuration schema.
+    pub config_schema_version: u32,
 }
 
 impl Capabilities {
@@ -552,7 +540,7 @@ pub struct AppRule {
     pub id: String,
     /// Whether the rule participates in matching.
     pub enabled: bool,
-    /// Owning UID. API v1 only supports administrator-owned global rules, so
+    /// Owning UID. Application rules are administrator-owned and global, so
     /// callers must use `u32::MAX`.
     pub owner_uid: u32,
     /// Exact path matched against `/proc/<pid>/exe`, or no executable
@@ -599,20 +587,18 @@ pub struct DiagnosticReport {
 mod tests {
     use super::{
         ApiVersion, AppRule, Capabilities, DecisionFrequency, DecisionScalar, DecisionTraceEntry,
-        DecisionTraceEntryV2, FrameHintEvent, FrequencyOverride, FrequencyStatus,
-        GovernorDiagnosticsStatus, GovernorStatus, GovernorTargetStatus, RunningWorkload,
-        SchedulerStatus, TargetCapability, WorkloadIdentity, WorkloadRequest,
+        FrameHintEvent, FrequencyOverride, FrequencyStatus, GovernorDiagnosticsStatus,
+        GovernorStatus, GovernorTargetStatus, RunningWorkload, SchedulerStatus, TargetCapability,
+        WorkloadIdentity, WorkloadRequest,
     };
     use crate::feature;
     use zvariant::{LE, Type, serialized::Context, to_bytes};
 
     #[test]
-    fn api_compatibility_is_major_versioned() {
-        assert!(ApiVersion::CURRENT.is_compatible_with(ApiVersion {
-            major: 1,
-            minor: 99,
-        }));
-        assert!(!ApiVersion::CURRENT.is_compatible_with(ApiVersion { major: 2, minor: 0 }));
+    fn api_version_must_match_exactly() {
+        assert!(ApiVersion::CURRENT.is_current());
+        assert!(!ApiVersion { major: 2, minor: 1 }.is_current());
+        assert!(!ApiVersion { major: 1, minor: 5 }.is_current());
     }
 
     #[test]
@@ -693,42 +679,6 @@ mod tests {
 
     #[test]
     fn decision_trace_round_trips_over_dbus_encoding() {
-        let original = DecisionTraceEntry {
-            decision_id: 7,
-            reconcile_id: 6,
-            monotonic_ms: 123,
-            duration_us: 456,
-            generation: 5,
-            profile: "balance".into(),
-            scene: "touch".into(),
-            frequency_attempted: true,
-            scheduler_attempted: false,
-            desired_frequencies: vec![DecisionFrequency {
-                target_id: "cpu.policy0".into(),
-                min_hz: 400_000_000,
-                max_hz: 1_800_000_000,
-            }],
-            applied_frequencies: vec![DecisionFrequency {
-                target_id: "cpu.policy0".into(),
-                min_hz: 400_000_000,
-                max_hz: 1_800_000_000,
-            }],
-            success: true,
-            error: String::new(),
-        };
-        assert_eq!(
-            DecisionTraceEntry::SIGNATURE.to_string(),
-            "(tttttssbba(stt)a(stt)bs)"
-        );
-        let encoded = to_bytes(Context::new_dbus(LE, 0), &original).expect("serialize trace");
-        let (decoded, _) = encoded
-            .deserialize::<DecisionTraceEntry>()
-            .expect("deserialize trace");
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn extended_trace_and_governor_status_round_trip_over_dbus_encoding() {
         let governor = GovernorDiagnosticsStatus {
             available: true,
             elapsed_ms: 20,
@@ -758,12 +708,28 @@ mod tests {
             target_id: "scalar.ddr".into(),
             value_json: r#"{"kind":"integer","value":800}"#.into(),
         };
-        let trace = DecisionTraceEntryV2 {
-            base: DecisionTraceEntry {
-                decision_id: 8,
-                reconcile_id: 7,
-                ..DecisionTraceEntry::default()
-            },
+        let original = DecisionTraceEntry {
+            decision_id: 7,
+            reconcile_id: 6,
+            monotonic_ms: 123,
+            duration_us: 456,
+            generation: 5,
+            profile: "balance".into(),
+            scene: "touch".into(),
+            frequency_attempted: true,
+            scheduler_attempted: false,
+            desired_frequencies: vec![DecisionFrequency {
+                target_id: "cpu.policy0".into(),
+                min_hz: 400_000_000,
+                max_hz: 1_800_000_000,
+            }],
+            applied_frequencies: vec![DecisionFrequency {
+                target_id: "cpu.policy0".into(),
+                min_hz: 400_000_000,
+                max_hz: 1_800_000_000,
+            }],
+            success: true,
+            error: String::new(),
             trigger_source: "desktop-input".into(),
             trigger_monotonic_ms: 100,
             verified_apply_latency_us: 2_500,
@@ -771,15 +737,14 @@ mod tests {
             desired_scalars: vec![scalar.clone()],
             applied_scalars: vec![scalar.clone()],
         };
-        let encoded = to_bytes(Context::new_dbus(LE, 0), &trace).expect("serialize v2 trace");
+        let encoded = to_bytes(Context::new_dbus(LE, 0), &original).expect("serialize trace");
         let (decoded, _) = encoded
-            .deserialize::<DecisionTraceEntryV2>()
-            .expect("deserialize v2 trace");
-        assert_eq!(decoded, trace);
+            .deserialize::<DecisionTraceEntry>()
+            .expect("deserialize trace");
+        assert_eq!(decoded, original);
 
         let status = GovernorStatus {
             generation: 9,
-            rollout: "shadow".into(),
             profile: "balance".into(),
             scene: "touch".into(),
             trigger_source: "desktop-input".into(),

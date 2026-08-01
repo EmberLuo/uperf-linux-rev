@@ -4,22 +4,22 @@ use zbus::Connection;
 
 use crate::{
     ActiveWorkload, ApiVersion, AppRule, Capabilities, ClientError, DaemonStatus,
-    DecisionTraceEntry, DecisionTraceEntryV2, DiagnosticCheck, DiagnosticReport, FrameHintEvent,
-    FrequencyOverride, GovernorStatus, MutationReceipt, ReloadReport, RunningWorkload,
-    TelemetrySnapshot, WorkloadRequest,
+    DecisionTraceEntry, DiagnosticCheck, DiagnosticReport, FrameHintEvent, FrequencyOverride,
+    GovernorStatus, MutationReceipt, ReloadReport, RunningWorkload, TelemetrySnapshot,
+    WorkloadRequest,
 };
 
 /// Maximum number of decision trace entries returned by one D-Bus request.
 pub const MAX_DECISION_TRACE_PAGE: u32 = 512;
 
 #[zbus::proxy(
-    default_service = "org.uperflinux.Daemon1",
-    default_path = "/org/uperflinux/Daemon1",
-    interface = "org.uperflinux.Daemon1",
+    default_service = "org.uperflinux.Daemon2",
+    default_path = "/org/uperflinux/Daemon2",
+    interface = "org.uperflinux.Daemon2",
     gen_blocking = false
 )]
-pub trait Daemon1 {
-    /// Breaking and compatible contract generation.
+pub trait Daemon2 {
+    /// Exact contract generation and revision.
     #[zbus(property)]
     fn api_version(&self) -> zbus::Result<ApiVersion>;
 
@@ -66,13 +66,6 @@ pub trait Daemon1 {
         after_id: u64,
         limit: u32,
     ) -> zbus::Result<Vec<DecisionTraceEntry>>;
-
-    /// Return extended reconciliation entries without changing the v1 tuple.
-    fn get_decision_trace_v2(
-        &self,
-        after_id: u64,
-        limit: u32,
-    ) -> zbus::Result<Vec<DecisionTraceEntryV2>>;
 
     /// Return the latest stateful-governor and scalar diagnostic snapshot.
     fn get_governor_status(&self) -> zbus::Result<GovernorStatus>;
@@ -137,7 +130,7 @@ pub trait Daemon1 {
     fn running_workloads_changed(&self) -> zbus::Result<()>;
 }
 
-/// Thin typed client around the version-1 system-bus interface.
+/// Thin typed client around the current system-bus interface.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
     connection: Connection,
@@ -173,18 +166,17 @@ impl DaemonClient {
     /// # Errors
     ///
     /// Returns [`ClientError::Transport`] if proxy construction fails.
-    pub async fn proxy(&self) -> Result<Daemon1Proxy<'_>, ClientError> {
-        Daemon1Proxy::new(&self.connection)
+    pub async fn proxy(&self) -> Result<Daemon2Proxy<'_>, ClientError> {
+        Daemon2Proxy::new(&self.connection)
             .await
             .map_err(ClientError::from)
     }
 
-    /// Fetch a coherent daemon status and verify its API major version.
+    /// Fetch a coherent daemon status and verify its exact API version.
     ///
     /// # Errors
     ///
-    /// Returns an error when the D-Bus call fails or the API major is
-    /// incompatible.
+    /// Returns an error when the D-Bus call fails or the API version differs.
     pub async fn status(&self) -> Result<DaemonStatus, ClientError> {
         let status = self
             .proxy()
@@ -192,16 +184,15 @@ impl DaemonClient {
             .get_status()
             .await
             .map_err(ClientError::from)?;
-        ensure_compatible(status.api_version)?;
+        ensure_current(status.api_version)?;
         Ok(status)
     }
 
-    /// Fetch dynamic capabilities and verify their API major version.
+    /// Fetch dynamic capabilities and verify their exact API version.
     ///
     /// # Errors
     ///
-    /// Returns an error when the D-Bus call fails or the API major is
-    /// incompatible.
+    /// Returns an error when the D-Bus call fails or the API version differs.
     pub async fn capabilities(&self) -> Result<Capabilities, ClientError> {
         let capabilities = self
             .proxy()
@@ -209,7 +200,7 @@ impl DaemonClient {
             .get_capabilities()
             .await
             .map_err(ClientError::from)?;
-        ensure_compatible(capabilities.api_version)?;
+        ensure_current(capabilities.api_version)?;
         Ok(capabilities)
     }
 
@@ -245,24 +236,6 @@ impl DaemonClient {
         self.proxy()
             .await?
             .get_decision_trace(after_id, limit)
-            .await
-            .map_err(ClientError::from)
-    }
-
-    /// Fetch one bounded page of extended governor/scalar trace entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `limit` exceeds 512 or the D-Bus call fails.
-    pub async fn decision_trace_v2(
-        &self,
-        after_id: u64,
-        limit: u32,
-    ) -> Result<Vec<DecisionTraceEntryV2>, ClientError> {
-        validate_decision_trace_limit(limit)?;
-        self.proxy()
-            .await?
-            .get_decision_trace_v2(after_id, limit)
             .await
             .map_err(ClientError::from)
     }
@@ -465,7 +438,7 @@ impl DaemonClient {
 
     /// Create or replace an administrator-owned global application rule.
     ///
-    /// API v1 matches an exact executable path, a kernel-name regex, or both.
+    /// The API matches an exact executable path, a kernel-name regex, or both.
     ///
     /// # Errors
     ///
@@ -504,9 +477,9 @@ impl DaemonClient {
         let mut checks = Vec::with_capacity(5);
 
         checks.push(DiagnosticCheck {
-            id: "api.compatible".into(),
+            id: "api.current".into(),
             passed: true,
-            message: format!("daemon API {} is compatible", status.api_version),
+            message: format!("daemon API {} is current", status.api_version),
         });
         checks.push(DiagnosticCheck {
             id: "daemon.health".into(),
@@ -565,8 +538,8 @@ fn validate_decision_trace_limit(limit: u32) -> Result<(), ClientError> {
     }
 }
 
-fn ensure_compatible(server: ApiVersion) -> Result<(), ClientError> {
-    if ApiVersion::CURRENT.is_compatible_with(server) {
+fn ensure_current(server: ApiVersion) -> Result<(), ClientError> {
+    if server.is_current() {
         Ok(())
     } else {
         Err(ClientError::IncompatibleApi {
@@ -651,7 +624,7 @@ fn validate_rule(rule: &AppRule) -> Result<(), ClientError> {
     validate_identifier("rule ID", &rule.id)?;
     if rule.owner_uid != u32::MAX {
         return Err(ClientError::InvalidRequest(
-            "D-Bus API v1 only supports administrator-owned global rules".into(),
+            "application rules are administrator-owned and global".into(),
         ));
     }
     validate_identifier("mode", &rule.mode)?;
@@ -756,13 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn app_rules_are_global_in_api_v1() {
+    fn app_rules_are_administrator_owned_and_global() {
         let mut rule = app_rule();
         rule.owner_uid = 1_000;
         assert!(matches!(
             validate_rule(&rule),
             Err(ClientError::InvalidRequest(message))
-                if message.contains("administrator-owned global")
+                if message.contains("administrator-owned and global")
         ));
     }
 }

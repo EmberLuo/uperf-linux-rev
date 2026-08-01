@@ -5,11 +5,11 @@ use crate::ApiVersion;
 
 /// Stable errors emitted by the daemon instead of ambiguous boolean results.
 #[derive(Debug, DBusError)]
-#[zbus(prefix = "org.uperflinux.Daemon1.Error")]
+#[zbus(prefix = "org.uperflinux.Daemon2.Error")]
 pub enum ServiceError {
     /// An argument is malformed or outside the advertised capability range.
     InvalidArgument(String),
-    /// Client and daemon use incompatible major API generations.
+    /// Client and daemon use different API versions.
     IncompatibleVersion(String),
     /// A target, process, rule, or mode does not exist.
     NotFound(String),
@@ -44,7 +44,7 @@ pub enum ClientError {
         /// Human-readable daemon detail.
         message: String,
     },
-    /// The daemon speaks another breaking API generation.
+    /// The daemon does not speak this client's exact API version.
     #[error("incompatible D-Bus API: client {client}, daemon {server}")]
     IncompatibleApi {
         /// Version implemented by this client.
@@ -91,7 +91,7 @@ mod tests {
         let error = ServiceError::NotFound("missing".into());
         assert_eq!(
             error.name().as_str(),
-            "org.uperflinux.Daemon1.Error.NotFound"
+            "org.uperflinux.Daemon2.Error.NotFound"
         );
     }
 }

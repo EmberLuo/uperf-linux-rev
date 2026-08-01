@@ -7,7 +7,7 @@ ConditionArchitecture=arm64
 
 [Service]
 Type=dbus
-BusName=org.uperflinux.Daemon1
+BusName=org.uperflinux.Daemon2
 User=root
 Group=root
 ExecStart=/usr/bin/uperf-linux --config-dir /etc/uperf-linux --device-profile-dir /usr/share/uperf-linux/devices --state-dir /var/lib/uperf-linux --runtime-dir /run/uperf-linux

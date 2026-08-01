@@ -21,18 +21,18 @@ use tokio::{
 use uperf_actuator::{ActuatorMode, FileStateStore, FrequencyActuator};
 use uperf_api::{
     ActiveWorkload, ApiVersion, AppRule as ApiAppRule, Capabilities, CpuLoad, DaemonStatus,
-    DecisionTraceEntry, DecisionTraceEntryV2, FrameHintEvent, FrequencyOverride, FrequencyStatus,
+    DecisionTraceEntry, FrameHintEvent, FrequencyOverride, FrequencyStatus,
     GovernorDiagnosticsStatus, GovernorStatus, GovernorTargetStatus, HealthIssue, HealthStatus,
     MutationReceipt, ReloadReport, SchedulerStatus, TelemetrySnapshot, ThermalStatus,
     WorkloadIdentity, WorkloadRequest, feature,
 };
 use uperf_core::{
     AdaptiveSampler, AppliedState, AppsConfig, DesiredPlan, FrequencyLimits, GovernorDiagnostics,
-    GovernorRollout, GovernorState, HeavyLoadDetector, HeavyLoadState, Hertz, Hint, HintSet,
-    InputConfig, MilliCelsius, ModeSelection, MonotonicMillis, ObservedFrequency, ObservedState,
-    ProcessId, ProcessIdentity, ProcessInfo, ProfileId, Scene, SensorHealth, TargetId, TaskPlan,
-    ThermalGuard, ThermalReading, ThermalState, ThermalThresholds, WorkloadSource,
-    scheduler_scene_for, worst_thermal_state,
+    GovernorState, HeavyLoadDetector, HeavyLoadState, Hertz, Hint, HintSet, InputConfig,
+    MilliCelsius, ModeSelection, MonotonicMillis, ObservedFrequency, ObservedState, ProcessId,
+    ProcessIdentity, ProcessInfo, ProfileId, Scene, SensorHealth, TargetId, TaskPlan, ThermalGuard,
+    ThermalReading, ThermalState, ThermalThresholds, WorkloadSource, scheduler_scene_for,
+    worst_thermal_state,
 };
 use uperf_linux::{LinuxDiscovery, LinuxEnvironment};
 use uperf_platform::{
@@ -266,11 +266,6 @@ impl RuntimeHandle {
     #[must_use]
     pub(crate) fn decision_trace(&self, after_id: u64, limit: u32) -> Vec<DecisionTraceEntry> {
         self.decision_trace.page(after_id, limit)
-    }
-
-    #[must_use]
-    pub(crate) fn decision_trace_v2(&self, after_id: u64, limit: u32) -> Vec<DecisionTraceEntryV2> {
-        self.decision_trace.page_v2(after_id, limit)
     }
 
     /// Select the global automatic or forced profile mode.
@@ -864,11 +859,7 @@ pub struct ObserverSettings {
 
 impl ObserverSettings {
     fn from_configuration(configuration: &ResolvedConfiguration, generation: u64) -> Self {
-        let load_interval_ms = if configuration.policy.governor.rollout == GovernorRollout::Legacy {
-            configuration.policy.load.sample_interval_ms
-        } else {
-            configuration.policy.governor.idle_sample_ms
-        };
+        let load_interval_ms = configuration.policy.governor.idle_sample_ms;
         Self {
             generation,
             load_interval: Duration::from_millis(load_interval_ms),
@@ -1127,7 +1118,6 @@ struct RuntimeActor {
     decision_trigger_at: MonotonicMillis,
     governor_state: GovernorState,
     governor_diagnostics: Option<GovernorDiagnostics>,
-    shadow_frequencies: Option<BTreeMap<TargetId, FrequencyLimits>>,
     governor_integrate_elapsed_time: bool,
     applied: AppliedState,
     hints: HintSet,
@@ -1281,7 +1271,6 @@ impl RuntimeActor {
             decision_trigger_at: MonotonicMillis::new(0),
             governor_state: GovernorState::default(),
             governor_diagnostics: None,
-            shadow_frequencies: None,
             governor_integrate_elapsed_time: false,
             applied: AppliedState::default(),
             hints: HintSet::new(),
@@ -1936,9 +1925,6 @@ impl RuntimeActor {
     }
 
     fn update_load_observer_cadence(&mut self) {
-        if self.configuration.policy.governor.rollout == GovernorRollout::Legacy {
-            return;
-        }
         let maximum_load = self
             .observed
             .cpu_loads
@@ -3223,23 +3209,6 @@ impl RuntimeActor {
             lease.expires_at = now.saturating_add(ttl);
             return Ok(());
         }
-        // Backward-compatible lazy promotion for a focus lease accepted before
-        // this dedicated authorization existed. Production focus completion
-        // installs the reporter lease eagerly.
-        let focus_uid = self.focus_lease.as_ref().and_then(|lease| {
-            (lease.peer.as_deref() == Some(peer)
-                && now < lease.expires_at
-                && (caller_uid == 0 || lease.info.identity.uid.get() == caller_uid))
-                .then_some(lease.info.identity.uid.get())
-        });
-        if let Some(uid) = focus_uid {
-            self.frame_reporter_lease = Some(FrameReporterLease {
-                peer: peer.to_owned(),
-                uid,
-                expires_at: now.saturating_add(ttl),
-            });
-            return Ok(());
-        }
         Err(RuntimeError::NotAuthorized(
             "frame hints require a current compositor reporter lease".to_owned(),
         ))
@@ -3830,7 +3799,6 @@ impl RuntimeActor {
         self.configuration = candidate;
         self.governor_state = GovernorState::default();
         self.governor_diagnostics = None;
-        self.shadow_frequencies = None;
         self.governor_integrate_elapsed_time = false;
         self.adaptive_sampler = AdaptiveSampler::default();
         self.config_generation = next_config_generation;
@@ -4043,20 +4011,6 @@ impl RuntimeActor {
                 self.health_issues.remove("policy.evaluate");
                 self.governor_state = evaluation.next_governor_state;
                 self.governor_diagnostics = evaluation.governor_diagnostics;
-                self.shadow_frequencies = evaluation.shadow_frequencies;
-                if let Some(error) = evaluation.governor_error {
-                    self.health_issues.insert(
-                        "governor.shadow".to_owned(),
-                        issue(
-                            "governor.shadow",
-                            "warning",
-                            "policy",
-                            format!("shadow energy governor unavailable: {error}"),
-                        ),
-                    );
-                } else {
-                    self.health_issues.remove("governor.shadow");
-                }
                 self.governor_integrate_elapsed_time = true;
                 evaluation.desired
             }
@@ -4969,12 +4923,6 @@ impl RuntimeActor {
             .to_string();
         GovernorStatus {
             generation,
-            rollout: match self.configuration.policy.governor.rollout {
-                GovernorRollout::Legacy => "legacy",
-                GovernorRollout::Shadow => "shadow",
-                GovernorRollout::Energy => "energy",
-            }
-            .to_owned(),
             profile,
             scene,
             trigger_source: self.decision_trigger_source.clone(),
@@ -5035,9 +4983,6 @@ impl RuntimeActor {
         capabilities
             .features
             .push(feature::RUNNING_WORKLOADS.to_owned());
-        capabilities
-            .features
-            .push(feature::DECISION_TRACE_V2.to_owned());
         if self.configuration.policy.scheduler.focus.enabled {
             capabilities
                 .features
@@ -5663,7 +5608,7 @@ fn read_frequency_limits(
 fn api_rule_to_core(rule: &ApiAppRule) -> Result<uperf_core::AppRule, RuntimeError> {
     if rule.owner_uid != u32::MAX {
         return Err(RuntimeError::InvalidArgument(
-            "D-Bus API v1 only supports administrator-owned global application rules".to_owned(),
+            "application rules are administrator-owned and global".to_owned(),
         ));
     }
     if rule.executable.is_none() && rule.comm_regex.is_none() {
@@ -6586,7 +6531,16 @@ mod tests {
                     "related_cpus": [0],
                     "floor_hz": 1000,
                     "reference_hz": 2000,
-                    "efficient_cap_hz": 3000
+                    "efficient_cap_hz": 3000,
+                    "energy_model": {
+                        "kind": "reference-curve-v1",
+                        "relative_performance": 100,
+                        "typical_power_mw_per_core": 100,
+                        "typical_frequency_hz": 3000,
+                        "sweet_frequency_hz": 2000,
+                        "plain_frequency_hz": 1500,
+                        "free_frequency_hz": 1000
+                    }
                 }],
                 "thermal_zones": [{
                     "id": "soc",
@@ -6809,6 +6763,14 @@ mod tests {
         }
     }
 
+    fn held_frame_reporter_lease(peer: &str, uid: u32, expires_at: u64) -> FrameReporterLease {
+        FrameReporterLease {
+            peer: peer.to_owned(),
+            uid,
+            expires_at: MonotonicMillis::new(expires_at),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn frame_hints_require_the_current_focus_peer_and_uid() {
         let temporary = tempfile::tempdir().expect("temporary configuration roots");
@@ -6817,6 +6779,7 @@ mod tests {
             FakeClock::new(MonotonicMillis::new(10)),
         ));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.frame_reporter_lease = Some(held_frame_reporter_lease(":1.7", 1_000, 10_000));
         actor.reduce_runtime_input(RuntimeInput::Input(InputEvent::Interaction {
             device: InputDeviceId::new(1),
         }));
@@ -6842,6 +6805,7 @@ mod tests {
         let clock = FakeClock::new(MonotonicMillis::new(10));
         let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.frame_reporter_lease = Some(held_frame_reporter_lease(":1.7", 1_000, 10_000));
         actor.reduce_runtime_input(RuntimeInput::Input(InputEvent::Interaction {
             device: InputDeviceId::new(1),
         }));
@@ -6892,6 +6856,7 @@ mod tests {
         let clock = FakeClock::new(MonotonicMillis::new(10));
         let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.frame_reporter_lease = Some(held_frame_reporter_lease(":1.7", 1_000, 10_000));
         let now = clock.monotonic_millis();
         actor.hints.activate(Hint::persistent(Scene::Boost, now));
         actor.hints.activate(Hint::persistent(Scene::Wake, now));
@@ -7011,6 +6976,7 @@ mod tests {
         let clock = FakeClock::new(MonotonicMillis::new(10));
         let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
+        actor.frame_reporter_lease = Some(held_frame_reporter_lease(":1.7", 1_000, 10_000));
         actor.reduce_runtime_input(RuntimeInput::Input(InputEvent::Interaction {
             device: InputDeviceId::new(1),
         }));
@@ -7042,9 +7008,11 @@ mod tests {
         let clock = FakeClock::new(MonotonicMillis::new(10));
         let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
-        actor
-            .command_report_frame_hint(FrameHintEvent::RenderStarted, 1_000, Some(":1.7"))
-            .expect("promote the verified focus reporter");
+        actor.frame_reporter_lease = Some(FrameReporterLease {
+            peer: ":1.7".to_owned(),
+            uid: 1_000,
+            expires_at: MonotonicMillis::new(10_000),
+        });
         assert!(actor.frame_reporter_lease.is_some());
 
         actor
@@ -7083,9 +7051,11 @@ mod tests {
         let clock = FakeClock::new(MonotonicMillis::new(10));
         let mut actor = actor_for_test(actor_parts(temporary.path(), clock.clone()));
         actor.focus_lease = Some(held_focus_lease(test_process(42, 1_000), ":1.7", 10_000));
-        actor
-            .command_report_frame_hint(FrameHintEvent::RenderStarted, 1_000, Some(":1.7"))
-            .expect("promote reporter lease");
+        actor.frame_reporter_lease = Some(FrameReporterLease {
+            peer: ":1.7".to_owned(),
+            uid: 1_000,
+            expires_at: MonotonicMillis::new(10_000),
+        });
         actor
             .command_clear_foreground(1_000)
             .expect("clear focus while retaining reporter");

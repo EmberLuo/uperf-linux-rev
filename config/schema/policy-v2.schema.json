@@ -11,14 +11,11 @@
       "default": {
         "active_load_threshold": 0.3,
         "active_sample_ms": 20,
-        "ema_time_constant_ms": 40,
         "idle_load_threshold": 0.15,
         "idle_sample_ms": 80,
         "min_opp_residency_ms": 10,
         "predict_threshold": 0.15,
-        "prediction_gain": 1.0,
-        "ramp_latency_ms": 100,
-        "rollout": "legacy"
+        "ramp_latency_ms": 100
       }
     },
     "input": {
@@ -193,11 +190,6 @@
           "format": "uint64",
           "minimum": 0
         },
-        "ema_time_constant_ms": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
         "idle_load_threshold": {
           "type": "number",
           "format": "double"
@@ -216,18 +208,10 @@
           "type": "number",
           "format": "double"
         },
-        "prediction_gain": {
-          "type": "number",
-          "format": "double"
-        },
         "ramp_latency_ms": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
-        },
-        "rollout": {
-          "$ref": "#/$defs/GovernorRollout",
-          "default": "legacy"
         }
       },
       "additionalProperties": false,
@@ -236,19 +220,9 @@
         "idle_sample_ms",
         "active_load_threshold",
         "idle_load_threshold",
-        "ema_time_constant_ms",
         "predict_threshold",
-        "prediction_gain",
         "ramp_latency_ms",
         "min_opp_residency_ms"
-      ]
-    },
-    "GovernorRollout": {
-      "type": "string",
-      "enum": [
-        "legacy",
-        "shadow",
-        "energy"
       ]
     },
     "InputConfig": {
@@ -684,12 +658,7 @@
           "maxItems": 1024
         },
         "realtime": {
-          "$ref": "#/$defs/RealtimeSchedulerConfig",
-          "default": {
-            "enabled": false,
-            "housekeeping_cpus": [],
-            "max_priority": 20
-          }
+          "$ref": "#/$defs/RealtimeSchedulerConfig"
         },
         "task_profiles": {
           "type": "array",
@@ -700,7 +669,10 @@
           "maxItems": 256
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "realtime"
+      ]
     },
     "SchedulingClass": {
       "type": "string",
@@ -864,23 +836,8 @@
     "ThreadRuleConfig": {
       "type": "object",
       "properties": {
-        "comm_regex": {
-          "description": "Deprecated v2 spelling retained for configuration compatibility.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "selector": {
-          "description": "Typed selector used by new configurations.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ThreadSelector"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/ThreadSelector"
         },
         "task_profile": {
           "type": "string"
@@ -888,6 +845,7 @@
       },
       "additionalProperties": false,
       "required": [
+        "selector",
         "task_profile"
       ]
     },

@@ -287,7 +287,7 @@ fn energy_draft(capabilities: &uperf_core::DeviceCapabilities) -> serde_json::Va
             "measure steady-state package power at every selected OPP",
             "subtract an idle baseline using the same kernel and ambient conditions",
             "record firmware, kernel, governor, temperature, and repeatability",
-            "do not enable energy rollout until an A/B report is reviewed"
+            "do not activate the energy model until an A/B report is reviewed"
         ]
     })
 }

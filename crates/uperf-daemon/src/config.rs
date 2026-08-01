@@ -12,9 +12,9 @@ use uperf_actuator::{FrequencyTarget, ScalarDomain, ScalarTarget, TargetRegistry
 use uperf_api::{ApiVersion, Capabilities, ModeInfo, TargetCapability, feature};
 use uperf_core::{
     AppRuleEngine, AppsConfig, CONFIG_SCHEMA_VERSION, ConfigBundle, CpuSet, CpuTargetPolicy,
-    DeviceConfig, EnergyModel, FrequencyLimits, FrequencyPolicy, GovernorRollout, Hertz,
-    MAX_CONFIG_FILE_BYTES, PolicyConfig, PolicyEngine, ScalarTargetConfig,
-    ScalarTargetDomainConfig, TargetId, ThermalZoneConfig,
+    DeviceConfig, EnergyModel, FrequencyLimits, FrequencyPolicy, Hertz, MAX_CONFIG_FILE_BYTES,
+    PolicyConfig, PolicyEngine, ScalarTargetConfig, ScalarTargetDomainConfig, TargetId,
+    ThermalZoneConfig,
 };
 use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -161,7 +161,7 @@ impl ResolvedConfiguration {
             .context("validate references across device and policy configuration")?;
         let policy_engine = PolicyEngine::new(policy.clone())?;
         let app_rule_engine = AppRuleEngine::new(&apps)?;
-        let (targets, mut warnings) = resolve_targets(&device, discovery, policy.governor.rollout)?;
+        let (targets, mut warnings) = resolve_targets(&device, discovery)?;
         warnings.extend(paths.startup_warnings.iter().cloned());
         let thermal_zones = resolve_thermal_zones(&device, discovery)?;
 
@@ -280,12 +280,11 @@ impl ResolvedConfiguration {
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
         let mut features = vec![
-            feature::LOAD_GOVERNOR.to_owned(),
             feature::THERMAL_GUARD.to_owned(),
             feature::ACTIVE_WORKLOAD.to_owned(),
             feature::CONFIG_RELOAD_V2.to_owned(),
             feature::LOGIND_SLEEP_WAKE.to_owned(),
-            feature::DECISION_TRACE_V1.to_owned(),
+            feature::DECISION_TRACE.to_owned(),
         ];
         if self.policy.input.enabled {
             features.push(feature::EVDEV_SCENES.to_owned());
@@ -297,8 +296,7 @@ impl ResolvedConfiguration {
         if !self.device.scalar_targets.is_empty() {
             features.push(feature::SCALAR_TARGETS_V1.to_owned());
         }
-        if self.policy.governor.rollout != GovernorRollout::Legacy
-            && !self.device.cpu_policies.is_empty()
+        if !self.device.cpu_policies.is_empty()
             && self
                 .device
                 .cpu_policies
@@ -343,8 +341,7 @@ impl ResolvedConfiguration {
                 .values()
                 .map(ResolvedTarget::api_capability)
                 .collect(),
-            config_schema_min: CONFIG_SCHEMA_VERSION,
-            config_schema_max: CONFIG_SCHEMA_VERSION,
+            config_schema_version: CONFIG_SCHEMA_VERSION,
         }
     }
 }
@@ -524,7 +521,6 @@ fn device_matches(device: &DeviceConfig, discovery: &LinuxDiscovery) -> bool {
 fn resolve_targets(
     device: &DeviceConfig,
     discovery: &LinuxDiscovery,
-    governor_rollout: GovernorRollout,
 ) -> Result<(BTreeMap<TargetId, ResolvedTarget>, Vec<String>)> {
     let mut resolved = BTreeMap::new();
     let mut claimed_discovery_ids = BTreeSet::new();
@@ -592,16 +588,8 @@ fn resolve_targets(
             .energy_model
             .as_ref()
             .map(|model| EnergyModel::from_config(model, &capability.available_frequencies))
-            .transpose();
-        let energy_model = match (energy_model, governor_rollout) {
-            (Ok(model), _) => model,
-            (Err(_), GovernorRollout::Legacy) => None,
-            (Err(error), GovernorRollout::Shadow | GovernorRollout::Energy) => {
-                return Err(error).with_context(|| {
-                    format!("expand calibrated energy model for {}", configured.id)
-                });
-            }
-        };
+            .transpose()
+            .with_context(|| format!("expand calibrated energy model for {}", configured.id))?;
         claimed_discovery_ids.insert(capability.id.clone());
         resolved.insert(
             configured.id.clone(),
@@ -861,8 +849,8 @@ mod tests {
     use tempfile::tempdir;
     use uperf_core::{
         AppsConfig, ConfigBundle, CpuId, CpuPolicyCapability, CpuSet, DeviceCapabilities,
-        DeviceConfig, FrequencyLimits, GovernorRollout, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig,
-        PowerBudgetConfig, TargetId, ThermalZoneCapability,
+        DeviceConfig, FrequencyLimits, Hertz, MAX_CONFIG_FILE_BYTES, PolicyConfig, TargetId,
+        ThermalZoneCapability,
     };
     use uperf_linux::{FrequencyTargetPaths, LinuxDiscovery};
 
@@ -1110,12 +1098,9 @@ mod tests {
                 .any(|feature| feature == uperf_api::feature::DESKTOP_INPUT_V1)
         );
         assert!(
-            !resolved
+            resolved
                 .capabilities()
-                .features
-                .iter()
-                .any(|feature| feature == uperf_api::feature::ENERGY_GOVERNOR_V1),
-            "legacy rollout must not advertise an active energy governor"
+                .supports(uperf_api::feature::ENERGY_GOVERNOR_V1)
         );
         assert!(
             resolved
@@ -1131,36 +1116,6 @@ mod tests {
         assert!(!disabled.supports(uperf_api::feature::DESKTOP_INPUT_V1));
         assert!(!disabled.supports(uperf_api::feature::SCENE_SCHEDULER_V1));
         assert!(!disabled.supports(uperf_api::feature::SCALAR_TARGETS_V1));
-
-        resolved.policy.governor.rollout = GovernorRollout::Shadow;
-        resolved.device.cpu_policies[0].energy_model =
-            Some(uperf_core::CpuEnergyModelConfig::ReferenceCurveV1 {
-                relative_performance: 100,
-                typical_power_mw_per_core: 1_000,
-                typical_frequency_hz: Hertz::new(3_000),
-                sweet_frequency_hz: Hertz::new(2_000),
-                plain_frequency_hz: Hertz::new(1_000),
-                free_frequency_hz: Hertz::new(1_000),
-            });
-        assert!(
-            !resolved
-                .capabilities()
-                .supports(uperf_api::feature::ENERGY_GOVERNOR_V1),
-            "an incomplete shadow budget must not advertise a usable energy governor"
-        );
-        for profile in &mut resolved.policy.profiles {
-            profile.power_budget = Some(PowerBudgetConfig {
-                slow_limit_power_mw: 1_000,
-                fast_limit_power_mw: 2_000,
-                fast_limit_capacity_mj: 1_000,
-                fast_limit_recover_scale: 1.0,
-            });
-        }
-        assert!(
-            resolved
-                .capabilities()
-                .supports(uperf_api::feature::ENERGY_GOVERNOR_V1)
-        );
     }
 
     #[test]
@@ -1262,7 +1217,16 @@ mod tests {
                 "efficient_cap_hz": 3_000,
                 "admin_cap_hz": 4_000,
                 "critical_cap_hz": 1_000,
-                "sensor_failure_cap_hz": 1_000
+                "sensor_failure_cap_hz": 1_000,
+                "energy_model": {
+                    "kind": "reference-curve-v1",
+                    "relative_performance": 100,
+                    "typical_power_mw_per_core": 100,
+                    "typical_frequency_hz": 3_000,
+                    "sweet_frequency_hz": 2_000,
+                    "plain_frequency_hz": 1_500,
+                    "free_frequency_hz": 1_000
+                }
             }],
             "scalar_targets": [{
                 "id": "scalar.memory",

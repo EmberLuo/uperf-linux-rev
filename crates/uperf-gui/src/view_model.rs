@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use uperf_api::{
-    ActiveWorkload, ApiVersion, Capabilities, DaemonStatus, FrequencyOverride, FrequencyStatus,
-    HealthStatus, ModeInfo, TargetCapability, ThermalStatus, feature,
+    ActiveWorkload, Capabilities, DaemonStatus, FrequencyOverride, FrequencyStatus, HealthStatus,
+    ModeInfo, TargetCapability, ThermalStatus, feature,
 };
 
 use crate::i18n::{
@@ -17,11 +17,6 @@ pub const FOCUS_REJECTED_CODE: &str = "focus.rejected";
 pub const FOCUS_REPORTER_COMMAND: &str = "gnome-extensions enable focus@uperflinux.org";
 /// Policy key that gates the whole focus path inside the daemon.
 pub const FOCUS_POLICY_KEY: &str = "scheduler.focus.enabled";
-/// First API minor that carries the focus methods at all.
-const FOCUS_API_MINOR: u32 = 2;
-
-const _: () = assert!(ApiVersion::CURRENT.minor >= FOCUS_API_MINOR);
-
 /// Presentation state derived only from versioned API DTOs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewModel {
@@ -67,7 +62,7 @@ pub struct TargetView {
     pub choices_hz: Vec<u64>,
 }
 
-/// Aggregate thermal information exposed by D-Bus v1.
+/// Aggregate thermal information exposed by D-Bus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThermalView {
     pub state: String,
@@ -256,21 +251,14 @@ fn focus_view(
         .find(|issue| issue.code == FOCUS_REJECTED_CODE);
 
     if !supported {
-        // A daemon that predates the focus contract cannot be fixed by editing
-        // policy, so the two causes need different advice.
-        let detail = if capabilities.api_version.minor < FOCUS_API_MINOR {
-            tr("This daemon is older than the focus contract; update uperf-linux").to_owned()
-        } else {
-            format!(
-                "{} {FOCUS_POLICY_KEY}",
-                tr("The daemon has focus scheduling disabled; enable")
-            )
-        };
         return FocusView {
             state: FocusState::Unsupported,
             supported,
             summary: tr("Off").into(),
-            detail,
+            detail: format!(
+                "{} {FOCUS_POLICY_KEY}",
+                tr("The daemon has focus scheduling disabled; enable")
+            ),
             holder: None,
             command: None,
         };
@@ -636,26 +624,6 @@ mod tests {
         assert!(view.focus.detail.contains("scheduler.focus.enabled"));
         assert!(view.focus.command.is_none());
         assert_eq!(view.focus.action(), FocusAction::None);
-    }
-
-    #[test]
-    fn an_old_daemon_is_told_to_update_rather_than_to_edit_policy() {
-        let capabilities = Capabilities {
-            api_version: uperf_api::ApiVersion { major: 1, minor: 1 },
-            ..Capabilities::default()
-        };
-
-        let view = ViewModel::from_api(
-            &capabilities,
-            &DaemonStatus::default(),
-            ReporterState::Enabled,
-        );
-
-        assert_eq!(view.focus.state, FocusState::Unsupported);
-        assert!(
-            !view.focus.detail.contains("scheduler.focus.enabled"),
-            "editing a policy key that this daemon ignores would be bad advice"
-        );
     }
 
     #[test]

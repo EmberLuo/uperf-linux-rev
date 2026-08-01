@@ -606,7 +606,7 @@ impl Ui {
 
         let overview = adw::PreferencesGroup::builder()
             .title(tr("Status"))
-            .description(tr("Observed state reported by org.uperflinux.Daemon1"))
+            .description(tr("Observed state reported by org.uperflinux.Daemon2"))
             .build();
         overview.add(&self.connection_row);
         overview.add(&self.state_row);
@@ -2873,7 +2873,7 @@ mod tests {
     #[test]
     fn permission_and_request_errors_do_not_masquerade_as_disconnects() {
         let denied = ClientError::Remote {
-            name: "org.uperflinux.Daemon1.Error.NotAuthorized".into(),
+            name: "org.uperflinux.Daemon2.Error.NotAuthorized".into(),
             message: "authorization required".into(),
         };
         assert_eq!(

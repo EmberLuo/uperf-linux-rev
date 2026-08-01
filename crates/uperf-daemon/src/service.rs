@@ -1,11 +1,11 @@
-//! Version-1 D-Bus service backed by the runtime actor.
+//! Current D-Bus service backed by the runtime actor.
 
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 use uperf_api::{
-    ApiVersion, AppRule, Capabilities, DaemonStatus, DecisionTraceEntry, DecisionTraceEntryV2,
-    FrameHintEvent, FrequencyOverride, GovernorStatus, HealthStatus, MutationReceipt, ReloadReport,
+    ApiVersion, AppRule, Capabilities, DaemonStatus, DecisionTraceEntry, FrameHintEvent,
+    FrequencyOverride, GovernorStatus, HealthStatus, MutationReceipt, ReloadReport,
     RunningWorkload, SchedulerStatus, ServiceError, TelemetrySnapshot, WorkloadIdentity,
     WorkloadRequest,
 };
@@ -149,7 +149,7 @@ impl RunningWorkloadScanner {
     }
 }
 
-/// Exported `org.uperflinux.Daemon1` object.
+/// Exported `org.uperflinux.Daemon2` object.
 pub struct DaemonService {
     runtime: RuntimeHandle,
     authorizer: Authorizer,
@@ -171,7 +171,7 @@ impl DaemonService {
     }
 }
 
-#[zbus::interface(name = "org.uperflinux.Daemon1", introspection_docs = false)]
+#[zbus::interface(name = "org.uperflinux.Daemon2", introspection_docs = false)]
 impl DaemonService {
     fn get_status(&self) -> DaemonStatus {
         self.runtime.snapshot().status.clone()
@@ -206,19 +206,6 @@ impl DaemonService {
             )));
         }
         Ok(self.runtime.decision_trace(after_id, limit))
-    }
-
-    fn get_decision_trace_v2(
-        &self,
-        after_id: u64,
-        limit: u32,
-    ) -> Result<Vec<DecisionTraceEntryV2>, ServiceError> {
-        if limit > MAX_TRACE_PAGE {
-            return Err(ServiceError::InvalidArgument(format!(
-                "decision trace limit {limit} exceeds {MAX_TRACE_PAGE}"
-            )));
-        }
-        Ok(self.runtime.decision_trace_v2(after_id, limit))
     }
 
     fn get_governor_status(&self) -> GovernorStatus {
@@ -746,7 +733,7 @@ mod tests {
     use crate::auth::AuthorizationMode;
 
     #[test]
-    fn daemon1_introspection_matches_the_versioned_snapshot() {
+    fn daemon2_introspection_matches_the_current_snapshot() {
         let service = DaemonService::new(
             RuntimeHandle::snapshot_only(),
             Authorizer::new(AuthorizationMode::DevelopmentSession),
@@ -754,7 +741,7 @@ mod tests {
         );
         let mut xml = String::new();
         service.introspect_to_writer(&mut xml, 0);
-        assert_eq!(xml, include_str!("daemon1-introspection.xml"));
+        assert_eq!(xml, include_str!("daemon2-introspection.xml"));
     }
 
     #[test]
@@ -784,16 +771,6 @@ mod tests {
         );
         assert!(matches!(
             service.get_decision_trace(0, MAX_TRACE_PAGE + 1),
-            Err(ServiceError::InvalidArgument(_))
-        ));
-        assert!(
-            service
-                .get_decision_trace_v2(0, MAX_TRACE_PAGE)
-                .expect("read-only extended trace query")
-                .is_empty()
-        );
-        assert!(matches!(
-            service.get_decision_trace_v2(0, MAX_TRACE_PAGE + 1),
             Err(ServiceError::InvalidArgument(_))
         ));
         assert_eq!(service.get_governor_status(), GovernorStatus::default());

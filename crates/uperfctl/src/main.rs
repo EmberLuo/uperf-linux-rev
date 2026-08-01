@@ -11,9 +11,9 @@ use args::{
 use serde_json::json;
 use tokio::time::timeout;
 use uperf_api::{
-    Capabilities, DaemonClient, DaemonStatus, DecisionTraceEntry, DecisionTraceEntryV2,
-    DiagnosticReport, FrequencyOverride, FrequencyStatus, GovernorStatus, HealthStatus,
-    MutationReceipt, ReloadReport, TargetCapability, WorkloadRequest,
+    Capabilities, DaemonClient, DaemonStatus, DecisionTraceEntry, DiagnosticReport,
+    FrequencyOverride, FrequencyStatus, GovernorStatus, HealthStatus, MutationReceipt,
+    ReloadReport, TargetCapability, WorkloadRequest,
 };
 
 const EXIT_UNHEALTHY: u8 = 2;
@@ -120,17 +120,10 @@ async fn run_trace(
     options: &TraceOptions,
     json_output: bool,
 ) -> Result<bool> {
-    if options.extended {
-        let entries = client
-            .decision_trace_v2(options.after_id, options.limit)
-            .await?;
-        print_trace_v2(&entries, json_output)?;
-    } else {
-        let entries = client
-            .decision_trace(options.after_id, options.limit)
-            .await?;
-        print_trace(&entries, json_output)?;
-    }
+    let entries = client
+        .decision_trace(options.after_id, options.limit)
+        .await?;
+    print_trace(&entries, json_output)?;
     Ok(true)
 }
 
@@ -629,20 +622,6 @@ fn print_trace(entries: &[DecisionTraceEntry], json_output: bool) -> Result<()> 
         if !entry.error.is_empty() {
             println!("  error: {}", entry.error);
         }
-    }
-    Ok(())
-}
-
-fn print_trace_v2(entries: &[DecisionTraceEntryV2], json_output: bool) -> Result<()> {
-    if json_output {
-        return print_json(&entries);
-    }
-    if entries.is_empty() {
-        println!("no retained decision trace entries");
-        return Ok(());
-    }
-    for entry in entries {
-        print_trace(std::slice::from_ref(&entry.base), false)?;
         println!(
             "  trigger={} at={}ms verified-apply-latency={}us",
             display_or_dash(&entry.trigger_source),
@@ -664,7 +643,7 @@ fn print_trace_v2(entries: &[DecisionTraceEntryV2], json_output: bool) -> Result
     }
     let mut verified_apply_latencies = entries
         .iter()
-        .filter(|entry| entry.base.frequency_attempted && entry.base.success)
+        .filter(|entry| entry.frequency_attempted && entry.success)
         .map(|entry| entry.verified_apply_latency_us)
         .collect::<Vec<_>>();
     verified_apply_latencies.sort_unstable();
@@ -692,8 +671,7 @@ fn print_governor_status(status: &GovernorStatus, json_output: bool) -> Result<(
         return print_json(status);
     }
     println!(
-        "governor: rollout={} generation={} profile={} scene={} trigger={}",
-        status.rollout,
+        "governor: generation={} profile={} scene={} trigger={}",
         status.generation,
         status.profile,
         status.scene,
@@ -888,13 +866,13 @@ mod tests {
     #[test]
     fn remote_errors_have_stable_exit_codes() {
         let denied = anyhow::Error::new(uperf_api::ClientError::Remote {
-            name: "org.uperflinux.Daemon1.Error.NotAuthorized".into(),
+            name: "org.uperflinux.Daemon2.Error.NotAuthorized".into(),
             message: "denied".into(),
         });
         assert_eq!(classify_error(&denied), EXIT_NOT_AUTHORIZED);
 
         let conflict = anyhow::Error::new(uperf_api::ClientError::Remote {
-            name: "org.uperflinux.Daemon1.Error.Conflict".into(),
+            name: "org.uperflinux.Daemon2.Error.Conflict".into(),
             message: "stale".into(),
         });
         assert_eq!(classify_error(&conflict), EXIT_CONFLICT);

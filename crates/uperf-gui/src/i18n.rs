@@ -246,8 +246,8 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
         "None" => "无",
         "Off" => "已关闭",
         "Not authorized" => "未授权",
-        "Observed state reported by org.uperflinux.Daemon1" => {
-            "org.uperflinux.Daemon1 报告的实际状态"
+        "Observed state reported by org.uperflinux.Daemon2" => {
+            "org.uperflinux.Daemon2 报告的实际状态"
         }
         "Paused by an explicit selection" => "已被显式选择暂停",
         "Pending or no matching scheduler rule" => "等待应用或没有匹配的调度规则",
@@ -308,9 +308,6 @@ pub fn translate(language: Language, english: &'static str) -> &'static str {
             "限制生效时，内核不会选择低于此值的频率"
         }
         "Thermal safety" => "温控安全",
-        "This daemon is older than the focus contract; update uperf-linux" => {
-            "该守护进程版本早于焦点接口，请更新 uperf-linux"
-        }
         "Turn on" => "启用",
         "Turn the GNOME focus reporter on to let focus steer scheduling" => {
             "启用 GNOME 焦点上报扩展后，焦点才能驱动调度"

@@ -162,7 +162,7 @@
           "$ref": "#/$defs/Hertz"
         },
         "energy_model": {
-          "description": "Optional calibrated model.  Absence keeps the legacy governor active.",
+          "description": "Calibrated model used by the energy governor. It may be absent only in\na non-activatable probe draft.",
           "anyOf": [
             {
               "$ref": "#/$defs/CpuEnergyModelConfig"

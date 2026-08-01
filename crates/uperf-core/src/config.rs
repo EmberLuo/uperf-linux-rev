@@ -219,7 +219,8 @@ pub struct CpuPolicyConfig {
     pub critical_cap_hz: Option<Hertz>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensor_failure_cap_hz: Option<Hertz>,
-    /// Optional calibrated model.  Absence keeps the legacy governor active.
+    /// Calibrated model used by the energy governor. It may be absent only in
+    /// a non-activatable probe draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_model: Option<CpuEnergyModelConfig>,
 }
@@ -589,27 +590,14 @@ pub struct ProfileConfig {
     pub scenes: BTreeMap<Scene, ScenePatch>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum GovernorRollout {
-    #[default]
-    Legacy,
-    Shadow,
-    Energy,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GovernorConfig {
-    #[serde(default)]
-    pub rollout: GovernorRollout,
     pub active_sample_ms: u64,
     pub idle_sample_ms: u64,
     pub active_load_threshold: f64,
     pub idle_load_threshold: f64,
-    pub ema_time_constant_ms: u64,
     pub predict_threshold: f64,
-    pub prediction_gain: f64,
     pub ramp_latency_ms: u64,
     pub min_opp_residency_ms: u64,
 }
@@ -617,14 +605,11 @@ pub struct GovernorConfig {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            rollout: GovernorRollout::Legacy,
             active_sample_ms: 20,
             idle_sample_ms: 80,
             active_load_threshold: 0.30,
             idle_load_threshold: 0.15,
-            ema_time_constant_ms: 40,
             predict_threshold: 0.15,
-            prediction_gain: 1.0,
             ramp_latency_ms: 100,
             min_opp_residency_ms: 10,
         }
@@ -732,12 +717,7 @@ pub enum ThreadSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadRuleConfig {
-    /// Typed selector used by new configurations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector: Option<ThreadSelector>,
-    /// Deprecated v2 spelling retained for configuration compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comm_regex: Option<String>,
+    pub selector: ThreadSelector,
     pub task_profile: String,
 }
 
@@ -872,7 +852,6 @@ pub struct SchedulerConfig {
     pub cgroup_classes: Vec<CgroupClassConfig>,
     #[serde(default)]
     pub focus: FocusConfig,
-    #[serde(default)]
     pub realtime: RealtimeSchedulerConfig,
 }
 
@@ -1207,14 +1186,11 @@ impl ConfigBundle {
     }
 
     fn validate_energy_references(&self, issues: &mut Vec<ValidationIssue>) {
-        if self.policy.governor.rollout != GovernorRollout::Energy {
-            return;
-        }
         for (index, cpu_policy) in self.device.cpu_policies.iter().enumerate() {
             if cpu_policy.energy_model.is_none() {
                 issues.push(ValidationIssue::new(
                     format!("device.cpu_policies[{index}].energy_model"),
-                    "is required when governor.rollout is energy",
+                    "is required by the energy governor",
                 ));
             }
         }
@@ -1222,7 +1198,7 @@ impl ConfigBundle {
             if profile.power_budget.is_none() {
                 issues.push(ValidationIssue::new(
                     format!("policy.profiles[{index}].power_budget"),
-                    "is required when governor.rollout is energy",
+                    "is required by the energy governor",
                 ));
             }
         }
@@ -1521,13 +1497,13 @@ fn validate_energy_model(
                     ));
                 }
             }
-            if !(*plain_frequency_hz <= *sweet_frequency_hz
+            if !(*free_frequency_hz <= *plain_frequency_hz
+                && *plain_frequency_hz <= *sweet_frequency_hz
                 && *sweet_frequency_hz <= *typical_frequency_hz)
-                || *free_frequency_hz > *typical_frequency_hz
             {
                 issues.push(ValidationIssue::new(
                     base,
-                    "frequencies must satisfy plain <= sweet <= typical and free <= typical",
+                    "frequencies must satisfy free <= plain <= sweet <= typical",
                 ));
             }
         }
@@ -1723,23 +1699,11 @@ fn validate_governor(config: &GovernorConfig, issues: &mut Vec<ValidationIssue>)
             "idle_load_threshold must be less than active_load_threshold",
         ));
     }
-    validate_positive_duration(
-        "governor.ema_time_constant_ms",
-        config.ema_time_constant_ms,
-        issues,
-    );
     validate_ratio(
         "governor.predict_threshold",
         config.predict_threshold,
         0.0,
         1.0,
-        issues,
-    );
-    validate_ratio(
-        "governor.prediction_gain",
-        config.prediction_gain,
-        0.0,
-        4.0,
         issues,
     );
     if config.ramp_latency_ms > 10_000 {
@@ -2035,22 +1999,11 @@ fn validate_process_rules(
         let thread_limit = MAX_THREAD_RULES_PER_PROCESS.min(remaining_thread_budget);
         for (thread_index, thread) in rule.threads.iter().take(thread_limit).enumerate() {
             let thread_base = format!("{base}.threads[{thread_index}]");
-            match (&thread.selector, &thread.comm_regex) {
-                (Some(_), Some(_)) => issues.push(ValidationIssue::new(
-                    thread_base.clone(),
-                    "selector and deprecated comm_regex are mutually exclusive",
-                )),
-                (None, None) => issues.push(ValidationIssue::new(
-                    thread_base.clone(),
-                    "one selector is required",
-                )),
-                (Some(ThreadSelector::CommRegex { pattern }), None) => {
+            match &thread.selector {
+                ThreadSelector::CommRegex { pattern } => {
                     validate_regex(&format!("{thread_base}.selector.pattern"), pattern, issues);
                 }
-                (Some(ThreadSelector::Leader), None) => {}
-                (None, Some(pattern)) => {
-                    validate_regex(&format!("{thread_base}.comm_regex"), pattern, issues);
-                }
+                ThreadSelector::Leader => {}
             }
             if !task_profiles.contains(thread.task_profile.as_str()) {
                 issues.push(ValidationIssue::new(
@@ -2336,7 +2289,14 @@ mod tests {
                     admin_cap_hz: None,
                     critical_cap_hz: Some(Hertz(600_000_000)),
                     sensor_failure_cap_hz: Some(Hertz(600_000_000)),
-                    energy_model: None,
+                    energy_model: Some(CpuEnergyModelConfig::ReferenceCurveV1 {
+                        relative_performance: 100,
+                        typical_power_mw_per_core: 1_000,
+                        typical_frequency_hz: Hertz(1_500_000_000),
+                        sweet_frequency_hz: Hertz(1_000_000_000),
+                        plain_frequency_hz: Hertz(600_000_000),
+                        free_frequency_hz: Hertz(307_200_000),
+                    }),
                 },
                 CpuPolicyConfig {
                     id: target("cpu.prime"),
@@ -2348,7 +2308,14 @@ mod tests {
                     admin_cap_hz: None,
                     critical_cap_hz: Some(Hertz(739_000_000)),
                     sensor_failure_cap_hz: Some(Hertz(739_000_000)),
-                    energy_model: None,
+                    energy_model: Some(CpuEnergyModelConfig::ReferenceCurveV1 {
+                        relative_performance: 200,
+                        typical_power_mw_per_core: 2_000,
+                        typical_frequency_hz: Hertz(2_200_000_000),
+                        sweet_frequency_hz: Hertz(1_500_000_000),
+                        plain_frequency_hz: Hertz(1_000_000_000),
+                        free_frequency_hz: Hertz(739_000_000),
+                    }),
                 },
             ],
             devfreq_targets: Vec::new(),
@@ -2372,7 +2339,12 @@ mod tests {
                 margin: 0.2,
                 burst: 0.0,
                 limit_efficiency: id == ProfileId::Powersave,
-                power_budget: None,
+                power_budget: Some(PowerBudgetConfig {
+                    slow_limit_power_mw: 1_000,
+                    fast_limit_power_mw: 2_000,
+                    fast_limit_capacity_mj: 4_000,
+                    fast_limit_recover_scale: 1.0,
+                }),
                 scalar_values: BTreeMap::new(),
                 scenes: BTreeMap::new(),
             })
@@ -2402,6 +2374,122 @@ mod tests {
                     && issue.message == "must be in 15000..=600000"
             }));
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the shipped profile test keeps every transcribed model and preset value visible in one audit fixture"
+    )]
+    fn shipped_sm8550_uses_the_audited_sdm8g2_reference_seed() {
+        let device = DeviceConfig::from_json(include_str!("../../../config/devices/sm8550.json"))
+            .expect("shipped SM8550 profile validates");
+        let expected = [
+            (
+                "cpu.efficiency",
+                [0, 1, 2].as_slice(),
+                CpuEnergyModelConfig::ReferenceCurveV1 {
+                    relative_performance: 140,
+                    typical_power_mw_per_core: 500,
+                    typical_frequency_hz: Hertz(1_900_000_000),
+                    sweet_frequency_hz: Hertz(1_600_000_000),
+                    plain_frequency_hz: Hertz(1_400_000_000),
+                    free_frequency_hz: Hertz(600_000_000),
+                },
+            ),
+            (
+                "cpu.performance",
+                [3, 4, 5, 6].as_slice(),
+                CpuEnergyModelConfig::ReferenceCurveV1 {
+                    relative_performance: 320,
+                    typical_power_mw_per_core: 1_900,
+                    typical_frequency_hz: Hertz(2_800_000_000),
+                    sweet_frequency_hz: Hertz(1_800_000_000),
+                    plain_frequency_hz: Hertz(1_000_000_000),
+                    free_frequency_hz: Hertz(700_000_000),
+                },
+            ),
+            (
+                "cpu.prime",
+                [7].as_slice(),
+                CpuEnergyModelConfig::ReferenceCurveV1 {
+                    relative_performance: 450,
+                    typical_power_mw_per_core: 3_600,
+                    typical_frequency_hz: Hertz(3_200_000_000),
+                    sweet_frequency_hz: Hertz(2_200_000_000),
+                    plain_frequency_hz: Hertz(1_600_000_000),
+                    free_frequency_hz: Hertz(800_000_000),
+                },
+            ),
+        ];
+        for (policy, (id, cpus, model)) in device.cpu_policies.iter().zip(expected) {
+            assert_eq!(policy.id.as_str(), id);
+            assert_eq!(
+                policy.related_cpus,
+                CpuSet::from_ids(cpus.iter().copied().map(CpuId))
+            );
+            assert_eq!(policy.energy_model, Some(model));
+        }
+
+        let policy = PolicyConfig::from_json(include_str!("../../../config/policy.json"))
+            .expect("shipped policy validates");
+        let expected_budgets = [
+            (ProfileId::Powersave, 0.10, 0.0, 1_000, 1_000, 1_000),
+            (ProfileId::Balance, 0.21, 0.0, 2_000, 2_000, 16_000),
+            (
+                ProfileId::Performance,
+                0.20,
+                0.22,
+                999_000,
+                999_000,
+                999_000,
+            ),
+        ];
+        for (profile, (id, margin, burst, slow, fast, capacity)) in
+            policy.profiles.iter().zip(expected_budgets)
+        {
+            assert_eq!(profile.id, id);
+            assert!((profile.margin - margin).abs() < f64::EPSILON);
+            assert!((profile.burst - burst).abs() < f64::EPSILON);
+            let budget = profile
+                .power_budget
+                .expect("every energy profile has a budget");
+            assert_eq!(budget.slow_limit_power_mw, slow);
+            assert_eq!(budget.fast_limit_power_mw, fast);
+            assert_eq!(budget.fast_limit_capacity_mj, capacity);
+        }
+        let powersave = &policy.profiles[0];
+        assert_eq!(powersave.scenes[&Scene::Junk].burst, Some(0.08));
+        assert_eq!(
+            powersave.scenes[&Scene::Switch]
+                .power_budget
+                .and_then(|patch| patch.fast_limit_power_mw),
+            Some(2_000)
+        );
+        let balance = &policy.profiles[1];
+        assert_eq!(balance.scenes[&Scene::Trigger].margin, Some(0.30));
+        assert_eq!(balance.scenes[&Scene::Gesture].margin, Some(0.40));
+        assert_eq!(balance.scenes[&Scene::Junk].burst, Some(0.60));
+        assert_eq!(balance.scenes[&Scene::Switch].margin, Some(0.50));
+        assert_eq!(
+            balance.scenes[&Scene::Switch]
+                .power_budget
+                .and_then(|patch| patch.fast_limit_power_mw),
+            Some(6_000)
+        );
+        let performance = &policy.profiles[2];
+        assert_eq!(performance.scenes[&Scene::Touch].margin, Some(0.40));
+        assert_eq!(performance.scenes[&Scene::Trigger].margin, Some(0.50));
+        assert_eq!(performance.scenes[&Scene::Gesture].margin, Some(0.45));
+        assert_eq!(performance.scenes[&Scene::Junk].burst, Some(0.55));
+        assert_eq!(performance.scenes[&Scene::Switch].burst, Some(0.25));
+        assert_eq!(policy.governor.active_sample_ms, 40);
+        assert_eq!(policy.governor.idle_sample_ms, 80);
+        assert!((policy.governor.predict_threshold - 0.2).abs() < f64::EPSILON);
+        assert_eq!(policy.governor.ramp_latency_ms, 200);
+        ConfigBundle { device, policy }
+            .materialize_cpu_groups()
+            .expect("SM8550 energy governor materializes");
     }
 
     #[test]
@@ -2727,30 +2815,6 @@ mod tests {
         let json = serde_json::to_string(&policy).expect("serialize");
         let decoded = PolicyConfig::from_json(&json).expect("deserialize");
         assert_eq!(decoded, policy);
-    }
-
-    #[test]
-    fn older_v2_policy_defaults_new_session_and_realtime_fields() {
-        let mut value = serde_json::to_value(valid_policy()).expect("serialize policy");
-        value
-            .as_object_mut()
-            .expect("policy object")
-            .remove("session");
-        value["scheduler"]
-            .as_object_mut()
-            .expect("scheduler object")
-            .remove("realtime");
-
-        let decoded = PolicyConfig::from_json(
-            &serde_json::to_string(&value).expect("serialize older v2 policy"),
-        )
-        .expect("new fields are backward-compatible");
-
-        assert_eq!(decoded.session, None);
-        assert_eq!(
-            decoded.scheduler.realtime,
-            RealtimeSchedulerConfig::default()
-        );
     }
 
     #[test]
