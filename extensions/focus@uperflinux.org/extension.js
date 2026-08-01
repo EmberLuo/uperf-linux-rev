@@ -53,7 +53,6 @@ const RETRY_MAXIMUM_MS = 30000;
 // A 50 ms quiet window is longer than one frame at 30 Hz. The daemon applies
 // its own 200 ms render-idle slack after receiving this observation.
 const RENDER_IDLE_MS = 50;
-const DEADLINE_MISS_RATIO = 1.5;
 const DISPLAY_RENEWAL_MS = 5000;
 
 export default class FocusReporterExtension extends Extension {
@@ -75,7 +74,6 @@ export default class FocusReporterExtension extends Extension {
         this._frameCalls = new Set();
         this._renderIdleId = 0;
         this._rendering = false;
-        this._presentations = new Map();
         this._displayState = null;
         this._reportedDisplayState = null;
         this._displayQuery = null;
@@ -106,7 +104,9 @@ export default class FocusReporterExtension extends Extension {
         // hints outside a user session.
         this._connect(global.stage, 'before-paint', () => this._onBeforePaint());
         this._connect(global.stage, 'after-paint', () => this._onAfterPaint());
-        this._connect(global.stage, 'presented', (...args) => this._onPresented(...args));
+        // Do not connect ClutterStage::presented here. Mutter exposes its
+        // frame-info argument as a raw G_TYPE_POINTER, which GJS cannot
+        // marshal before invoking a JavaScript handler.
 
         this._monitorManager = global.backend?.get_monitor_manager?.() ?? null;
         if (this._monitorManager) {
@@ -427,7 +427,6 @@ export default class FocusReporterExtension extends Extension {
             return;
         if (!this._rendering) {
             this._rendering = true;
-            this._presentations.clear();
             this._reportFrameHint('render-started');
         }
     }
@@ -444,54 +443,15 @@ export default class FocusReporterExtension extends Extension {
                 if (!this._rendering)
                     return GLib.SOURCE_REMOVE;
                 this._rendering = false;
-                this._presentations.clear();
                 this._reportFrameHint('render-idle');
                 return GLib.SOURCE_REMOVE;
             },
         );
     }
 
-    _onPresented(...args) {
-        if (!this._rendering || !this._userSession || this._displayState === true)
-            return;
-        const infoIndex = args.findIndex(
-            value => typeof value?.get_presentation_time_us === 'function' ||
-                typeof value?.get_presentation_time === 'function' ||
-                value?.presentation_time !== undefined,
-        );
-        if (infoIndex < 0)
-            return;
-        const frameInfo = args[infoIndex];
-        const view = infoIndex > 0 ? args[infoIndex - 1] : global.stage;
-        let presentationUs;
-        if (typeof frameInfo.get_presentation_time_us === 'function')
-            presentationUs = Number(frameInfo.get_presentation_time_us());
-        else if (frameInfo.presentation_time !== undefined)
-            presentationUs = Number(frameInfo.presentation_time);
-        else
-            presentationUs = Number(frameInfo.get_presentation_time()) / 1000;
-        const refreshRate = Number(
-            typeof frameInfo.get_refresh_rate === 'function'
-                ? frameInfo.get_refresh_rate()
-                : frameInfo.refresh_rate,
-        );
-        if (!Number.isFinite(presentationUs) || presentationUs <= 0 ||
-            !Number.isFinite(refreshRate) || refreshRate <= 0)
-            return;
-
-        const previous = this._presentations.get(view);
-        this._presentations.set(view, presentationUs);
-        if (previous === undefined || presentationUs <= previous)
-            return;
-        const expectedUs = 1_000_000 / refreshRate;
-        if (presentationUs - previous > expectedUs * DEADLINE_MISS_RATIO)
-            this._reportFrameHint('deadline-missed');
-    }
-
     _resetRenderState() {
         this._cancelSource('_renderIdleId');
         this._rendering = false;
-        this._presentations?.clear();
     }
 
     _reportFrameHint(event, completed = null) {

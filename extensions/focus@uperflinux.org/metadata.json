@@ -1,9 +1,9 @@
 {
   "uuid": "focus@uperflinux.org",
   "name": "uperf-linux focus reporter",
-  "description": "Reports focused-process, compositor frame-timing, and physical-display lifecycle events to the uperf-linux daemon. The daemon authenticates an expiring reporter lease and keeps all policy decisions on the system side.",
+  "description": "Reports focused-process, compositor render-lifecycle, and physical-display events to the uperf-linux daemon. The daemon authenticates an expiring reporter lease and keeps all policy decisions on the system side.",
   "shell-version": ["46", "47", "48", "49", "50"],
   "session-modes": ["user", "unlock-dialog"],
   "url": "https://github.com/EmberLuo/uperf-linux-rev",
-  "version": 3
+  "version": 4
 }

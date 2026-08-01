@@ -218,6 +218,9 @@ function harness(initialPid = null) {
         callsNamed(method) {
             return calls.filter(call => call.method === method);
         },
+        connectedSignalNames() {
+            return [...signals.values()].map(entry => entry.signal);
+        },
     };
 }
 
@@ -352,6 +355,10 @@ function startInitialSet(test, pid) {
     const test = harness(41);
     const first = startInitialSet(test, 41);
     first.complete();
+    assert.ok(
+        !test.connectedSignalNames().includes('presented'),
+        'GJS cannot marshal the raw frame-info pointer from Stage::presented',
+    );
     test.emitStage('before-paint', {});
     const started = test.callsNamed('ReportFrameHint');
     assert.equal(started.length, 1);
@@ -363,27 +370,6 @@ function startInitialSet(test, pid) {
     assert.equal(hints.length, 2);
     assert.deepEqual(Array.from(hints[1].parameters.value), ['render-idle']);
     hints[1].complete();
-    test.reporter.disable();
-}
-
-{
-    const test = harness(41);
-    const first = startInitialSet(test, 41);
-    first.complete();
-    test.emitStage('before-paint', {});
-    const view = {};
-    const frame = (presentationUs, refreshRate = 60) => ({
-        presentation_time: presentationUs,
-        refresh_rate: refreshRate,
-    });
-    test.emitStage('presented', view, frame(1_000_000));
-    test.emitStage('presented', view, frame(1_040_000));
-    const hints = test.callsNamed('ReportFrameHint');
-    assert.equal(
-        hints.filter(call => call.parameters.value[0] === 'deadline-missed').length,
-        1,
-        'a 40 ms interval at 60 Hz must report one missed deadline',
-    );
     test.reporter.disable();
 }
 
