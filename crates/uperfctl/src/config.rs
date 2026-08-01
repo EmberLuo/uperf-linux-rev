@@ -1,17 +1,8 @@
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
-use uperf_core::{
-    AppsConfig, ConfigBundle, DeviceConfig, MAX_CONFIG_FILE_BYTES, MigrationResult, PolicyConfig,
-    migrate_c_v1,
-};
+use uperf_core::{AppsConfig, ConfigBundle, DeviceConfig, MAX_CONFIG_FILE_BYTES, PolicyConfig};
 
 #[derive(Debug)]
 pub struct ValidationReport {
@@ -52,52 +43,12 @@ impl ValidationReport {
     }
 }
 
-#[derive(Debug)]
-pub struct MigrationOutputs {
-    pub device: PathBuf,
-    pub policy: PathBuf,
-    pub apps: PathBuf,
-}
-
 pub fn validate_path(path: &Path) -> Result<ValidationReport> {
     if path.is_dir() {
         validate_bundle(path)
     } else {
         validate_file(path)
     }
-}
-
-pub fn migrate_path(path: &Path) -> Result<MigrationResult> {
-    let text = read_config_text(path)?;
-    let document = serde_json::from_str(&text)
-        .with_context(|| format!("parse legacy JSON in {}", path.display()))?;
-    migrate_c_v1(&document).with_context(|| format!("migrate {}", path.display()))
-}
-
-pub fn write_migration(
-    directory: &Path,
-    migration: &MigrationResult,
-    force: bool,
-) -> Result<MigrationOutputs> {
-    ensure_output_directory(directory)?;
-    let outputs = MigrationOutputs {
-        device: directory.join("device.json"),
-        policy: directory.join("policy.json"),
-        apps: directory.join("apps.json"),
-    };
-    for path in [&outputs.device, &outputs.policy, &outputs.apps] {
-        if path.exists() && !force {
-            bail!(
-                "{} already exists; pass --force to replace all migration outputs",
-                path.display()
-            );
-        }
-    }
-
-    write_json_atomic(&outputs.device, &migration.device, force)?;
-    write_json_atomic(&outputs.policy, &migration.policy, force)?;
-    write_json_atomic(&outputs.apps, &migration.apps, force)?;
-    Ok(outputs)
 }
 
 fn validate_file(path: &Path) -> Result<ValidationReport> {
@@ -234,70 +185,6 @@ fn detect_kind(value: &Value, path: &Path) -> &'static str {
     }
 }
 
-pub(crate) fn ensure_output_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("migration output directory must not be a symbolic link");
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            bail!("migration output {} is not a directory", path.display());
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .with_context(|| format!("create output directory {}", path.display()))?;
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", path.display()));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn write_json_atomic(path: &Path, document: &impl Serialize, force: bool) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(document)
-        .with_context(|| format!("serialize {}", path.display()))?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let existing_permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary file in {}", parent.display()))?;
-    temporary
-        .write_all(&bytes)
-        .and_then(|()| temporary.write_all(b"\n"))
-        .with_context(|| format!("write temporary configuration for {}", path.display()))?;
-    if let Some(permissions) = existing_permissions {
-        temporary
-            .as_file()
-            .set_permissions(permissions)
-            .with_context(|| format!("preserve permissions for {}", path.display()))?;
-    }
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("sync temporary configuration for {}", path.display()))?;
-
-    if force {
-        temporary
-            .persist(path)
-            .map_err(|error| error.error)
-            .with_context(|| format!("replace {}", path.display()))?;
-    } else {
-        temporary
-            .persist_noclobber(path)
-            .map_err(|error| error.error)
-            .with_context(|| format!("create {}", path.display()))?;
-    }
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync directory {}", parent.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -306,31 +193,7 @@ mod tests {
     use tempfile::tempdir;
     use uperf_core::MAX_CONFIG_FILE_BYTES;
 
-    use super::{detect_kind, migrate_path, validate_path, write_migration};
-
-    fn legacy_configuration() -> serde_json::Value {
-        json!({
-            "meta": {
-                "name": "migration-test",
-                "schemaVersion": 1
-            },
-            "modules": {
-                "cpu": {
-                    "powerModel": [{
-                        "cpumask": "all",
-                        "freeFreq": 300,
-                        "typicalFreq": 1500,
-                        "sweetFreq": 1000
-                    }]
-                },
-                "sched": {
-                    "cpumask": {
-                        "all": [0, 2]
-                    }
-                }
-            }
-        })
-    }
+    use super::{detect_kind, validate_path};
 
     #[test]
     fn detects_each_separate_v2_document() {
@@ -379,47 +242,6 @@ mod tests {
         let report = validate_path(&path).unwrap();
         assert!(!report.valid());
         assert!(report.errors[0].contains("unknown field"));
-    }
-
-    #[test]
-    fn migration_writes_a_valid_typed_but_non_activatable_draft() {
-        let directory = tempdir().unwrap();
-        let input = directory.path().join("legacy.json");
-        let output = directory.path().join("migrated");
-        fs::write(
-            &input,
-            serde_json::to_vec(&legacy_configuration()).expect("legacy JSON"),
-        )
-        .unwrap();
-
-        let migration = migrate_path(&input).expect("migrate legacy configuration");
-        assert!(
-            migration
-                .warnings
-                .iter()
-                .any(|warning| warning.message.contains("non-activatable draft"))
-        );
-        let written = write_migration(&output, &migration, false).expect("write migration draft");
-        assert!(
-            validate_path(&written.device)
-                .expect("device report")
-                .valid()
-        );
-        assert!(
-            validate_path(&written.policy)
-                .expect("policy report")
-                .valid()
-        );
-        assert!(validate_path(&written.apps).expect("apps report").valid());
-
-        let bundle = validate_path(&output).expect("bundle report");
-        assert!(!bundle.valid());
-        assert!(
-            bundle
-                .errors
-                .iter()
-                .any(|error| error.contains("trusted thermal zone"))
-        );
     }
 
     #[test]

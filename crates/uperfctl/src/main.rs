@@ -1,7 +1,5 @@
 mod args;
 mod config;
-mod replay;
-mod uperf_v3;
 
 use std::{process::ExitCode, time::Duration};
 
@@ -320,83 +318,6 @@ fn run_config(action: &ConfigAction, json_output: bool) -> Result<ExitCode> {
             } else {
                 ExitCode::from(EXIT_UNHEALTHY)
             })
-        }
-        ConfigAction::Migrate {
-            input,
-            output_dir,
-            force,
-        } => {
-            let migration = config::migrate_path(input)?;
-            let outputs = config::write_migration(output_dir, &migration, *force)?;
-            if json_output {
-                print_json(&json!({
-                    "input": input,
-                    "output_directory": output_dir,
-                    "device": outputs.device,
-                    "policy": outputs.policy,
-                    "apps": outputs.apps,
-                    "schema_version": uperf_core::CONFIG_SCHEMA_VERSION,
-                    "warnings": migration.warnings,
-                }))?;
-            } else {
-                println!("migrated {} -> {}", input.display(), output_dir.display());
-                println!("  {}", outputs.device.display());
-                println!("  {}", outputs.policy.display());
-                println!("  {}", outputs.apps.display());
-                for warning in &migration.warnings {
-                    eprintln!("warning: {}: {}", warning.path, warning.message);
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        ConfigAction::ImportUperfV3 {
-            input,
-            output_dir,
-            cluster_cpus,
-            sysfs_root,
-            force,
-        } => {
-            let import = uperf_v3::import_path(input, cluster_cpus, sysfs_root)?;
-            let outputs = uperf_v3::write_import(output_dir, &import, *force)?;
-            if json_output {
-                print_json(&json!({
-                    "input": input,
-                    "output_directory": output_dir,
-                    "device": outputs.device,
-                    "policy": outputs.policy,
-                    "report": outputs.report,
-                    "schema_version": uperf_core::CONFIG_SCHEMA_VERSION,
-                    "review_only": true,
-                    "items": import.report.items,
-                    "warnings": import.report.warnings,
-                }))?;
-            } else {
-                println!(
-                    "imported {} -> {} (REVIEW ONLY; not activated)",
-                    input.display(),
-                    output_dir.display()
-                );
-                println!("  {}", outputs.device.display());
-                println!("  {}", outputs.policy.display());
-                println!("  {}", outputs.report.display());
-                for warning in &import.report.warnings {
-                    eprintln!("warning: {warning}");
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        ConfigAction::ReplayGovernor {
-            trace,
-            policy,
-            rollout,
-        } => {
-            let report = replay::replay_path(trace, policy, *rollout)?;
-            if json_output {
-                print_json(&report)?;
-            } else {
-                report.print_human();
-            }
-            Ok(ExitCode::SUCCESS)
         }
     }
 }

@@ -2,8 +2,6 @@ use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Result, bail};
 
-use crate::replay::CandidateRollout;
-
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,23 +83,6 @@ pub enum FrequencyAction {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigAction {
     Validate(PathBuf),
-    Migrate {
-        input: PathBuf,
-        output_dir: PathBuf,
-        force: bool,
-    },
-    ImportUperfV3 {
-        input: PathBuf,
-        output_dir: PathBuf,
-        cluster_cpus: Vec<String>,
-        sysfs_root: PathBuf,
-        force: bool,
-    },
-    ReplayGovernor {
-        trace: PathBuf,
-        policy: PathBuf,
-        rollout: CandidateRollout,
-    },
 }
 
 impl Cli {
@@ -361,117 +342,8 @@ fn parse_config(cursor: &mut Cursor) -> Result<ConfigAction> {
             cursor.finish()?;
             Ok(ConfigAction::Validate(path))
         }
-        "migrate-c-v1" | "migrate" => {
-            let input = PathBuf::from(cursor.required("input path")?);
-            let mut output_dir = None;
-            let mut force = false;
-            while let Some(argument) = cursor.next() {
-                match argument.as_str() {
-                    "-o" | "--output" | "--output-dir" => {
-                        set_once(
-                            &mut output_dir,
-                            PathBuf::from(cursor.required("output directory")?),
-                            "--output-dir",
-                        )?;
-                    }
-                    "--force" => force = true,
-                    other if !other.starts_with('-') && output_dir.is_none() => {
-                        output_dir = Some(PathBuf::from(other));
-                    }
-                    other => bail!("unknown config migrate option '{other}'"),
-                }
-            }
-            let output_dir = output_dir.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "config migrate requires --output-dir DIR for device.json, policy.json, and apps.json"
-                )
-            })?;
-            Ok(ConfigAction::Migrate {
-                input,
-                output_dir,
-                force,
-            })
-        }
-        "import-uperf-v3" => {
-            let input = PathBuf::from(cursor.required("input path")?);
-            let mut output_dir = None;
-            let mut cluster_cpus = Vec::new();
-            let mut sysfs_root = None;
-            let mut force = false;
-            while let Some(argument) = cursor.next() {
-                match argument.as_str() {
-                    "-o" | "--output" | "--output-dir" => {
-                        set_once(
-                            &mut output_dir,
-                            PathBuf::from(cursor.required("output directory")?),
-                            "--output-dir",
-                        )?;
-                    }
-                    "--cluster-cpus" => {
-                        cluster_cpus.push(cursor.required("CPU list after --cluster-cpus")?);
-                    }
-                    "--sysfs-root" => {
-                        set_once(
-                            &mut sysfs_root,
-                            PathBuf::from(cursor.required("sysfs root")?),
-                            "--sysfs-root",
-                        )?;
-                    }
-                    "--force" => force = true,
-                    other if !other.starts_with('-') && output_dir.is_none() => {
-                        output_dir = Some(PathBuf::from(other));
-                    }
-                    other => bail!("unknown config import-uperf-v3 option '{other}'"),
-                }
-            }
-            let output_dir = output_dir.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "config import-uperf-v3 requires --output-dir DIR for review drafts"
-                )
-            })?;
-            Ok(ConfigAction::ImportUperfV3 {
-                input,
-                output_dir,
-                cluster_cpus,
-                sysfs_root: sysfs_root.unwrap_or_else(|| PathBuf::from("/sys")),
-                force,
-            })
-        }
-        "replay-governor" | "replay" => parse_governor_replay(cursor),
-        action => bail!(
-            "unknown config action '{action}'; expected validate, migrate-c-v1, import-uperf-v3, or replay-governor"
-        ),
+        action => bail!("unknown config action '{action}'; expected validate"),
     }
-}
-
-fn parse_governor_replay(cursor: &mut Cursor) -> Result<ConfigAction> {
-    let trace = PathBuf::from(cursor.required("replay trace path")?);
-    let mut policy = None;
-    let mut rollout = None;
-    while let Some(argument) = cursor.next() {
-        match argument.as_str() {
-            "--policy" => {
-                set_once(
-                    &mut policy,
-                    PathBuf::from(cursor.required("policy path")?),
-                    "--policy",
-                )?;
-            }
-            "--rollout" => {
-                let value = cursor.required("candidate rollout")?;
-                let parsed = value.parse().map_err(anyhow::Error::msg)?;
-                set_once(&mut rollout, parsed, "--rollout")?;
-            }
-            other => bail!("unknown config replay-governor option '{other}'"),
-        }
-    }
-    let policy = policy
-        .ok_or_else(|| anyhow::anyhow!("config replay-governor requires --policy POLICY.json"))?;
-    Ok(ConfigAction::ReplayGovernor {
-        trace,
-        policy,
-        rollout: rollout.unwrap_or(CandidateRollout::Shadow),
-    })
 }
 
 fn parse_number<T>(value: &str, name: &str) -> Result<T>
@@ -579,9 +451,6 @@ Commands:
   frequency ...          Inspect or change bounded frequency overrides
   reload                 Transactionally reload daemon configuration
   config validate PATH   Validate an offline v2 configuration
-  config migrate-c-v1    Migrate a legacy C v1 configuration offline
-  config import-uperf-v3 Import a Uperf v3 configuration as a review draft
-  config replay-governor Compare legacy and energy planners on a JSON trace
   diagnose               Run API, health, recovery, and target checks
 
 Run 'uperfctl help COMMAND' for command-specific syntax.
@@ -659,37 +528,14 @@ are ms, s, m, and h; zero or an omitted TTL remains until explicitly cleared.
 const CONFIG_HELP: &str = "\
 Usage:
   uperfctl config validate PATH
-  uperfctl config migrate-c-v1 INPUT --output-dir DIR [--force]
-  uperfctl config import-uperf-v3 INPUT --output-dir DIR
-      [--cluster-cpus LIST ...] [--sysfs-root PATH] [--force]
-  uperfctl config replay-governor TRACE --policy POLICY
-      [--rollout shadow|energy]
 
 PATH may be one v2 JSON file or a directory containing device.json, policy.json,
 and apps.json. Directory validation also checks cross-file references.
-Migration is offline and writes those three independent v2 files.
-
-The Uperf v3 importer writes device.json, policy.json, and import-report.json.
-It never enables imported Android sysfs or scheduler rules. Without explicit
-cluster lists it reads policy*/related_cpus plus immutable maximum-frequency
-evidence below /sys and requires a unique nr/frequency-ranked mapping.
---sysfs-root selects a fixture or mounted target sysfs. Explicit cluster CPU
-lists use Linux list syntax (for example 0-2 or 3-6,8) and must be supplied
-once per power-model cluster when local inference is unavailable or ambiguous.
-
-Governor replay is entirely offline. Its v1 trace contains resolved CPU target
-models plus timestamped raw loads and observed frequencies; POLICY supplies
-profile, scene-patch, budget, and dynamic-governor settings. Shadow is the
-default candidate rollout. Energy uses the same planner but preserves its
-fail-closed active-rollout error behavior.
 ";
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use super::{Bus, Cli, Command, ConfigAction, FrequencyAction, TraceOptions, WorkloadAction};
-    use crate::replay::CandidateRollout;
+    use super::{Bus, Cli, Command, FrequencyAction, TraceOptions, WorkloadAction};
 
     fn parse(arguments: &[&str]) -> Cli {
         Cli::parse(arguments.iter().map(ToString::to_string)).unwrap()
@@ -779,63 +625,6 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::parse(["workload", "set", "42", "--uid", "1000"].map(str::to_owned)).is_err());
-    }
-
-    #[test]
-    fn config_migrate_accepts_positional_output() {
-        assert!(matches!(
-            parse(&["config", "migrate-c-v1", "old.json", "new.json"]).command,
-            Command::Config(ConfigAction::Migrate { output_dir: _, .. })
-        ));
-    }
-
-    #[test]
-    fn config_import_accepts_explicit_cluster_mapping() {
-        assert_eq!(
-            parse(&[
-                "config",
-                "import-uperf-v3",
-                "sdm.json",
-                "--output-dir",
-                "draft",
-                "--cluster-cpus",
-                "0-2",
-                "--cluster-cpus",
-                "3-6",
-                "--cluster-cpus",
-                "7",
-                "--sysfs-root",
-                "fixture-sys",
-            ])
-            .command,
-            Command::Config(ConfigAction::ImportUperfV3 {
-                input: PathBuf::from("sdm.json"),
-                output_dir: PathBuf::from("draft"),
-                cluster_cpus: vec!["0-2".into(), "3-6".into(), "7".into()],
-                sysfs_root: PathBuf::from("fixture-sys"),
-                force: false,
-            })
-        );
-    }
-
-    #[test]
-    fn config_replay_is_offline_and_defaults_to_shadow() {
-        assert_eq!(
-            parse(&[
-                "config",
-                "replay-governor",
-                "trace.json",
-                "--policy",
-                "policy.json",
-            ])
-            .command,
-            Command::Config(ConfigAction::ReplayGovernor {
-                trace: PathBuf::from("trace.json"),
-                policy: PathBuf::from("policy.json"),
-                rollout: CandidateRollout::Shadow,
-            })
-        );
-        assert!(Cli::parse(["config", "replay", "trace.json"].map(str::to_owned)).is_err());
     }
 
     #[test]

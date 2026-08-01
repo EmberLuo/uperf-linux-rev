@@ -8,11 +8,9 @@
 pub mod config;
 pub mod domain;
 pub mod energy;
-pub mod migration;
 pub mod policy;
 
 pub use config::*;
 pub use domain::*;
 pub use energy::*;
-pub use migration::*;
 pub use policy::*;
