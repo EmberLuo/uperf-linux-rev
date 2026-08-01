@@ -299,10 +299,6 @@ pub struct ProcessSchedulingState {
     pub nice: i8,
     pub policy: SchedulingClass,
     /// Exact fixed priority for `SCHED_FIFO`; absent for non-real-time classes.
-    ///
-    /// The default keeps task journal records written before FIFO support
-    /// backward compatible.
-    #[serde(default)]
     pub rt_priority: Option<u8>,
     pub uclamp_min: Option<u16>,
     pub uclamp_max: Option<u16>,

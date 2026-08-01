@@ -28,24 +28,7 @@ use uperf_platform::{
     SystemdClient, SystemdUnitInstanceIdentity, SystemdUnitInstanceKey, SystemdUnitProperties,
 };
 
-// v1 stores only frequency paths; v2 adds self-describing frequency targets.
-// Neither version records per-field ownership or a stable systemd activation
-// identity. During same-boot recovery, frequency/task entries are upgraded
-// conservatively after live target resolution. A v1/v2 unit entry is
-// deliberately fail-closed because a reused unit name cannot be disambiguated.
-const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
-const MANIFEST_JOURNAL_SCHEMA_VERSION: u32 = 2;
-// v3 adds exact legal frequency pairs, per-field task/unit ownership, and
-// stable systemd unit instance identities.
-const OWNERSHIP_JOURNAL_SCHEMA_VERSION: u32 = 3;
-// v4 defines a frequency entry's original request as the full hardware range,
-// so restoring it releases the actuator's userspace QoS request.
-const RELEASE_JOURNAL_SCHEMA_VERSION: u32 = 4;
-// v5 adds typed scalar sysfs resources and a tagged recovery-resource
-// manifest while retaining lossless decoding of v1-v4 frequency journals.
-const SCALAR_JOURNAL_SCHEMA_VERSION: u32 = 5;
-// v6 records the exact SCHED_FIFO priority in task state. The field has a
-// serde default so v1-v5 non-real-time task entries remain losslessly decodable.
+// v6 is the only accepted recovery-journal contract.
 const JOURNAL_SCHEMA_VERSION: u32 = 6;
 const MAX_JOURNAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_JOURNAL_ENVELOPE_BYTES: usize = 5 * 1024 * 1024;
@@ -640,7 +623,7 @@ impl RecoveryScalarTargetManifest {
     }
 }
 
-/// Tagged schema-v5 identity for every journal-owned sysfs resource.
+/// Tagged identity for every journal-owned sysfs resource.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "target", rename_all = "kebab-case")]
 pub enum RecoveryResourceManifest {
@@ -648,52 +631,11 @@ pub enum RecoveryResourceManifest {
     Scalar(RecoveryScalarTargetManifest),
 }
 
-/// Minimal identity retained by schema-v1 journals.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LegacyRecoveryFrequencyTarget {
-    pub id: TargetId,
-    pub min_path: PathBuf,
-    pub max_path: PathBuf,
-}
-
-/// One frequency resource discovered while inspecting a durable journal.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RecoveryFrequencyTarget {
-    SelfDescribing(RecoveryFrequencyTargetManifest),
-    Legacy(LegacyRecoveryFrequencyTarget),
-}
-
 /// One resource discovered while inspecting a durable journal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryResourceTarget {
-    FrequencyPair(RecoveryFrequencyTarget),
+    FrequencyPair(RecoveryFrequencyTargetManifest),
     Scalar(RecoveryScalarTargetManifest),
-}
-
-impl RecoveryFrequencyTarget {
-    #[must_use]
-    pub fn id(&self) -> &TargetId {
-        match self {
-            Self::SelfDescribing(target) => &target.id,
-            Self::Legacy(target) => &target.id,
-        }
-    }
-
-    #[must_use]
-    pub fn min_path(&self) -> &Path {
-        match self {
-            Self::SelfDescribing(target) => &target.min_path,
-            Self::Legacy(target) => &target.min_path,
-        }
-    }
-
-    #[must_use]
-    pub fn max_path(&self) -> &Path {
-        match self {
-            Self::SelfDescribing(target) => &target.max_path,
-            Self::Legacy(target) => &target.max_path,
-        }
-    }
 }
 
 /// Read-only recovery metadata obtained without loading device configuration.
@@ -703,30 +645,24 @@ pub struct RecoveryManifest {
     pub boot_id: String,
     pub device_fingerprint: String,
     pub resource_targets: Vec<RecoveryResourceTarget>,
-    pub frequency_targets: Vec<RecoveryFrequencyTarget>,
+    pub frequency_targets: Vec<RecoveryFrequencyTargetManifest>,
     pub has_tasks: bool,
     pub has_systemd_units: bool,
 }
 
 impl RecoveryManifest {
-    /// Build a registry when every journal resource is self-describing.
-    ///
-    /// Schema-v1 resources must instead be resolved against read-only hardware
-    /// discovery by matching their exact paths.
+    /// Build a registry from the journal's self-describing resources.
     ///
     /// # Errors
     ///
-    /// Returns an error for a legacy resource or an invalid/duplicate target.
+    /// Returns an error for an invalid or duplicate target.
     pub fn self_describing_registry(&self) -> Result<TargetRegistry, ActuatorError> {
         let mut frequencies = Vec::new();
         let mut scalars = Vec::new();
         for target in &self.resource_targets {
             match target {
-                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::SelfDescribing(
-                    target,
-                )) => frequencies.push(target.to_frequency_target()?),
-                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::Legacy(target)) => {
-                    return Err(ActuatorError::LegacyRecoveryTarget(target.id.to_string()));
+                RecoveryResourceTarget::FrequencyPair(target) => {
+                    frequencies.push(target.to_frequency_target()?);
                 }
                 RecoveryResourceTarget::Scalar(target) => {
                     scalars.push(target.to_scalar_target()?);
@@ -741,12 +677,7 @@ impl RecoveryManifest {
     pub fn frequency_write_paths(&self) -> Vec<PathBuf> {
         self.frequency_targets
             .iter()
-            .flat_map(|target| {
-                [
-                    target.min_path().to_path_buf(),
-                    target.max_path().to_path_buf(),
-                ]
-            })
+            .flat_map(|target| [target.min_path.clone(), target.max_path.clone()])
             .collect()
     }
 
@@ -791,14 +722,7 @@ pub fn inspect_recovery_journal(
     let frequency_targets = journal
         .entries
         .values()
-        .map(|entry| match entry.recovery_frequency_manifest() {
-            Some(manifest) => RecoveryFrequencyTarget::SelfDescribing(manifest.clone()),
-            None => RecoveryFrequencyTarget::Legacy(LegacyRecoveryFrequencyTarget {
-                id: entry.target.clone(),
-                min_path: entry.min_path.clone(),
-                max_path: entry.max_path.clone(),
-            }),
-        })
+        .map(|entry| entry.recovery_frequency_manifest().clone())
         .collect::<Vec<_>>();
     let mut resource_targets = frequency_targets
         .iter()
@@ -884,8 +808,6 @@ pub enum ActuatorError {
     Degraded(String),
     #[error("a durable journal must be recovered before accepting mutations")]
     RecoveryRequired,
-    #[error("schema-v1 recovery target requires live discovery: {0}")]
-    LegacyRecoveryTarget(String),
     #[error("frequency transaction failed for {target}: {reason}")]
     Transaction { target: String, reason: String },
     #[error("transaction rollback failed: {0}")]
@@ -908,25 +830,20 @@ struct JournalEntry {
     target: TargetId,
     min_path: PathBuf,
     max_path: PathBuf,
-    /// Bare frequency manifest used by schema v2-v4.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    manifest: Option<RecoveryFrequencyTargetManifest>,
-    /// Tagged frequency/scalar manifest introduced by schema v5.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resource_manifest: Option<RecoveryResourceManifest>,
+    resource_manifest: RecoveryResourceManifest,
     original: FrequencyLimits,
     desired: FrequencyLimits,
     applied: FrequencyLimits,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legal_pairs: Option<Vec<FrequencyLimits>>,
+    legal_pairs: Vec<FrequencyLimits>,
 }
 
 impl JournalEntry {
-    fn recovery_frequency_manifest(&self) -> Option<&RecoveryFrequencyTargetManifest> {
-        match self.resource_manifest.as_ref() {
-            Some(RecoveryResourceManifest::FrequencyPair(manifest)) => Some(manifest),
-            Some(RecoveryResourceManifest::Scalar(_)) => None,
-            None => self.manifest.as_ref(),
+    fn recovery_frequency_manifest(&self) -> &RecoveryFrequencyTargetManifest {
+        match &self.resource_manifest {
+            RecoveryResourceManifest::FrequencyPair(manifest) => manifest,
+            RecoveryResourceManifest::Scalar(_) => {
+                unreachable!("validated frequency journal manifest")
+            }
         }
     }
 }
@@ -957,7 +874,7 @@ impl ScalarJournalEntry {
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "explicit named journal fields are safer and more migration-friendly than bit positions"
+    reason = "explicit named journal fields are safer and clearer than bit positions"
 )]
 struct TaskFieldMask {
     affinity: bool,
@@ -1160,25 +1077,20 @@ struct TaskJournalEntry {
     original: ProcessSchedulingState,
     desired: ProcessSchedulingState,
     applied: ProcessSchedulingState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owned_fields: Option<TaskFieldMask>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    relinquished_fields: Option<TaskFieldMask>,
+    owned_fields: TaskFieldMask,
+    relinquished_fields: TaskFieldMask,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnitJournalEntry {
     unit: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    instance: Option<SystemdUnitInstanceIdentity>,
+    instance: SystemdUnitInstanceIdentity,
     original: SystemdUnitProperties,
     desired: SystemdUnitProperties,
     applied: SystemdUnitProperties,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owned_fields: Option<UnitFieldMask>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    relinquished_fields: Option<UnitFieldMask>,
+    owned_fields: UnitFieldMask,
+    relinquished_fields: UnitFieldMask,
 }
 
 #[derive(Clone, Debug)]
@@ -1223,13 +1135,9 @@ struct Journal {
     boot_id: String,
     device_fingerprint: String,
     generation: u64,
-    #[serde(default)]
     entries: BTreeMap<TargetId, JournalEntry>,
-    #[serde(default)]
     scalars: BTreeMap<TargetId, ScalarJournalEntry>,
-    #[serde(default)]
     tasks: BTreeMap<String, TaskJournalEntry>,
-    #[serde(default)]
     units: BTreeMap<String, UnitJournalEntry>,
 }
 
@@ -1415,18 +1323,16 @@ impl FrequencyActuator {
     /// Returns an error if the internal state lock is poisoned.
     pub fn has_owned_resources(&self) -> Result<bool, ActuatorError> {
         let state = self.lock_state()?;
-        let tasks_owned = state.journal.tasks.values().any(|entry| {
-            !entry
-                .owned_fields
-                .unwrap_or_else(|| legacy_task_owned_fields(entry))
-                .is_empty()
-        });
-        let units_owned = state.journal.units.values().any(|entry| {
-            entry.owned_fields.map_or(
-                state.journal.schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION,
-                |mask| !mask.is_empty(),
-            )
-        });
+        let tasks_owned = state
+            .journal
+            .tasks
+            .values()
+            .any(|entry| !entry.owned_fields.is_empty());
+        let units_owned = state
+            .journal
+            .units
+            .values()
+            .any(|entry| !entry.owned_fields.is_empty());
         Ok(!state.journal.entries.is_empty()
             || !state.journal.scalars.is_empty()
             || tasks_owned
@@ -1607,32 +1513,6 @@ impl FrequencyActuator {
                 "systemd recovery backend is unavailable".to_owned(),
             );
         }
-        if state.journal.schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION
-            && !state.journal.units.is_empty()
-        {
-            return self.degrade_locked(
-                &mut state,
-                "schema-v1/v2 systemd journal has no stable unit instance identity; automatic recovery is unsafe"
-                    .to_owned(),
-            );
-        }
-        if state.journal.schema_version < JOURNAL_SCHEMA_VERSION {
-            let mut upgraded = state.journal.clone();
-            if let Err(error) = upgrade_legacy_journal(&mut upgraded, &self.registry) {
-                return self.degrade_locked(
-                    &mut state,
-                    format!("cannot upgrade legacy recovery journal: {error}"),
-                );
-            }
-            if let Err(error) = persist_journal(self.store.as_ref(), &upgraded) {
-                return self.degrade_locked(
-                    &mut state,
-                    format!("cannot persist upgraded recovery journal: {error}"),
-                );
-            }
-            state.journal = upgraded;
-        }
-
         let entries: Vec<JournalEntry> = state.journal.entries.values().cloned().collect();
         let mut frequency_recovery = Vec::new();
         for entry in &entries {
@@ -1648,10 +1528,7 @@ impl FrequencyActuator {
                     format!("journal paths changed for {}", entry.target),
                 );
             }
-            if entry
-                .recovery_frequency_manifest()
-                .is_some_and(|manifest| target.recovery_manifest() != *manifest)
-            {
+            if target.recovery_manifest() != *entry.recovery_frequency_manifest() {
                 return self.degrade_locked(
                     &mut state,
                     format!("journal target identity changed for {}", entry.target),
@@ -1669,8 +1546,7 @@ impl FrequencyActuator {
             if let Some(journal_entry) = state.journal.entries.get_mut(&entry.target) {
                 journal_entry.applied = entry.desired;
                 journal_entry.desired = entry.original;
-                journal_entry.legal_pairs =
-                    Some(transaction_legal_pairs(entry.desired, entry.original));
+                journal_entry.legal_pairs = transaction_legal_pairs(entry.desired, entry.original);
             }
             frequency_recovery.push((entry.clone(), target.clone()));
         }
@@ -1808,21 +1684,18 @@ impl FrequencyActuator {
                     target: mutation.target.id.clone(),
                     min_path: mutation.target.min_path.clone(),
                     max_path: mutation.target.max_path.clone(),
-                    manifest: None,
-                    resource_manifest: Some(RecoveryResourceManifest::FrequencyPair(
+                    resource_manifest: RecoveryResourceManifest::FrequencyPair(
                         mutation.target.recovery_manifest(),
-                    )),
+                    ),
                     original: hardware_limits(&mutation.target),
                     desired: mutation.previous_request,
                     applied: mutation.previous_request,
-                    legal_pairs: Some(vec![mutation.previous_request]),
+                    legal_pairs: vec![mutation.previous_request],
                 });
             entry.applied = mutation.previous_request;
             entry.desired = mutation.desired_request;
-            entry.legal_pairs = Some(transaction_legal_pairs(
-                mutation.previous_request,
-                mutation.desired_request,
-            ));
+            entry.legal_pairs =
+                transaction_legal_pairs(mutation.previous_request, mutation.desired_request);
             state
                 .journal
                 .entries
@@ -1854,7 +1727,7 @@ impl FrequencyActuator {
                 Ok(actual) => {
                     if let Some(entry) = state.journal.entries.get_mut(&mutation.target.id) {
                         entry.applied = actual;
-                        entry.legal_pairs = Some(vec![actual]);
+                        entry.legal_pairs = vec![actual];
                     }
                     applied.insert(mutation.target.id.clone(), actual);
                 }
@@ -2018,10 +1891,8 @@ impl FrequencyActuator {
                 .ok_or_else(|| ActuatorError::OwnershipRequired(mutation.target.id.to_string()))?;
             entry.applied = mutation.before_effective;
             entry.desired = mutation.desired_request;
-            entry.legal_pairs = Some(transaction_legal_pairs(
-                mutation.before_effective,
-                mutation.desired_request,
-            ));
+            entry.legal_pairs =
+                transaction_legal_pairs(mutation.before_effective, mutation.desired_request);
         }
 
         let mut applied = BTreeMap::new();
@@ -2048,7 +1919,7 @@ impl FrequencyActuator {
                             ActuatorError::OwnershipRequired(mutation.target.id.to_string())
                         })?;
                     entry.applied = actual;
-                    entry.legal_pairs = Some(vec![actual]);
+                    entry.legal_pairs = vec![actual];
                     applied.insert(mutation.target.id.clone(), actual);
                 }
                 Err(error) => {
@@ -2321,18 +2192,16 @@ impl FrequencyActuator {
             let key = task_journal_key(request.identity);
             let existing = state.journal.tasks.remove(&key);
             let (mut entry, rollback_entry) = if let Some(mut entry) = existing {
-                let owned = entry
-                    .owned_fields
-                    .unwrap_or_else(|| legacy_task_owned_fields(&entry));
+                let owned = entry.owned_fields;
                 let still_owned =
                     owned.fields_matching_either(&current, &entry.applied, &entry.applied);
                 let lost = owned.without(still_owned);
-                let relinquished = entry.relinquished_fields.unwrap_or_default().union(lost);
+                let relinquished = entry.relinquished_fields.union(lost);
                 lost.copy(&mut entry.original, &current);
                 entry.desired.clone_from(&current);
                 entry.applied.clone_from(&current);
-                entry.owned_fields = Some(still_owned);
-                entry.relinquished_fields = Some(relinquished);
+                entry.owned_fields = still_owned;
+                entry.relinquished_fields = relinquished;
                 let rollback_entry = Some(entry.clone());
                 (entry, rollback_entry)
             } else {
@@ -2342,14 +2211,14 @@ impl FrequencyActuator {
                         original: current.clone(),
                         desired: current.clone(),
                         applied: current.clone(),
-                        owned_fields: Some(TaskFieldMask::default()),
-                        relinquished_fields: Some(TaskFieldMask::default()),
+                        owned_fields: TaskFieldMask::default(),
+                        relinquished_fields: TaskFieldMask::default(),
                     },
                     None,
                 )
             };
-            let owned = entry.owned_fields.unwrap_or_default();
-            let relinquished = entry.relinquished_fields.unwrap_or_default();
+            let owned = entry.owned_fields;
+            let relinquished = entry.relinquished_fields;
             let requested = TaskFieldMask::changed(&current, &request.desired);
             let next_owned = owned.union(requested.without(relinquished));
             let newly_owned = next_owned.without(owned);
@@ -2358,8 +2227,8 @@ impl FrequencyActuator {
             next_owned.copy(&mut desired, &request.desired);
             entry.desired.clone_from(&desired);
             entry.applied.clone_from(&current);
-            entry.owned_fields = Some(next_owned);
-            entry.relinquished_fields = Some(relinquished);
+            entry.owned_fields = next_owned;
+            entry.relinquished_fields = relinquished;
             if !next_owned.is_empty() || !relinquished.is_empty() {
                 state.journal.tasks.insert(key, entry);
             }
@@ -2524,41 +2393,40 @@ impl FrequencyActuator {
         let mut prepared = BTreeMap::new();
         for request in requests {
             let (instance, current) = &observed[&request.unit];
-            let existing = state.journal.units.remove(&request.unit).filter(|entry| {
-                entry
-                    .instance
-                    .as_ref()
-                    .is_some_and(|owned| owned == instance)
-            });
+            let existing = state
+                .journal
+                .units
+                .remove(&request.unit)
+                .filter(|entry| entry.instance == *instance);
             let (mut entry, rollback_entry) = if let Some(mut entry) = existing {
-                let owned = entry.owned_fields.unwrap_or_default();
+                let owned = entry.owned_fields;
                 let still_owned =
                     owned.fields_matching_either(current, &entry.applied, &entry.applied);
                 let lost = owned.without(still_owned);
-                let relinquished = entry.relinquished_fields.unwrap_or_default().union(lost);
+                let relinquished = entry.relinquished_fields.union(lost);
                 lost.copy(&mut entry.original, current);
                 entry.desired.clone_from(current);
                 entry.applied.clone_from(current);
-                entry.owned_fields = Some(still_owned);
-                entry.relinquished_fields = Some(relinquished);
+                entry.owned_fields = still_owned;
+                entry.relinquished_fields = relinquished;
                 let rollback_entry = Some(entry.clone());
                 (entry, rollback_entry)
             } else {
                 (
                     UnitJournalEntry {
                         unit: request.unit.clone(),
-                        instance: Some(instance.clone()),
+                        instance: instance.clone(),
                         original: current.clone(),
                         desired: current.clone(),
                         applied: current.clone(),
-                        owned_fields: Some(UnitFieldMask::default()),
-                        relinquished_fields: Some(UnitFieldMask::default()),
+                        owned_fields: UnitFieldMask::default(),
+                        relinquished_fields: UnitFieldMask::default(),
                     },
                     None,
                 )
             };
-            let owned = entry.owned_fields.unwrap_or_default();
-            let relinquished = entry.relinquished_fields.unwrap_or_default();
+            let owned = entry.owned_fields;
+            let relinquished = entry.relinquished_fields;
             let requested = UnitFieldMask::changed(current, &request.desired);
             let next_owned = owned.union(requested.without(relinquished));
             let newly_owned = next_owned.without(owned);
@@ -2567,8 +2435,8 @@ impl FrequencyActuator {
             next_owned.copy(&mut desired, &request.desired);
             entry.desired.clone_from(&desired);
             entry.applied.clone_from(current);
-            entry.owned_fields = Some(next_owned);
-            entry.relinquished_fields = Some(relinquished);
+            entry.owned_fields = next_owned;
+            entry.relinquished_fields = relinquished;
             if !next_owned.is_empty() || !relinquished.is_empty() {
                 state.journal.units.insert(request.unit.clone(), entry);
             }
@@ -2744,8 +2612,7 @@ impl FrequencyActuator {
             if let Some(journal_entry) = state.journal.entries.get_mut(&entry.target) {
                 journal_entry.applied = entry.desired;
                 journal_entry.desired = entry.original;
-                journal_entry.legal_pairs =
-                    Some(transaction_legal_pairs(entry.desired, entry.original));
+                journal_entry.legal_pairs = transaction_legal_pairs(entry.desired, entry.original);
             }
             restoration.push((entry.clone(), target.clone()));
         }
@@ -2911,9 +2778,7 @@ impl FrequencyActuator {
                     );
                 }
             };
-            let owned = entry
-                .owned_fields
-                .unwrap_or_else(|| legacy_task_owned_fields(entry));
+            let owned = entry.owned_fields;
             let restorable = owned.fields_matching_either(&current, &entry.applied, &entry.desired);
             let mut desired = current.clone();
             restorable.copy(&mut desired, &entry.original);
@@ -2986,15 +2851,7 @@ impl FrequencyActuator {
             );
         };
         for entry in &entries {
-            let Some(instance) = entry.instance.as_ref() else {
-                return self.degrade_locked(
-                    &mut state,
-                    format!(
-                        "systemd journal entry {} has no stable instance identity",
-                        entry.unit
-                    ),
-                );
-            };
+            let instance = &entry.instance;
             let identity_is_current = match unit_instance_is_current(systemd.as_ref(), instance) {
                 Ok(current) => current,
                 Err(error) => {
@@ -3028,7 +2885,7 @@ impl FrequencyActuator {
                     ),
                 );
             }
-            let owned = entry.owned_fields.unwrap_or_default();
+            let owned = entry.owned_fields;
             let restorable = owned.fields_matching_either(&current, &entry.applied, &entry.desired);
             let mut desired = current.clone();
             restorable.copy(&mut desired, &entry.original);
@@ -3086,9 +2943,7 @@ impl FrequencyActuator {
                 continue;
             }
             let current = controller.read_scheduling(entry.identity.pid)?;
-            let owned = entry
-                .owned_fields
-                .unwrap_or_else(|| legacy_task_owned_fields(&entry));
+            let owned = entry.owned_fields;
             let restorable = owned.fields_matching_either(&current, &entry.applied, &entry.desired);
             let mut desired = current.clone();
             restorable.copy(&mut desired, &entry.original);
@@ -3165,18 +3020,13 @@ impl FrequencyActuator {
             .ok_or(ActuatorError::SystemdBackendUnavailable)?;
         let entries = state.journal.units.values().cloned().collect::<Vec<_>>();
         for entry in entries {
-            let instance = entry.instance.as_ref().ok_or_else(|| {
-                ActuatorError::InvalidJournal(format!(
-                    "systemd journal entry {} has no stable instance identity",
-                    entry.unit
-                ))
-            })?;
+            let instance = &entry.instance;
             if !unit_instance_is_current(systemd.as_ref(), instance)? {
                 continue;
             }
             let current = systemd.read_unit_properties(&entry.unit)?;
             verify_unit_instance(systemd.as_ref(), instance)?;
-            let owned = entry.owned_fields.unwrap_or_default();
+            let owned = entry.owned_fields;
             let restorable = owned.fields_matching_either(&current, &entry.applied, &entry.desired);
             let mut desired = current.clone();
             restorable.copy(&mut desired, &entry.original);
@@ -3647,75 +3497,6 @@ fn push_unique_pair(pairs: &mut Vec<FrequencyLimits>, pair: FrequencyLimits) {
     }
 }
 
-fn legacy_frequency_pairs(entry: &JournalEntry) -> Vec<FrequencyLimits> {
-    if entry.desired == entry.applied {
-        vec![entry.applied]
-    } else {
-        transaction_legal_pairs(entry.applied, entry.desired)
-    }
-}
-
-fn upgrade_legacy_journal(
-    journal: &mut Journal,
-    registry: &TargetRegistry,
-) -> Result<(), ActuatorError> {
-    if journal.schema_version >= JOURNAL_SCHEMA_VERSION {
-        return Ok(());
-    }
-    let old_schema_version = journal.schema_version;
-    if old_schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION && !journal.units.is_empty() {
-        return Err(ActuatorError::InvalidJournal(
-            "legacy systemd entries have no stable instance identity".to_owned(),
-        ));
-    }
-    for entry in journal.entries.values_mut() {
-        let target = registry.get(&entry.target).ok_or_else(|| {
-            ActuatorError::InvalidJournal(format!(
-                "legacy recovery target {} is not present",
-                entry.target
-            ))
-        })?;
-        if target.min_path != entry.min_path || target.max_path != entry.max_path {
-            return Err(ActuatorError::InvalidJournal(format!(
-                "legacy recovery paths changed for {}",
-                entry.target
-            )));
-        }
-        if entry
-            .manifest
-            .as_ref()
-            .is_some_and(|manifest| target.recovery_manifest() != *manifest)
-        {
-            return Err(ActuatorError::InvalidJournal(format!(
-                "legacy recovery target identity changed for {}",
-                entry.target
-            )));
-        }
-        entry.manifest = None;
-        entry.resource_manifest = Some(RecoveryResourceManifest::FrequencyPair(
-            target.recovery_manifest(),
-        ));
-        entry.legal_pairs = Some(legacy_frequency_pairs(entry));
-        // Older schemas stored an effective aggregate here. Replaying that
-        // value could turn another kernel client's transient cap into a
-        // persistent userspace request, so migration releases our request.
-        entry.original = hardware_limits(target);
-    }
-    if old_schema_version < OWNERSHIP_JOURNAL_SCHEMA_VERSION {
-        for entry in journal.tasks.values_mut() {
-            entry.owned_fields = Some(legacy_task_owned_fields(entry));
-            entry.relinquished_fields = Some(TaskFieldMask::default());
-        }
-    }
-    journal.schema_version = JOURNAL_SCHEMA_VERSION;
-    validate_decoded_journal(journal)
-}
-
-fn legacy_task_owned_fields(entry: &TaskJournalEntry) -> TaskFieldMask {
-    TaskFieldMask::changed(&entry.original, &entry.desired)
-        .union(TaskFieldMask::changed(&entry.original, &entry.applied))
-}
-
 fn task_journal_key(identity: ProcessIdentity) -> String {
     format!(
         "{}:{}:{}",
@@ -3974,15 +3755,7 @@ fn decode_journal(bytes: &[u8]) -> Result<Journal, ActuatorError> {
     reason = "schema-version and cross-field validation stays centralized for fail-closed decoding"
 )]
 fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
-    if !matches!(
-        journal.schema_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION
-            | MANIFEST_JOURNAL_SCHEMA_VERSION
-            | OWNERSHIP_JOURNAL_SCHEMA_VERSION
-            | RELEASE_JOURNAL_SCHEMA_VERSION
-            | SCALAR_JOURNAL_SCHEMA_VERSION
-            | JOURNAL_SCHEMA_VERSION
-    ) {
+    if journal.schema_version != JOURNAL_SCHEMA_VERSION {
         return Err(ActuatorError::InvalidJournal(format!(
             "unsupported schema version {}",
             journal.schema_version
@@ -4029,123 +3802,65 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                 )));
             }
         }
-        let manifest = match (
-            journal.schema_version,
-            &entry.manifest,
-            &entry.resource_manifest,
-        ) {
-            (LEGACY_JOURNAL_SCHEMA_VERSION, None, None) => None,
-            (
-                MANIFEST_JOURNAL_SCHEMA_VERSION
-                | OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION,
-                Some(manifest),
-                None,
-            )
-            | (
-                SCALAR_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION,
-                None,
-                Some(RecoveryResourceManifest::FrequencyPair(manifest)),
-            ) => Some(manifest),
-            _ => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v{} has an invalid recovery manifest representation",
-                    entry.target, journal.schema_version
-                )));
-            }
+        let RecoveryResourceManifest::FrequencyPair(manifest) = &entry.resource_manifest else {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} frequency entry has a non-frequency manifest",
+                entry.target
+            )));
         };
-        if let Some(manifest) = manifest {
-            if manifest.id != entry.target
-                || manifest.min_path != entry.min_path
-                || manifest.max_path != entry.max_path
-            {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "{} recovery manifest identity does not match its entry",
-                    entry.target
-                )));
-            }
-            let target = manifest
-                .to_frequency_target()
+        if manifest.id != entry.target
+            || manifest.min_path != entry.min_path
+            || manifest.max_path != entry.max_path
+        {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} recovery manifest identity does not match its entry",
+                entry.target
+            )));
+        }
+        let target = manifest
+            .to_frequency_target()
+            .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+        for limits in [entry.original, entry.desired, entry.applied] {
+            target
+                .validate_limits(limits)
                 .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-            for limits in [entry.original, entry.desired, entry.applied] {
-                target
-                    .validate_limits(limits)
-                    .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-            }
-            if journal.schema_version >= RELEASE_JOURNAL_SCHEMA_VERSION
-                && entry.original != hardware_limits(&target)
-            {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v{} original request is not the full hardware range",
-                    entry.target, journal.schema_version
-                )));
-            }
         }
-        match (journal.schema_version, &entry.legal_pairs) {
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                Some(pairs),
-            ) if !pairs.is_empty() => {
-                let mut unique = Vec::with_capacity(pairs.len());
-                let target = entry
-                    .recovery_frequency_manifest()
-                    .expect("schema-v3+ manifest checked above")
-                    .to_frequency_target()
-                    .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-                for pair in pairs {
-                    target
-                        .validate_limits(*pair)
-                        .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-                    if unique.contains(pair) {
-                        return Err(ActuatorError::InvalidJournal(format!(
-                            "{} legal frequency pairs contain a duplicate",
-                            entry.target
-                        )));
-                    }
-                    unique.push(*pair);
-                }
-                let expected = if entry.desired == entry.applied {
-                    vec![entry.applied]
-                } else {
-                    transaction_legal_pairs(entry.applied, entry.desired)
-                };
-                if *pairs != expected {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "{} legal frequency pairs do not match its exact ordered transition",
-                        entry.target
-                    )));
-                }
-            }
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                _,
-            ) => {
+        if entry.original != hardware_limits(&target) {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} original request is not the full hardware range",
+                entry.target
+            )));
+        }
+        if entry.legal_pairs.is_empty() {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} entry has no legal frequency pairs",
+                entry.target
+            )));
+        }
+        let mut unique = Vec::with_capacity(entry.legal_pairs.len());
+        for pair in &entry.legal_pairs {
+            target
+                .validate_limits(*pair)
+                .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
+            if unique.contains(pair) {
                 return Err(ActuatorError::InvalidJournal(format!(
-                    "{} schema-v{} entry has no legal frequency pairs",
-                    entry.target, journal.schema_version
-                )));
-            }
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None) => {}
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, Some(_)) => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "{} legacy entry unexpectedly contains legal frequency pairs",
+                    "{} legal frequency pairs contain a duplicate",
                     entry.target
                 )));
             }
-            _ => unreachable!("schema version was checked above"),
+            unique.push(*pair);
         }
-    }
-    if journal.schema_version < SCALAR_JOURNAL_SCHEMA_VERSION && !journal.scalars.is_empty() {
-        return Err(ActuatorError::InvalidJournal(format!(
-            "schema-v{} unexpectedly contains scalar resources",
-            journal.schema_version
-        )));
+        let expected = if entry.desired == entry.applied {
+            vec![entry.applied]
+        } else {
+            transaction_legal_pairs(entry.applied, entry.desired)
+        };
+        if entry.legal_pairs != expected {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "{} legal frequency pairs do not match its exact ordered transition",
+                entry.target
+            )));
+        }
     }
     for (key, entry) in &journal.scalars {
         if key != &entry.target || journal.entries.contains_key(key) {
@@ -4209,48 +3924,11 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
                 ))
             })?;
         }
-        match (
-            journal.schema_version,
-            entry.owned_fields,
-            entry.relinquished_fields,
-        ) {
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                Some(owned),
-                Some(relinquished),
-            ) => {
-                if owned.intersects(relinquished) {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "task journal masks overlap for pid {}",
-                        entry.identity.pid.get()
-                    )));
-                }
-            }
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                _,
-                _,
-            ) => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "schema-v{} task entry for pid {} has no ownership masks",
-                    journal.schema_version,
-                    entry.identity.pid.get(),
-                )));
-            }
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None, None) => {}
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, _, _) => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "legacy task entry for pid {} unexpectedly contains ownership masks",
-                    entry.identity.pid.get()
-                )));
-            }
-            _ => unreachable!("schema version was checked above"),
+        if entry.owned_fields.intersects(entry.relinquished_fields) {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "task journal masks overlap for pid {}",
+                entry.identity.pid.get()
+            )));
         }
     }
     for (key, entry) in &journal.units {
@@ -4262,58 +3940,18 @@ fn validate_decoded_journal(journal: &Journal) -> Result<(), ActuatorError> {
         }
         validate_unit_name(&entry.unit)
             .map_err(|error| ActuatorError::InvalidJournal(error.to_string()))?;
-        match (
-            journal.schema_version,
-            &entry.instance,
-            entry.owned_fields,
-            entry.relinquished_fields,
-        ) {
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                Some(instance),
-                Some(owned),
-                Some(relinquished),
-            ) => {
-                validate_unit_instance_identity(instance)?;
-                if instance.unit != entry.unit {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "systemd instance identity does not match {}",
-                        entry.unit
-                    )));
-                }
-                if owned.intersects(relinquished) {
-                    return Err(ActuatorError::InvalidJournal(format!(
-                        "systemd journal masks overlap for {}",
-                        entry.unit
-                    )));
-                }
-            }
-            (
-                OWNERSHIP_JOURNAL_SCHEMA_VERSION
-                | RELEASE_JOURNAL_SCHEMA_VERSION
-                | SCALAR_JOURNAL_SCHEMA_VERSION
-                | JOURNAL_SCHEMA_VERSION,
-                _,
-                _,
-                _,
-            ) => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "schema-v{} systemd entry {} lacks identity or ownership masks",
-                    journal.schema_version, entry.unit
-                )));
-            }
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, None, None, None) => {
-            }
-            (LEGACY_JOURNAL_SCHEMA_VERSION | MANIFEST_JOURNAL_SCHEMA_VERSION, _, _, _) => {
-                return Err(ActuatorError::InvalidJournal(format!(
-                    "legacy systemd entry {} unexpectedly contains v3 ownership metadata",
-                    entry.unit
-                )));
-            }
-            _ => unreachable!("schema version was checked above"),
+        validate_unit_instance_identity(&entry.instance)?;
+        if entry.instance.unit != entry.unit {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "systemd instance identity does not match {}",
+                entry.unit
+            )));
+        }
+        if entry.owned_fields.intersects(entry.relinquished_fields) {
+            return Err(ActuatorError::InvalidJournal(format!(
+                "systemd journal masks overlap for {}",
+                entry.unit
+            )));
         }
     }
     Ok(())
@@ -4358,12 +3996,10 @@ mod tests {
 
     use super::{
         ActuatorError, ActuatorMode, FrequencyActuator, FrequencyRequest, FrequencyTarget,
-        JOURNAL_SCHEMA_VERSION, JournalEnvelope, LEGACY_JOURNAL_SCHEMA_VERSION,
-        MANIFEST_JOURNAL_SCHEMA_VERSION, OWNERSHIP_JOURNAL_SCHEMA_VERSION,
-        RELEASE_JOURNAL_SCHEMA_VERSION, RecoveryFrequencyTarget, RecoveryResourceManifest,
-        RecoveryResourceTarget, SCALAR_JOURNAL_SCHEMA_VERSION, ScalarDomain, ScalarRequest,
-        ScalarTarget, ScalarValue, TargetRegistry, TaskRequest, UnitRequest, decode_journal,
-        encode_journal, inspect_recovery_journal, transaction_legal_pairs,
+        JOURNAL_SCHEMA_VERSION, Journal, RecoveryResourceManifest, RecoveryResourceTarget,
+        ScalarDomain, ScalarRequest, ScalarTarget, ScalarValue, TargetRegistry, TaskRequest,
+        UnitRequest, decode_journal, encode_journal, inspect_recovery_journal,
+        transaction_legal_pairs,
     };
 
     #[derive(Default)]
@@ -4895,16 +4531,6 @@ mod tests {
 
     fn limits(minimum: u64, maximum: u64) -> FrequencyLimits {
         FrequencyLimits::new(Hertz::new(minimum), Hertz::new(maximum)).expect("limits")
-    }
-
-    fn use_legacy_frequency_manifests(journal: &mut super::Journal) {
-        for entry in journal.entries.values_mut() {
-            if let Some(super::RecoveryResourceManifest::FrequencyPair(manifest)) =
-                entry.resource_manifest.take()
-            {
-                entry.manifest = Some(manifest);
-            }
-        }
     }
 
     fn process_identity(pid: u32, start_time_ticks: u64) -> ProcessIdentity {
@@ -5719,21 +5345,14 @@ mod tests {
                 value: ScalarValue::Integer(20),
             }])
             .expect("claim scalar");
-        let bytes = store.load().expect("load journal").expect("journal bytes");
-        let mut schema_v5 = decode_journal(&bytes).expect("decode current journal");
-        schema_v5.schema_version = SCALAR_JOURNAL_SCHEMA_VERSION;
-        store
-            .store_durable(&encode_journal(&schema_v5).expect("encode schema-v5 journal"))
-            .expect("store schema-v5 journal");
-
         let manifest = inspect_recovery_journal(store.as_ref())
             .expect("inspect tagged-resource journal")
             .expect("tagged recovery manifest");
-        assert_eq!(manifest.schema_version, SCALAR_JOURNAL_SCHEMA_VERSION);
+        assert_eq!(manifest.schema_version, JOURNAL_SCHEMA_VERSION);
         assert!(matches!(
             manifest.resource_targets.as_slice(),
             [
-                RecoveryResourceTarget::FrequencyPair(RecoveryFrequencyTarget::SelfDescribing(_)),
+                RecoveryResourceTarget::FrequencyPair(_),
                 RecoveryResourceTarget::Scalar(_),
             ]
         ));
@@ -5761,32 +5380,6 @@ mod tests {
             restarted.read_limits(&id()).expect("recovered frequency"),
             limits(1_000, 3_000)
         );
-        assert!(store.load().expect("journal removed").is_none());
-    }
-
-    #[test]
-    fn schema_v4_frequency_journal_decodes_and_upgrades_to_current() {
-        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
-        let store = Arc::new(MemoryStore::default());
-        actuator(io.clone(), store.clone(), "boot-a", "device-a")
-            .apply_batch(&[FrequencyRequest {
-                target: id(),
-                limits: limits(2_000, 3_000),
-            }])
-            .expect("seed current frequency journal");
-        let bytes = store.load().expect("load journal").expect("journal bytes");
-        let mut v4 = decode_journal(&bytes).expect("decode current journal");
-        v4.schema_version = RELEASE_JOURNAL_SCHEMA_VERSION;
-        use_legacy_frequency_manifests(&mut v4);
-        let v4_bytes = encode_journal(&v4).expect("encode v4 journal");
-        store.store_durable(&v4_bytes).expect("store v4 journal");
-
-        let manifest = inspect_recovery_journal(store.as_ref())
-            .expect("decode v4 journal")
-            .expect("v4 manifest");
-        assert_eq!(manifest.schema_version, RELEASE_JOURNAL_SCHEMA_VERSION);
-        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
-        restarted.recover_pending().expect("upgrade and recover v4");
         assert!(store.load().expect("journal removed").is_none());
     }
 
@@ -6096,6 +5689,40 @@ mod tests {
     }
 
     #[test]
+    fn noncurrent_journal_schema_is_rejected_without_upgrade() {
+        let journal = Journal {
+            schema_version: JOURNAL_SCHEMA_VERSION - 1,
+            boot_id: "boot-a".to_owned(),
+            device_fingerprint: "device-a".to_owned(),
+            generation: 0,
+            entries: BTreeMap::new(),
+            scalars: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            units: BTreeMap::new(),
+        };
+        let store = Arc::new(MemoryStore::default());
+        store
+            .store_durable(&encode_journal(&journal).expect("encode noncurrent journal"))
+            .expect("store noncurrent journal");
+
+        assert!(matches!(
+            inspect_recovery_journal(store.as_ref()),
+            Err(ActuatorError::InvalidJournal(message))
+                if message.contains("unsupported schema version")
+        ));
+        let actuator = actuator(
+            Arc::new(MemorySysfs::with_pair("1000", "3000")),
+            store,
+            "boot-a",
+            "device-a",
+        );
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadOnlyDegraded { .. }
+        ));
+    }
+
+    #[test]
     fn propagated_startup_recovery_failure_is_distinct_from_active_ownership() {
         let actuator = actuator(
             Arc::new(MemorySysfs::with_pair("1000", "3000")),
@@ -6200,7 +5827,7 @@ mod tests {
         let mut journal = decode_journal(&bytes).expect("decode journal");
         let entry = journal.entries.get_mut(&id()).expect("frequency entry");
         entry.applied = entry.original;
-        entry.legal_pairs = Some(transaction_legal_pairs(entry.original, entry.desired));
+        entry.legal_pairs = transaction_legal_pairs(entry.original, entry.desired);
         store
             .store_durable(&encode_journal(&journal).expect("encode crash journal"))
             .expect("store crash journal");
@@ -6233,10 +5860,7 @@ mod tests {
             .expect("inspect journal")
             .expect("recovery manifest");
         assert_eq!(manifest.schema_version, JOURNAL_SCHEMA_VERSION);
-        assert!(matches!(
-            manifest.frequency_targets.as_slice(),
-            [RecoveryFrequencyTarget::SelfDescribing(_)]
-        ));
+        assert_eq!(manifest.frequency_targets.len(), 1);
         let recovery_registry = manifest
             .self_describing_registry()
             .expect("manifest registry");
@@ -6264,123 +5888,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_manifest_can_be_resolved_without_old_configuration() {
-        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
-        let store = Arc::new(MemoryStore::default());
-        actuator(io.clone(), store.clone(), "boot-a", "device-a")
-            .apply_batch(&[FrequencyRequest {
-                target: id(),
-                limits: limits(2_000, 3_000),
-            }])
-            .expect("apply");
-        let bytes = store.load().expect("load journal").expect("journal bytes");
-        let mut legacy = decode_journal(&bytes).expect("decode current journal");
-        legacy.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
-        for entry in legacy.entries.values_mut() {
-            entry.manifest = None;
-            entry.resource_manifest = None;
-            entry.legal_pairs = None;
-        }
-        store
-            .store_durable(&encode_journal(&legacy).expect("encode legacy journal"))
-            .expect("store legacy journal");
-
-        let manifest = inspect_recovery_journal(store.as_ref())
-            .expect("inspect legacy journal")
-            .expect("legacy manifest");
-        assert!(matches!(
-            manifest.frequency_targets.as_slice(),
-            [RecoveryFrequencyTarget::Legacy(_)]
-        ));
-        assert!(matches!(
-            manifest.self_describing_registry(),
-            Err(ActuatorError::LegacyRecoveryTarget(_))
-        ));
-
-        // Live discovery supplies this registry in the daemon; no old
-        // configuration file is needed.
-        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
-        restarted.recover_pending().expect("legacy recovery");
-        assert_eq!(
-            restarted.read_limits(&id()).expect("restored limits"),
-            limits(1_000, 3_000)
-        );
-        assert!(store.load().expect("cleared journal").is_none());
-    }
-
-    #[test]
-    fn invalid_schema_v1_limits_are_never_persisted_as_current() {
-        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
-        let store = Arc::new(MemoryStore::default());
-        actuator(io.clone(), store.clone(), "boot-a", "device-a")
-            .apply_batch(&[FrequencyRequest {
-                target: id(),
-                limits: limits(2_000, 3_000),
-            }])
-            .expect("apply");
-
-        let bytes = store.load().expect("load journal").expect("journal bytes");
-        let mut legacy = decode_journal(&bytes).expect("decode current journal");
-        legacy.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
-        for entry in legacy.entries.values_mut() {
-            entry.manifest = None;
-            entry.resource_manifest = None;
-            entry.legal_pairs = None;
-            entry.desired = limits(4_000, 4_000);
-            entry.applied = limits(4_000, 4_000);
-        }
-        let legacy_bytes = encode_journal(&legacy).expect("encode legacy journal");
-        store
-            .store_durable(&legacy_bytes)
-            .expect("store legacy journal");
-        let writes_before_recovery = io.writes().len();
-
-        let restarted = actuator(io.clone(), store.clone(), "boot-a", "device-a");
-        assert!(matches!(
-            restarted.recover_pending(),
-            Err(ActuatorError::Degraded(_))
-        ));
-        assert_eq!(io.writes().len(), writes_before_recovery);
-        assert_eq!(
-            store.load().expect("journal remains").as_deref(),
-            Some(legacy_bytes.as_slice())
-        );
-    }
-
-    #[test]
-    fn schema_v3_constrained_original_migrates_to_a_released_request() {
-        let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
-        let store = Arc::new(MemoryStore::default());
-        actuator(io.clone(), store.clone(), "boot-a", "device-a")
-            .apply_batch(&[FrequencyRequest {
-                target: id(),
-                limits: limits(2_000, 3_000),
-            }])
-            .expect("apply");
-
-        let bytes = store.load().expect("load journal").expect("journal bytes");
-        let mut legacy = decode_journal(&bytes).expect("decode current journal");
-        legacy.schema_version = OWNERSHIP_JOURNAL_SCHEMA_VERSION;
-        use_legacy_frequency_manifests(&mut legacy);
-        legacy
-            .entries
-            .get_mut(&id())
-            .expect("frequency entry")
-            .original = limits(1_000, 2_000);
-        store
-            .store_durable(&encode_journal(&legacy).expect("encode schema-v3 journal"))
-            .expect("store schema-v3 journal");
-
-        let restarted = actuator(io, store.clone(), "boot-a", "device-a");
-        restarted.recover_pending().expect("migrate and recover");
-        assert_eq!(
-            restarted.read_limits(&id()).expect("released limits"),
-            limits(1_000, 3_000)
-        );
-        assert!(store.load().expect("cleared journal").is_none());
-    }
-
-    #[test]
     fn inconsistent_recovery_manifest_is_rejected_fail_closed() {
         let io = Arc::new(MemorySysfs::with_pair("1000", "3000"));
         let store = Arc::new(MemoryStore::default());
@@ -6392,14 +5899,12 @@ mod tests {
             .expect("apply");
         let bytes = store.load().expect("load journal").expect("journal bytes");
         let mut journal = decode_journal(&bytes).expect("decode journal");
-        let resource_manifest = journal
+        let resource_manifest = &mut journal
             .entries
             .values_mut()
             .next()
             .expect("frequency entry")
-            .resource_manifest
-            .as_mut()
-            .expect("recovery manifest");
+            .resource_manifest;
         let super::RecoveryResourceManifest::FrequencyPair(manifest) = resource_manifest else {
             panic!("frequency recovery manifest");
         };
@@ -6621,78 +6126,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_task_without_priority_field_remains_decodable() {
-        let store = Arc::new(MemoryStore::default());
-        let proc_reader = Arc::new(FakeProc::default());
-        let controller = Arc::new(FaultingProcessController::default());
-        let identity = process_identity(41, 10);
-        let original = scheduling(0);
-        insert_process(&proc_reader, identity);
-        controller.insert(identity.pid, original.clone());
-        control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader.clone()),
-            Some(controller.clone()),
-            None,
-        )
-        .apply_tasks(&[TaskRequest {
-            identity,
-            desired: scheduling(-5),
-        }])
-        .expect("create task journal");
-
-        let current = decode_journal(&store.load().expect("load journal").expect("journal bytes"))
-            .expect("decode current journal");
-        let mut value = serde_json::to_value(current).expect("serialize journal value");
-        value["schema_version"] = serde_json::json!(SCALAR_JOURNAL_SCHEMA_VERSION);
-        let tasks = value["tasks"].as_object_mut().expect("task journal object");
-        for entry in tasks.values_mut() {
-            for field in ["original", "desired", "applied"] {
-                entry[field]
-                    .as_object_mut()
-                    .expect("scheduler state object")
-                    .remove("rt_priority");
-            }
-        }
-        let payload = serde_json::to_vec(&value).expect("serialize schema-v5 payload");
-        let envelope = JournalEnvelope {
-            checksum: super::crc32(&payload),
-            payload,
-        };
-        let encoded = serde_json::to_vec(&envelope).expect("serialize schema-v5 envelope");
-        let decoded = decode_journal(&encoded).expect("decode schema-v5 task journal");
-        assert_eq!(decoded.schema_version, SCALAR_JOURNAL_SCHEMA_VERSION);
-        assert!(
-            decoded
-                .tasks
-                .values()
-                .all(|entry| entry.original.rt_priority.is_none()
-                    && entry.desired.rt_priority.is_none()
-                    && entry.applied.rt_priority.is_none())
-        );
-        store
-            .store_durable(&encoded)
-            .expect("store schema-v5 task journal");
-
-        control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader),
-            Some(controller.clone()),
-            None,
-        )
-        .recover_pending()
-        .expect("upgrade and restore schema-v5 task");
-        assert_eq!(
-            controller
-                .read_scheduling(identity.pid)
-                .expect("restored task"),
-            original
-        );
-    }
-
-    #[test]
     fn unchanged_task_and_unit_requests_claim_no_ownership() {
         let task_store = Arc::new(MemoryStore::default());
         let proc_reader = Arc::new(FakeProc::default());
@@ -6839,61 +6272,6 @@ mod tests {
                 .expect("administrator FIFO tuple"),
             administrator
         );
-        assert!(store.load().expect("cleared journal").is_none());
-    }
-
-    #[test]
-    fn schema_v2_task_recovery_derives_a_conservative_field_mask() {
-        let store = Arc::new(MemoryStore::default());
-        let proc_reader = Arc::new(FakeProc::default());
-        let controller = Arc::new(FaultingProcessController::default());
-        let identity = process_identity(41, 10);
-        let original = scheduling(0);
-        let desired = scheduling(-5);
-        insert_process(&proc_reader, identity);
-        controller.insert(identity.pid, original.clone());
-        control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader.clone()),
-            Some(controller.clone()),
-            None,
-        )
-        .apply_tasks(&[TaskRequest {
-            identity,
-            desired: desired.clone(),
-        }])
-        .expect("apply task");
-
-        let bytes = store.load().expect("load journal").expect("journal");
-        let mut journal = decode_journal(&bytes).expect("decode journal");
-        journal.schema_version = MANIFEST_JOURNAL_SCHEMA_VERSION;
-        for entry in journal.tasks.values_mut() {
-            entry.owned_fields = None;
-            entry.relinquished_fields = None;
-        }
-        store
-            .store_durable(&encode_journal(&journal).expect("encode schema-v2 journal"))
-            .expect("store schema-v2 journal");
-
-        let mut administrator = desired;
-        administrator.affinity = CpuSet::from_ids([CpuId::new(3)]);
-        controller.set_admin(identity.pid, administrator);
-        let restarted = control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader),
-            Some(controller.clone()),
-            None,
-        );
-        restarted
-            .recover_pending()
-            .expect("recover schema-v2 task entry");
-        let recovered = controller
-            .read_scheduling(identity.pid)
-            .expect("recovered task");
-        assert_eq!(recovered.nice, original.nice);
-        assert_eq!(recovered.affinity, CpuSet::from_ids([CpuId::new(3)]));
         assert!(store.load().expect("cleared journal").is_none());
     }
 
@@ -7261,87 +6639,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_recovery_restores_tasks_and_units() {
-        let store = Arc::new(MemoryStore::default());
-        let proc_reader = Arc::new(FakeProc::default());
-        let controller = Arc::new(FaultingProcessController::default());
-        let systemd = Arc::new(FaultingSystemd::default());
-        let identity = process_identity(41, 10);
-        let original_task = scheduling(0);
-        let desired_task = scheduling(-5);
-        let unit = "app-game.scope";
-        let original_unit = unit_properties(100);
-        let desired_unit = unit_properties(900);
-        insert_process(&proc_reader, identity);
-        controller.insert(identity.pid, original_task.clone());
-        systemd.insert(unit, vec![identity.pid], original_unit.clone());
-
-        let running = control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader.clone()),
-            Some(controller.clone()),
-            Some(systemd.clone()),
-        );
-        running
-            .apply_tasks(&[TaskRequest {
-                identity,
-                desired: desired_task,
-            }])
-            .expect("apply task");
-        running
-            .apply_units(&[UnitRequest {
-                unit: unit.to_owned(),
-                desired: desired_unit,
-            }])
-            .expect("apply unit");
-        let bytes = store.load().expect("load journal").expect("journal");
-        let mut legacy = decode_journal(&bytes).expect("decode journal");
-        legacy.schema_version = OWNERSHIP_JOURNAL_SCHEMA_VERSION;
-        store
-            .store_durable(&encode_journal(&legacy).expect("encode schema-v3 journal"))
-            .expect("store schema-v3 journal");
-
-        let restarted = control_actuator(
-            store.clone(),
-            "boot-a",
-            Some(proc_reader),
-            Some(controller.clone()),
-            Some(systemd.clone()),
-        );
-        assert!(
-            restarted
-                .startup_recovery_required()
-                .expect("pending journal")
-        );
-        assert!(matches!(
-            restarted.apply_tasks(&[TaskRequest {
-                identity,
-                desired: scheduling(-2),
-            }]),
-            Err(ActuatorError::RecoveryRequired)
-        ));
-        restarted.recover_pending().expect("same-boot recovery");
-
-        assert_eq!(
-            controller
-                .read_scheduling(identity.pid)
-                .expect("recovered task"),
-            original_task
-        );
-        assert_eq!(
-            systemd.read_unit_properties(unit).expect("recovered unit"),
-            original_unit
-        );
-        assert!(
-            !restarted
-                .startup_recovery_required()
-                .expect("pending journal")
-        );
-        assert!(store.load().expect("cleared recovery journal").is_none());
-    }
-
-    #[test]
     fn pid_reuse_is_never_restored_into_the_new_process() {
         let store = Arc::new(MemoryStore::default());
         let proc_reader = Arc::new(FakeProc::default());
@@ -7543,46 +6840,6 @@ mod tests {
                 .expect("cleared old-instance journal")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn schema_v2_systemd_journal_fails_closed_without_an_instance_identity() {
-        let store = Arc::new(MemoryStore::default());
-        let systemd = Arc::new(FaultingSystemd::default());
-        let unit = "app-game.scope";
-        systemd.insert(unit, vec![ProcessId::new(41)], unit_properties(100));
-        control_actuator(store.clone(), "boot-a", None, None, Some(systemd.clone()))
-            .apply_units(&[UnitRequest {
-                unit: unit.to_owned(),
-                desired: unit_properties(900),
-            }])
-            .expect("apply unit");
-        let writes_before_restart = systemd.writes().len();
-
-        let bytes = store.load().expect("load journal").expect("journal");
-        let mut journal = decode_journal(&bytes).expect("decode journal");
-        journal.schema_version = MANIFEST_JOURNAL_SCHEMA_VERSION;
-        for entry in journal.units.values_mut() {
-            entry.instance = None;
-            entry.owned_fields = None;
-            entry.relinquished_fields = None;
-        }
-        store
-            .store_durable(&encode_journal(&journal).expect("encode schema-v2 journal"))
-            .expect("store schema-v2 journal");
-
-        let restarted =
-            control_actuator(store.clone(), "boot-a", None, None, Some(systemd.clone()));
-        assert!(matches!(
-            restarted.recover_pending(),
-            Err(ActuatorError::Degraded(_))
-        ));
-        assert!(matches!(
-            restarted.mode().expect("mode"),
-            ActuatorMode::ReadOnlyDegraded { .. }
-        ));
-        assert_eq!(systemd.writes().len(), writes_before_restart);
-        assert!(store.load().expect("journal remains").is_some());
     }
 
     #[test]

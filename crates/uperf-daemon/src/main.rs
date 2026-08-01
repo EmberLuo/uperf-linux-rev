@@ -11,9 +11,8 @@ use tokio::{
     sync::watch,
 };
 use uperf_actuator::{
-    FileStateStore, FrequencyActuator, FrequencyTarget, RecoveryFrequencyTarget,
-    RecoveryFrequencyTargetManifest, RecoveryManifest, RecoveryResourceTarget, TargetRegistry,
-    inspect_recovery_journal,
+    FileStateStore, FrequencyActuator, RecoveryFrequencyTargetManifest, RecoveryManifest,
+    RecoveryResourceTarget, TargetRegistry, inspect_recovery_journal,
 };
 use uperf_api::{OBJECT_PATH, SERVICE_NAME};
 use uperf_core::{FrequencyLimits, Hertz};
@@ -487,26 +486,8 @@ fn recovery_registry(
     for resource in &manifest.resource_targets {
         match resource {
             RecoveryResourceTarget::FrequencyPair(target) => {
-                let target = match target {
-                    RecoveryFrequencyTarget::SelfDescribing(target) => {
-                        validate_self_describing_target(target, discovery)?;
-                        target.to_frequency_target().map_err(anyhow::Error::from)?
-                    }
-                    RecoveryFrequencyTarget::Legacy(target) => {
-                        let live =
-                            live_target_for_paths(discovery, &target.min_path, &target.max_path)?;
-                        FrequencyTarget::new(
-                            target.id.clone(),
-                            target.min_path.clone(),
-                            target.max_path.clone(),
-                            live.limits.min,
-                            live.limits.max,
-                            live.opps,
-                        )
-                        .and_then(|target| target.with_hertz_per_unit(live.hertz_per_unit))
-                        .map_err(anyhow::Error::from)?
-                    }
-                };
+                validate_self_describing_target(target, discovery)?;
+                let target = target.to_frequency_target().map_err(anyhow::Error::from)?;
                 frequencies.push(target);
             }
             RecoveryResourceTarget::Scalar(target) => {
@@ -731,7 +712,8 @@ mod tests {
 
     use tempfile::TempDir;
     use uperf_actuator::{
-        ActuatorMode, FrequencyRequest, ScalarDomain, ScalarRequest, ScalarTarget, ScalarValue,
+        ActuatorMode, FrequencyRequest, FrequencyTarget, ScalarDomain, ScalarRequest, ScalarTarget,
+        ScalarValue,
     };
     use uperf_core::{
         CpuId, CpuPolicyCapability, CpuSet, DeviceCapabilities, InputDeviceCapability,
@@ -925,33 +907,6 @@ mod tests {
         );
 
         assert_eq!(before, device_fingerprint(&discovery));
-    }
-
-    #[test]
-    fn recovery_registry_keeps_legacy_frequency_path_resolution() {
-        let fixture = recovery_fixture();
-        let legacy = uperf_actuator::LegacyRecoveryFrequencyTarget {
-            id: fixture.target.id.clone(),
-            min_path: fixture.target.min_path.clone(),
-            max_path: fixture.target.max_path.clone(),
-        };
-        let frequency = RecoveryFrequencyTarget::Legacy(legacy);
-        let manifest = RecoveryManifest {
-            schema_version: 1,
-            boot_id: "boot-a".to_owned(),
-            device_fingerprint: device_fingerprint(&fixture.discovery),
-            resource_targets: vec![RecoveryResourceTarget::FrequencyPair(frequency.clone())],
-            frequency_targets: vec![frequency],
-            has_tasks: false,
-            has_systemd_units: false,
-        };
-
-        let registry =
-            recovery_registry(&manifest, &fixture.discovery).expect("legacy recovery registry");
-        assert!(
-            registry.get(&fixture.target.id).is_some(),
-            "schema-v1 frequency resources must still resolve through live discovery"
-        );
     }
 
     #[test]
