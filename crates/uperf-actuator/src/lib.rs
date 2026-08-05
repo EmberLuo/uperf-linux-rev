@@ -3528,6 +3528,29 @@ fn process_identity_is_current(
     }
 }
 
+/// Record a rollback failure only while the original process still exists.
+///
+/// A task can exit after the rollback's identity check but before the following
+/// scheduler read or write. Once the numeric PID has disappeared there is no
+/// scheduler object left to restore, so that race is equivalent to a completed
+/// rollback. A reused PID remains a failure: it is present with a different
+/// stable identity and must never be treated as the exited original task.
+fn record_task_rollback_failure_if_present(
+    failures: &mut Vec<String>,
+    proc_reader: &dyn ProcReader,
+    identity: ProcessIdentity,
+    failure: &str,
+) {
+    match proc_reader.process_identity(identity.pid) {
+        Err(PlatformError::Disappeared(_)) => {}
+        Ok(_) => failures.push(format!("pid {}: {failure}", identity.pid.get())),
+        Err(error) => failures.push(format!(
+            "pid {}: {failure}; identity recheck failed: {error}",
+            identity.pid.get()
+        )),
+    }
+}
+
 fn verify_unit_instance(
     systemd: &dyn SystemdClient,
     expected: &SystemdUnitInstanceIdentity,
@@ -3566,10 +3589,21 @@ fn rollback_tasks(
                 let current = match controller.read_scheduling(identity.pid) {
                     Ok(current) => current,
                     Err(error) => {
-                        failures.push(format!("pid {}: {error}", identity.pid.get()));
+                        record_task_rollback_failure_if_present(
+                            &mut failures,
+                            proc_reader,
+                            *identity,
+                            &error.to_string(),
+                        );
                         continue;
                     }
                 };
+                // Close the read-side identity window before mutating. If the
+                // PID was reused while its scheduler state was being read, the
+                // new process must not receive the old task's rollback values.
+                if !process_identity_is_current(proc_reader, *identity)? {
+                    continue;
+                }
                 let restorable = mutation.changed_fields.fields_matching_either(
                     &current,
                     &mutation.desired,
@@ -3583,16 +3617,26 @@ fn rollback_tasks(
                 match controller.write_scheduling(identity.pid, &rollback) {
                     Ok(actual) if restorable.values_equal(&actual, &mutation.before) => {
                         if let Err(error) = verify_process_identity(proc_reader, *identity) {
-                            failures.push(format!(
-                                "pid {} identity changed during rollback: {error}",
-                                identity.pid.get()
-                            ));
+                            record_task_rollback_failure_if_present(
+                                &mut failures,
+                                proc_reader,
+                                *identity,
+                                &format!("identity changed during rollback: {error}"),
+                            );
                         }
                     }
-                    Ok(actual) => {
-                        failures.push(format!("pid {} read back {actual:?}", identity.pid.get()));
-                    }
-                    Err(error) => failures.push(format!("pid {}: {error}", identity.pid.get())),
+                    Ok(actual) => record_task_rollback_failure_if_present(
+                        &mut failures,
+                        proc_reader,
+                        *identity,
+                        &format!("read back {actual:?}"),
+                    ),
+                    Err(error) => record_task_rollback_failure_if_present(
+                        &mut failures,
+                        proc_reader,
+                        *identity,
+                        &error.to_string(),
+                    ),
                 }
             }
             // The journal owns a stable identity, not the numeric PID/TID.
@@ -4195,6 +4239,10 @@ mod tests {
             proc_reader: Arc<FakeProc>,
             pid: ProcessId,
         },
+        ExitBeforeRollbackRead {
+            proc_reader: Arc<FakeProc>,
+            pid: ProcessId,
+        },
         Reuse {
             proc_reader: Arc<FakeProc>,
             process: ProcessInfo,
@@ -4208,6 +4256,7 @@ mod tests {
         write_attempts: Mutex<usize>,
         fail_on_write: Mutex<Option<usize>>,
         lifecycle_on_failure: Mutex<Option<LifecycleMutation>>,
+        exit_before_read: Mutex<Option<(Arc<FakeProc>, ProcessId)>>,
         admin_on_failure: Mutex<Option<(ProcessId, ProcessSchedulingState)>>,
     }
 
@@ -4245,6 +4294,14 @@ mod tests {
                 Some(LifecycleMutation::Exit { proc_reader, pid });
         }
 
+        fn exit_before_rollback_read_on_failure(&self, proc_reader: Arc<FakeProc>, pid: ProcessId) {
+            *self
+                .lifecycle_on_failure
+                .lock()
+                .expect("process lifecycle lock") =
+                Some(LifecycleMutation::ExitBeforeRollbackRead { proc_reader, pid });
+        }
+
         fn reuse_on_failure(&self, proc_reader: Arc<FakeProc>, process: ProcessInfo) {
             *self
                 .lifecycle_on_failure
@@ -4262,6 +4319,23 @@ mod tests {
 
     impl ProcessController for FaultingProcessController {
         fn read_scheduling(&self, process: ProcessId) -> PlatformResult<ProcessSchedulingState> {
+            let pending_exit = {
+                let mut pending = self
+                    .exit_before_read
+                    .lock()
+                    .expect("process read lifecycle lock");
+                pending
+                    .as_ref()
+                    .is_some_and(|(_, pid)| *pid == process)
+                    .then(|| pending.take().expect("matched pending process exit"))
+            };
+            if let Some((proc_reader, pid)) = pending_exit {
+                proc_reader.remove_process(pid);
+                self.states
+                    .lock()
+                    .expect("process states lock")
+                    .remove(&pid);
+            }
             self.states
                 .lock()
                 .expect("process states lock")
@@ -4303,6 +4377,12 @@ mod tests {
                     match mutation {
                         LifecycleMutation::Exit { proc_reader, pid } => {
                             proc_reader.remove_process(pid);
+                        }
+                        LifecycleMutation::ExitBeforeRollbackRead { proc_reader, pid } => {
+                            *self
+                                .exit_before_read
+                                .lock()
+                                .expect("process read lifecycle lock") = Some((proc_reader, pid));
                         }
                         LifecycleMutation::Reuse {
                             proc_reader,
@@ -6493,6 +6573,65 @@ mod tests {
         actuator
             .restore_tasks(&[exited, failing])
             .expect("clear journal for exited TID");
+        assert!(store.load().expect("cleared task journal").is_none());
+    }
+
+    #[test]
+    fn task_rollback_tolerates_exit_between_identity_check_and_scheduler_read() {
+        let store = Arc::new(MemoryStore::default());
+        let proc_reader = Arc::new(FakeProc::default());
+        let controller = Arc::new(FaultingProcessController::default());
+        let exited = process_identity(4_101, 10);
+        let failing = process_identity(4_102, 20);
+        let exited_original = scheduling(0);
+        let exited_desired = scheduling(-5);
+        let failing_original = scheduling(1);
+        insert_process(&proc_reader, exited);
+        insert_process(&proc_reader, failing);
+        controller.insert(exited.pid, exited_original);
+        controller.insert(failing.pid, failing_original.clone());
+        controller.fail_on(2);
+        controller.exit_before_rollback_read_on_failure(proc_reader.clone(), exited.pid);
+        let actuator = control_actuator(
+            store.clone(),
+            "boot-a",
+            Some(proc_reader),
+            Some(controller.clone()),
+            None,
+        );
+
+        let error = actuator
+            .apply_tasks(&[
+                TaskRequest {
+                    identity: exited,
+                    desired: exited_desired.clone(),
+                },
+                TaskRequest {
+                    identity: failing,
+                    desired: scheduling(-4),
+                },
+            ])
+            .expect_err("second write must fail while the first TID exits during rollback");
+
+        assert!(matches!(error, ActuatorError::Transaction { .. }));
+        assert!(matches!(
+            actuator.mode().expect("mode"),
+            ActuatorMode::ReadWrite
+        ));
+        assert_eq!(
+            controller
+                .writes()
+                .into_iter()
+                .filter(|(pid, _)| *pid == exited.pid)
+                .collect::<Vec<_>>(),
+            vec![(exited.pid, exited_desired)]
+        );
+        assert_eq!(
+            controller
+                .read_scheduling(failing.pid)
+                .expect("failing TID remains original"),
+            failing_original
+        );
         assert!(store.load().expect("cleared task journal").is_none());
     }
 
